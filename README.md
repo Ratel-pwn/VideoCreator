@@ -1,6 +1,6 @@
-﻿# ChaosMuseum
+﻿# VideoCreator
 
-ChaosMuseum is a local-first content production pipeline for short-form humanities, science, and technology videos.
+VideoCreator is a local-first content production pipeline for short-form humanities, science, and technology videos.
 
 ## What it does
 
