@@ -1,0 +1,18 @@
+{
+  "appid": "YOUR_VOLC_APP_ID",
+  "access_token": "YOUR_VOLC_ACCESS_TOKEN",
+  "resource_id": "seed-icl-2.0",
+  "text": "",
+  "output_file": "volc_tts_output.mp3",
+  "format": "mp3",
+  "sample_rate": 24000,
+  "explicit_language": "zh-cn",
+  "model": "seed-tts-2.0-expressive",
+  "enable_subtitle": true,
+  "speech_rate": 0,
+  "loudness_rate": 0,
+  "disable_markdown_filter": false,
+  "uid": "chaos-museum",
+  "speaker_id": "YOUR_SPEAKER_ID",
+  "clone_speaker_id": "YOUR_CLONE_SPEAKER_ID"
+}

@@ -1,0 +1,12 @@
+﻿{
+  "search": {
+    "enable_image_search": true,
+    "enable_video_search": true,
+    "image_provider": "wikimedia",
+    "video_provider": "pexels",
+    "pexels_api_key_env": "PEXELS_API_KEY"
+  },
+  "generation": {
+    "prefer_search_first": true
+  }
+}

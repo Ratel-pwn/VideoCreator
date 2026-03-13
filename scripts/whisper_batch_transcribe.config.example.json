@@ -1,0 +1,14 @@
+{
+  "input_dir": "./media/input",
+  "output_dir": "./media/transcripts",
+  "model": "medium",
+  "language": "zh",
+  "task": "transcribe",
+  "output_format": "srt",
+  "device": "cuda",
+  "beam_size": 5,
+  "temperature": 0.0,
+  "recursive": true,
+  "force": false,
+  "dry_run": false
+}

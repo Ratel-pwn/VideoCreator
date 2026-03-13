@@ -1,0 +1,23 @@
+{
+  "access_key_id_env": "VOLC_ACCESS_KEY_ID",
+  "secret_access_key_env": "VOLC_SECRET_ACCESS_KEY",
+  "security_token_env": "VOLC_SECURITY_TOKEN",
+  "region": "cn-north-1",
+  "service": "cv",
+  "host": "visual.volcengineapi.com",
+  "version": "2022-08-31",
+  "poll_interval_seconds": 5,
+  "timeout_seconds": 900,
+  "image": {
+    "req_key": "jimeng_t2i_v40",
+    "width": 1920,
+    "height": 1080,
+    "force_single": true,
+    "return_url": true
+  },
+  "video": {
+    "req_key": "jimeng_t2v_v30_1080p",
+    "frames": 121,
+    "aspect_ratio": "16:9"
+  }
+}

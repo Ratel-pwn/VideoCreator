@@ -1,0 +1,12 @@
+{
+  "list_file": "./scripts/yt-list.example.txt",
+  "output_dir": "./downloads",
+  "cookies_file": "./cookies/yt-cookies.txt",
+  "cookies_from_browser": "",
+  "format": "bv*+ba/b",
+  "js_runtime": "node",
+  "remote_components": "ejs:github",
+  "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+  "force": false,
+  "dry_run": false
+}

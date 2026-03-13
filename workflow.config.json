@@ -1,0 +1,61 @@
+﻿{
+  "confirm": {
+    "prepare": true,
+    "draft": true,
+    "tts": true,
+    "visual_plan": true,
+    "assets": true,
+    "video": true
+  },
+  "retain": {
+    "chat_log": true,
+    "draft": true,
+    "audio": true,
+    "subtitle": true
+  },
+  "llm": {
+    "base_url": "https://api.openai.com/v1",
+    "api_key_env": "OPENAI_API_KEY",
+    "model": "gpt-4o-mini"
+  },
+  "skills": {
+    "prepare_skill_path_project": "skills/prepare-topic-chat/SKILL.md",
+    "prepare_skill_name_installed": "prepare-topic-chat",
+    "article_skill_path_project": "skills/article-from-chat/SKILL.md",
+    "article_skill_name_installed": "article-from-chat",
+    "controller_skill_path_project": "skills/workflow-controller/SKILL.md",
+    "controller_skill_name_installed": "workflow-controller"
+  },
+  "visual_plan": {
+    "script": "scripts/generate_visual_plan.py",
+    "skill_path_project": "skills/segment-visual-planner/SKILL.md",
+    "skill_name_installed": "segment-visual-planner",
+    "default_category": "general"
+  },
+  "visual_assets": {
+    "script": "scripts/build_visual_assets.py",
+    "config": "scripts/visual_assets.config.json",
+    "manifest_name": "asset-manifest.json"
+  },
+  "jimeng": {
+    "client_config": "scripts/jimeng_visual.config.json",
+    "image_script": "scripts/jimeng_generate_image.py",
+    "video_script": "scripts/jimeng_generate_video.py"
+  },
+  "tts": {
+    "script": "scripts/volc_tts_ws.py",
+    "config": "scripts/volc_tts_ws.config.json",
+    "output_format": "mp3"
+  },
+  "subtitle": {
+    "script": "scripts/align_subtitles_with_whisper.py",
+    "config": "scripts/whisper_batch_transcribe.config.json"
+  },
+  "projects": {
+    "root": "projects"
+  },
+  "library": {
+    "style_default_dir": "library/style/default",
+    "voice_default_file": "library/voice/default/voice.mp3"
+  }
+}

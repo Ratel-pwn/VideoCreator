@@ -1,0 +1,50 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Local temp
+AGENTS.md.tmp
+*.tmp
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Runtime outputs
+projects/**
+!projects/sample-project/
+!projects/sample-project/README.md
+!projects/sample-project/project.json
+!projects/sample-project/assets/
+!projects/sample-project/assets/.gitkeep
+!projects/sample-project/audio/
+!projects/sample-project/audio/.gitkeep
+!projects/sample-project/drafts/
+!projects/sample-project/drafts/.gitkeep
+!projects/sample-project/library/
+!projects/sample-project/library/style/
+!projects/sample-project/library/style/.gitkeep
+!projects/sample-project/library/voice/
+!projects/sample-project/library/voice/.gitkeep
+!projects/sample-project/runs/
+!projects/sample-project/runs/.gitkeep
+!projects/sample-project/sessions/
+!projects/sample-project/sessions/.gitkeep
+
+library/**
+!library/style/
+!library/style/default/
+!library/style/default/.gitkeep
+!library/voice/
+!library/voice/default/
+!library/voice/default/.gitkeep
+
+# Local runtime configs (keep local, do not publish raw values)
+scripts/jimeng_visual.config.json
+scripts/volc_tts_ws.config.json
+scripts/whisper_batch_transcribe.config.json
+scripts/yt_batch_download.config.json
