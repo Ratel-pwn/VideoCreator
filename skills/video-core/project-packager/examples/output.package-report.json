@@ -1,0 +1,17 @@
+{
+  "video_id": "demo-product-launch",
+  "artifact_type": "package_report",
+  "generated_at": "2026-04-22T20:00:00+08:00",
+  "package_path": "output/demo-product-launch",
+  "manifest_path": "output/demo-product-launch/manifest.json",
+  "cleanup_report": {
+    "removed": [
+      "render/tmp-preview.mp4",
+      "render/tmp-audio.wav"
+    ],
+    "preserved": [
+      "sources/export-flow.png",
+      "sources/product-doc.md"
+    ]
+  }
+}

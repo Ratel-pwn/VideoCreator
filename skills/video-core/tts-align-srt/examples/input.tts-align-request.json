@@ -1,0 +1,12 @@
+{
+  "video_id": "demo-product-launch",
+  "artifact_type": "tts_align_request",
+  "generated_at": "2026-04-22T20:00:00+08:00",
+  "final_audio_path": "work/audio/final.wav",
+  "approved_text": "This release turns your weekly reporting loop into a one click export.",
+  "alignment_engine": {
+    "provider": "forced-aligner",
+    "profile": "default-en"
+  },
+  "provisional_srt_path": "work/subtitles/provisional.srt"
+}

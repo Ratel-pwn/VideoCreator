@@ -1,0 +1,20 @@
+{
+  "video_id": "demo-product-launch",
+  "artifact_type": "aligned_segments_request",
+  "generated_at": "2026-04-22T20:00:00+08:00",
+  "aspect_ratio": "9:16",
+  "language": "en",
+  "style": {
+    "max_chars_per_line": 20,
+    "min_duration_ms": 900,
+    "max_duration_ms": 3200
+  },
+  "aligned_segments": [
+    {
+      "id": "seg-001",
+      "start_ms": 0,
+      "end_ms": 2600,
+      "text": "This release turns your weekly reporting loop into a one click export."
+    }
+  ]
+}

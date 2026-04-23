@@ -1,0 +1,14 @@
+{
+  "video_id": "demo-product-launch",
+  "artifact_type": "tts_align_result",
+  "generated_at": "2026-04-22T20:00:00+08:00",
+  "aligned_srt_path": "work/subtitles/aligned.srt",
+  "timing_json_path": "work/subtitles/aligned.json",
+  "report": {
+    "coverage_percent": 100,
+    "low_confidence_spans": [],
+    "notes": [
+      "Aligned subtitle output is now the canonical timing source."
+    ]
+  }
+}

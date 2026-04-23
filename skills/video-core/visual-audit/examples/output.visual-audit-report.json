@@ -1,0 +1,20 @@
+{
+  "video_id": "demo-product-launch",
+  "artifact_type": "visual_audit_report",
+  "generated_at": "2026-04-22T20:00:00+08:00",
+  "status": "fail",
+  "scene_findings": [
+    {
+      "scene_id": "scene-02",
+      "severity": "high",
+      "message": "Primary callout text overlaps a dense chart region and becomes unreadable."
+    }
+  ],
+  "required_actions": [
+    "Move the callout to a low-noise region or dim the chart behind the text."
+  ],
+  "gate_summary": {
+    "pre_render": "fail",
+    "post_render": "not_run"
+  }
+}

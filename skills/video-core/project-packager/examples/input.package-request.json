@@ -1,0 +1,21 @@
+{
+  "video_id": "demo-product-launch",
+  "artifact_type": "package_request",
+  "generated_at": "2026-04-22T20:00:00+08:00",
+  "project_root": "output",
+  "deliverables": [
+    "render/final.mp4",
+    "subtitles/aligned.srt",
+    "meta/cover.png",
+    "meta/metadata.json"
+  ],
+  "source_assets": [
+    "sources/export-flow.png",
+    "sources/product-doc.md"
+  ],
+  "intermediate_assets": [
+    "render/tmp-preview.mp4",
+    "render/tmp-audio.wav"
+  ],
+  "cleanup_approved": true
+}

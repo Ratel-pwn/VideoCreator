@@ -1,0 +1,17 @@
+{
+  "openai": {
+    "api_key": "YOUR_OPENAI_API_KEY",
+    "base_url": "https://api.openai.com/v1",
+    "model": "gpt-5.4"
+  },
+  "tts": {
+    "provider": "elevenlabs",
+    "api_key": "YOUR_TTS_API_KEY",
+    "voice_id": "YOUR_VOICE_ID"
+  },
+  "paths": {
+    "workspace_root": "E:/Projects/AIGC/VideoCreator",
+    "output_root": "E:/Projects/AIGC/VideoCreator/output",
+    "temp_root": "E:/Projects/AIGC/VideoCreator/tmp"
+  }
+}

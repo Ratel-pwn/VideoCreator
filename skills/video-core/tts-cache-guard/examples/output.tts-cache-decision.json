@@ -1,0 +1,18 @@
+{
+  "video_id": "demo-product-launch",
+  "artifact_type": "tts_cache_decision",
+  "generated_at": "2026-04-22T20:00:00+08:00",
+  "decision": "reuse",
+  "fingerprint": "abc123",
+  "reasoning": [
+    "Existing paid cloned voice asset matches the current script fingerprint.",
+    "No force override was requested."
+  ],
+  "provenance_record": {
+    "provider": "elevenlabs",
+    "voice_id": "cloned-host-01",
+    "pricing_tier": "paid",
+    "mode": "cloned",
+    "asset_path": "work/audio/final.wav"
+  }
+}

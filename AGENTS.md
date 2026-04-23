@@ -1,9 +1,35 @@
-﻿# ChaosMuseum AGENTS.md
+# VideoCreator AGENTS.md
 
 ## Purpose
 
-This repository is a content production pipeline for short-form humanities, science, and technology videos.
-The current implemented workflow is:
+This repository now serves two closely related purposes:
+
+1. it remains a local-first short-video production pipeline
+2. it is the integration workspace for extracting reusable capabilities from:
+   - `E:\Projects\AIGC\ChaosMuseum`
+   - `E:\Projects\Experiment\remotion-demo`
+
+Do not modify the two source projects during the integration design phase.
+Use this repository to stabilize reusable contracts, skills, and orchestration boundaries first.
+
+## Source Of Truth
+
+Use these locations consistently:
+
+- `skills/` stores project-owned skills and reusable capability definitions
+- `scripts/` stores executable workflow and utility scripts only
+- `docs/` stores external API docs and reference material only
+- `plans/` stores roadmap, split decisions, and architecture notes
+- `config/` stores public config examples plus local-only ignored config files
+- `library/` stores global style and voice resources
+- `projects/<project>/` stores generated artifacts and project-local overrides
+
+Do not place new skill-like prompts in `docs/`.
+If a prompt governs agent behavior or a reusable workflow step, it belongs in `skills/`.
+
+## Current Workflow
+
+The currently implemented pipeline is still:
 
 1. topic discussion and collection
 2. article generation from the conversation
@@ -13,21 +39,25 @@ The current implemented workflow is:
 6. asset collection or generation per segment
 7. final video assembly reserved only, not implemented yet
 
-When changing this project, preserve that workflow unless the user explicitly requests a redesign.
+Preserve that workflow unless the user explicitly requests a redesign.
 
-## Source Of Truth
+## Integration Direction
 
-Use these locations consistently:
+The long-term architecture should separate:
 
-- `skills/` stores project-owned skills only
-- `scripts/` stores executable workflow and utility scripts only
-- `docs/` stores external API docs and reference material only
-- `plans/` stores roadmap, pending decisions, and future implementation notes
-- `library/` stores global style and voice resources
-- `projects/<project>/` stores generated artifacts and project-local overrides
+1. shared infrastructure
+2. scenario-specific writing and visual strategy
+3. orchestration / composition
 
-Do not place new skill-like prompts in `docs/`.
-If a prompt governs agent behavior or a reusable workflow step, it belongs in `skills/`.
+Preferred build order:
+
+1. define reusable skill boundaries
+2. define input/output contracts
+3. implement shared subtitle / TTS / packaging infrastructure
+4. implement scenario-level writing and visual planners
+5. implement orchestration
+
+Do not silently merge everything into one giant workflow skill.
 
 ## Output Layout
 
@@ -48,15 +78,20 @@ Rules:
 - `drafts/` stores article drafts and approved article files
 - `sessions/` stores conversation records and preparation notes
 
-Do not create flat global folders like `projects/audio` or `projects/drafts` at the repository root again.
-Do not store the global voice source inside the global style library.
+## Config Rules
+
+Sensitive values such as API keys, access tokens, and machine-specific paths must stay in local config files and must not be committed.
+
+- committed examples belong in `config/*.example.json` or existing script-level example config files
+- local real values belong in `config/*.local.json` or ignored script-level `.config.json` files
+
+If a future script requires credentials, read local config first and treat example config as documentation only.
 
 ## Workflow Rules
 
 ### Topic chat
 
 - The prepare/chat behavior is defined by `skills/prepare-topic-chat/SKILL.md`
-- Do not reintroduce a separate chat system prompt in `docs/`
 - The chat phase should gather useful angles, examples, definitions, disputes, and hooks for later writing
 
 ### Article generation
@@ -76,7 +111,6 @@ Do not store the global voice source inside the global style library.
 - Final subtitles must use the original approved article text as the subtitle text source
 - Whisper is used for timestamps only
 - If Whisper text differs from the article text, keep the article text and use Whisper timing
-- Do not keep extra intermediate subtitle files unless the user explicitly asks for them
 - The expected final subtitle artifact is the normal `.srt` beside the final audio
 
 ### Visual planning
@@ -91,25 +125,18 @@ Do not store the global voice source inside the global style library.
 - Asset lookup must try reusable online material first when the plan says `search_first`
 - If no usable online material is found, fallback to Jimeng image/video generation
 - Asset files must be saved under `projects/<project>/assets/`
-- Asset file names must use `timestamp + visual brief`
 - `runs/asset-manifest.json` is the source of truth for resolved assets
 
-## Maintenance Rules
+## Quality Bar
 
-- Prefer improving Python scripts over adding manual multi-step instructions
-- If a new repeated workflow appears, first consider whether it belongs in `skills/` or `scripts/`
-- If a new provider or API is introduced, store the provider documentation in `docs/` first, then wire scripts against it
-- If a new major stage is planned but not implemented, record it in `plans/workflow-roadmap.md`
-- Keep `main.py` as the workflow orchestrator; avoid scattering orchestration logic across many unrelated files
+Every reusable skill should answer:
 
-## Iteration Rules
+- what exact problem it solves
+- what input it expects
+- what output it must produce
+- what it explicitly does not own
 
-When extending the pipeline:
-
-- update the relevant skill if the change affects agent behavior or generation logic
-- update the relevant script if the change affects executable processing
-- update `workflow.config.json` if the change introduces new configurable behavior
-- update `plans/workflow-roadmap.md` if the change opens a new future stage or unresolved design decision
+If those four points are blurry, the skill boundary is still wrong.
 
 ## Current Non-Goals
 
@@ -117,19 +144,5 @@ These are intentionally not implemented yet:
 
 - final video timeline assembly
 - automatic compositor selection
-- unifying all image/video search providers into one abstraction
-
-Do not implement those silently. Record the decision path first in `plans/workflow-roadmap.md` and only then add code.
-
-## Practical Defaults
-
-- Default article input for voice is the approved draft
-- Default subtitle output is a single final `.srt`
-- Default visual planning input is the final subtitle file
-- Default visual planning output is `drafts/visual-plan.json`
-- Default asset resolution output is `runs/asset-manifest.json`
-- Default global style library is `library/style/default`
-- Default global voice source is `library/voice/default/voice.mp3`
-- Project-local overrides live in `projects/<project>/project.json` and `projects/<project>/library/`
-- Default project directory name should be derived from the topic and normalized for reuse
-- Prefer keeping final artifacts and deleting only disposable debug intermediates
+- silently replacing the original working pipelines
+- creating one universal mega skill before the contracts are stable

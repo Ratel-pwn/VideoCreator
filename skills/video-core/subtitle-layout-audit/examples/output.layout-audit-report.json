@@ -1,0 +1,19 @@
+{
+  "video_id": "demo-product-launch",
+  "artifact_type": "subtitle_layout_audit_report",
+  "generated_at": "2026-04-22T20:00:00+08:00",
+  "status": "fail",
+  "findings": [
+    {
+      "code": "subtitle_too_low",
+      "severity": "high",
+      "message": "Subtitle box sits 48px below the lower-third safe area."
+    }
+  ],
+  "required_actions": [
+    "Move subtitle box upward by at least 48px."
+  ],
+  "checked_inputs": [
+    "previews/scene-02-frame-01.png"
+  ]
+}

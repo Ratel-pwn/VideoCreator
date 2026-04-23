@@ -1,0 +1,30 @@
+{
+  "video_id": "demo-product-launch",
+  "artifact_type": "visual_audit_request",
+  "generated_at": "2026-04-22T20:00:00+08:00",
+  "scenes": [
+    {
+      "scene_id": "scene-02",
+      "spoken_point": "Show the export flow and confirm that one click execution is visible."
+    }
+  ],
+  "frames": [
+    {
+      "scene_id": "scene-02",
+      "path": "previews/scene-02-frame-01.png"
+    }
+  ],
+  "source_evidence": [
+    {
+      "scene_id": "scene-02",
+      "type": "screenshot",
+      "path": "sources/export-flow.png"
+    }
+  ],
+  "narration_map": [
+    {
+      "scene_id": "scene-02",
+      "text": "One click export means the operator never rebuilds the report by hand."
+    }
+  ]
+}

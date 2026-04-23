@@ -1,0 +1,28 @@
+{
+  "video_id": "demo-product-launch",
+  "artifact_type": "segmented_captions",
+  "generated_at": "2026-04-22T20:00:00+08:00",
+  "segments": [
+    {
+      "id": "cap-001",
+      "source_segment_id": "seg-001",
+      "start_ms": 0,
+      "end_ms": 1300,
+      "text": "This release turns"
+    },
+    {
+      "id": "cap-002",
+      "source_segment_id": "seg-001",
+      "start_ms": 1300,
+      "end_ms": 2600,
+      "text": "your weekly reporting loop into a one click export"
+    }
+  ],
+  "report": {
+    "rule_hits": [
+      "semantic_split_before_wrap",
+      "trailing_punctuation_removed"
+    ],
+    "wrap_risks_remaining": []
+  }
+}

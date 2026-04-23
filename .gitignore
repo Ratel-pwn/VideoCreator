@@ -1,4 +1,4 @@
-﻿# Python
+# Python
 __pycache__/
 *.py[cod]
 *.pyo
@@ -48,3 +48,5 @@ scripts/jimeng_visual.config.json
 scripts/volc_tts_ws.config.json
 scripts/whisper_batch_transcribe.config.json
 scripts/yt_batch_download.config.json
+config/*.local.json
+config/*.private.json

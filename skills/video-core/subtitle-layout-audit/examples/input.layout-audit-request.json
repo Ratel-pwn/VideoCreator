@@ -1,0 +1,31 @@
+{
+  "video_id": "demo-product-launch",
+  "artifact_type": "subtitle_layout_audit_request",
+  "generated_at": "2026-04-22T20:00:00+08:00",
+  "aspect_ratio": "9:16",
+  "subtitle_box": {
+    "x": 72,
+    "y": 1500,
+    "width": 936,
+    "height": 160
+  },
+  "font_size_px": 52,
+  "safe_area": {
+    "top": 160,
+    "right": 72,
+    "bottom": 240,
+    "left": 72
+  },
+  "ui_blocks": [
+    {
+      "name": "callout-card",
+      "x": 120,
+      "y": 1320,
+      "width": 840,
+      "height": 180
+    }
+  ],
+  "preview_frames": [
+    "previews/scene-02-frame-01.png"
+  ]
+}
