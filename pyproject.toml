@@ -10,4 +10,4 @@ dev = ["pytest>=8,<9"]
 testpaths = ["tests"]
 pythonpath = ["."]
 addopts = "-q"
-markers = ["integration: invokes FFmpeg and Remotion to render media"]
+markers = ["integration: runs the real Remotion and FFmpeg toolchain"]
