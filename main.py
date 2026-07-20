@@ -221,6 +221,7 @@ class WorkflowContext:
     run_id: str
     project_name: str
     run_dir: Path
+    project_root_override: Path | None = None
     topic: str = ""
     mode: str = "chat"
     imported_chat: Path | None = None
@@ -235,7 +236,7 @@ class WorkflowContext:
 
     @property
     def project_root(self) -> Path:
-        return self.output_root / self.project_name
+        return self.project_root_override or (self.output_root / self.project_name)
 
     @property
     def global_style_library_dir(self) -> Path:
@@ -809,6 +810,7 @@ def resume_context(repo_root: Path, config_path: Path, run_dir: Path) -> Workflo
         run_id=state["run_id"],
         project_name=project_name,
         run_dir=run_dir,
+        project_root_override=project_root,
         topic=manifest.get("topic", ""),
         mode=state.get("mode", "chat"),
         imported_chat=None,
