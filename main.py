@@ -76,7 +76,7 @@ def normalize_project_name(value: str) -> str:
 def load_json(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
-    return json.loads(path.read_text(encoding="utf-8"))
+    return json.loads(path.read_text(encoding="utf-8-sig"))
 
 
 def save_json(path: Path, data: dict[str, Any]) -> None:
