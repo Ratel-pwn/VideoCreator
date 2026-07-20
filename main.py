@@ -14,6 +14,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from videocreator.asset_manifest import audit_asset_manifest
+from videocreator.media import (
+    clean_audio_and_srt,
+    detect_trailing_silence,
+    probe_media,
+)
+from videocreator.render_contract import build_render_input, normalize_scenes
 from videocreator.workflow_state import STAGES, missing_stage_handlers
 
 
@@ -41,6 +48,11 @@ FINAL_ARTIFACT_KEYS = {
     "voice_subtitle": False,
     "visual_plan": True,
     "asset_manifest": True,
+    "render_input": True,
+    "voice_audio_cleaned": True,
+    "voice_subtitle_cleaned": True,
+    "final_video": True,
+    "render_report": True,
 }
 
 
@@ -659,15 +671,103 @@ def confirm_visual_assets(ctx: WorkflowContext) -> None:
     print("??? visual-plan.json??????????????????")
     ctx.set_stage(STAGE_VISUAL_ASSETS, status="ready")
 def run_video_render(ctx: WorkflowContext) -> None:
-    raise RuntimeError(
-        "Remotion renderer is not installed; finish renderer setup before entering video_render"
+    ctx.set_stage(STAGE_VIDEO_RENDER)
+    artifacts = ctx.manifest.get("artifacts", {})
+    required = ("voice_audio", "voice_subtitle", "visual_plan", "asset_manifest")
+    missing = [key for key in required if not artifacts.get(key)]
+    if missing:
+        raise RuntimeError(f"Video render is missing artifacts: {', '.join(missing)}")
+
+    audio_path = Path(artifacts["voice_audio"])
+    subtitle_path = Path(artifacts["voice_subtitle"])
+    visual_plan_path = Path(artifacts["visual_plan"])
+    asset_manifest_path = Path(artifacts["asset_manifest"])
+    visual_plan = load_json(visual_plan_path)
+    asset_manifest = load_json(asset_manifest_path)
+    audit = audit_asset_manifest(ctx.project_root, visual_plan, asset_manifest)
+    if not audit.ok:
+        raise RuntimeError("Asset audit failed:\n" + "\n".join(audit.errors))
+
+    duration_ms = probe_media(audio_path).duration_ms
+    spoken_end_ms = detect_trailing_silence(
+        audio_path, total_duration_ms=duration_ms
     )
+    if spoken_end_ms is not None and duration_ms - spoken_end_ms >= 1_000:
+        render_audio, render_subtitle = clean_audio_and_srt(
+            audio_path,
+            subtitle_path,
+            ctx.project_root / "audio",
+            spoken_end_ms=spoken_end_ms,
+        )
+    else:
+        spoken_end_ms = duration_ms
+        render_audio, render_subtitle = audio_path, subtitle_path
+
+    records = {
+        record["scene_id"]: record for record in asset_manifest.get("segments", [])
+    }
+    renderer_cfg = ctx.config["renderer"]
+    scenes = normalize_scenes(
+        visual_plan,
+        records,
+        fps=int(renderer_cfg["fps"]),
+        spoken_end_ms=spoken_end_ms,
+    )
+
+    def project_relative(path: Path) -> str:
+        try:
+            return path.resolve().relative_to(ctx.project_root.resolve()).as_posix()
+        except ValueError as exc:
+            raise RuntimeError(f"Render media must be inside project root: {path}") from exc
+
+    render_input = build_render_input(
+        video_id=slugify(ctx.project_name),
+        scenes=scenes,
+        audio_path=project_relative(render_audio),
+        subtitle_path=project_relative(render_subtitle),
+        fps=int(renderer_cfg["fps"]),
+    )
+    render_input_path = ctx.run_dir / "render-input.json"
+    final_video_path = ctx.run_dir / "final.mp4"
+    render_report_path = ctx.run_dir / "render-report.json"
+    save_json(render_input_path, render_input)
+    command = [
+        sys.executable,
+        str(ctx.repo_root / "scripts" / "render_video.py"),
+        "--project-root",
+        str(ctx.project_root),
+        "--input",
+        str(render_input_path),
+        "--output",
+        str(final_video_path),
+    ]
+    try:
+        subprocess.run(command, check=True)
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(f"Remotion render failed with code {exc.returncode}") from exc
+
+    ctx.register_artifact("render_input", render_input_path)
+    ctx.register_artifact("voice_audio_cleaned", render_audio)
+    ctx.register_artifact("voice_subtitle_cleaned", render_subtitle)
+    ctx.register_artifact("final_video", final_video_path)
+    ctx.register_artifact("render_report", render_report_path)
+    ctx.set_stage(STAGE_VIDEO_RENDER_CONFIRM, status="awaiting_confirmation")
 
 
 def confirm_video_render(ctx: WorkflowContext) -> None:
-    raise RuntimeError(
-        "Remotion renderer is not installed; finish renderer setup before confirming video_render"
-    )
+    print(f"Final video: {ctx.manifest['artifacts']['final_video']}")
+    if not ctx.config["confirm"].get("video", True):
+        cleanup_intermediate(ctx)
+        ctx.set_stage(STAGE_DONE, status="completed")
+        return
+    decision = request_confirmation("Approve final video")
+    if decision == "y":
+        cleanup_intermediate(ctx)
+        ctx.set_stage(STAGE_DONE, status="completed")
+        return
+    if decision == "q":
+        raise SystemExit(0)
+    ctx.set_stage(STAGE_VIDEO_RENDER, status="ready")
 
 
 def cleanup_intermediate(ctx: WorkflowContext) -> None:

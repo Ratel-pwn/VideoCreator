@@ -14,8 +14,45 @@ This repository also serves as the integration workspace for extracting reusable
 - Volcengine TTS voice synthesis
 - subtitle alignment using original text plus Whisper timestamps
 - semantic visual planning from subtitles and draft text
-- visual asset resolution through search-first and generation fallback flows
+- AI-curated web asset requests and local media audit
+- Remotion final assembly with hard cuts, narration, and burned-in subtitles
 - reusable skill boundary design for future multi-scenario orchestration
+
+## Final video assembly
+
+Install the locked Remotion dependencies once:
+
+```powershell
+npm --prefix renderer install
+```
+
+Register an existing project without moving its draft, audio, subtitle, or visual-plan files:
+
+```powershell
+python scripts/import_legacy_project.py projects/<project> --run-id <run-id>
+```
+
+Create the web-research request, then have AI find and download suitable online assets into the project's `assets/` directory. Generation providers are disabled by default.
+
+```powershell
+python scripts/create_asset_request.py projects/<project>/drafts/visual-plan.json projects/<project>/drafts/asset-request.json
+python scripts/audit_asset_manifest.py projects/<project> projects/<project>/drafts/visual-plan.json projects/<project>/runs/<run-id>/asset-manifest.json
+```
+
+Preview the composition or resume the full workflow:
+
+```powershell
+npm --prefix renderer run studio
+python main.py resume projects/<project>/runs/<run-id>
+```
+
+To render an already prepared `render-input.json` directly:
+
+```powershell
+python scripts/render_video.py --project-root projects/<project> --input projects/<project>/runs/<run-id>/render-input.json --output projects/<project>/runs/<run-id>/final.mp4
+```
+
+The final quality gate requires an approved provenance record for every non-text scene. The renderer outputs 1920x1080, 25fps H.264/AAC MP4 with adjacent hard cuts and burned-in SRT captions.
 
 ## Repository policy
 
@@ -46,6 +83,7 @@ Excluded:
 - `config/`: public config examples and local config conventions
 - `library/`: global style and voice directory skeleton only
 - `projects/`: project template plus local/generated project work
+- `renderer/`: typed Remotion composition and local rendering bridge
 
 ## Config files
 

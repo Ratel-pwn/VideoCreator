@@ -89,6 +89,41 @@ def parse_trailing_silence(
     return analysis_offset_ms + round(starts[-1] * 1000)
 
 
+def detect_trailing_silence(
+    audio_path: Path,
+    *,
+    total_duration_ms: int,
+    analysis_window_ms: int = 120_000,
+    runner: Callable[..., Any] = subprocess.run,
+) -> int | None:
+    analysis_offset_ms = max(0, total_duration_ms - analysis_window_ms)
+    completed = runner(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-ss",
+            f"{analysis_offset_ms / 1000:.3f}",
+            "-i",
+            str(audio_path),
+            "-af",
+            "silencedetect=noise=-40dB:d=1.0",
+            "-f",
+            "null",
+            "-",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    return parse_trailing_silence(
+        completed.stderr,
+        analysis_offset_ms=analysis_offset_ms,
+        total_duration_ms=total_duration_ms,
+    )
+
+
 def _timestamp_to_ms(value: str) -> int:
     hours, minutes, remainder = value.split(":")
     seconds, milliseconds = remainder.split(",")

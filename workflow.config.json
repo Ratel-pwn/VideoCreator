@@ -57,5 +57,15 @@
   "library": {
     "style_default_dir": "library/style/default",
     "voice_default_file": "library/voice/default/voice.mp3"
+  },
+  "renderer": {
+    "engine": "remotion",
+    "project_dir": "renderer",
+    "composition_id": "NarratedVideo",
+    "width": 1920,
+    "height": 1080,
+    "fps": 25,
+    "codec": "h264",
+    "generation_enabled": false
   }
 }

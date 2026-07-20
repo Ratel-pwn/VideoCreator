@@ -3,6 +3,7 @@ from unittest.mock import Mock
 
 from videocreator.media import (
     clean_audio_and_srt,
+    detect_trailing_silence,
     parse_ffprobe_json,
     parse_trailing_silence,
 )
@@ -49,6 +50,26 @@ def test_parse_trailing_silence_rejects_non_trailing_silence():
         )
         is None
     )
+
+
+def test_detect_trailing_silence_analyzes_only_the_audio_tail(tmp_path: Path):
+    completed = Mock()
+    completed.stderr = (
+        "silence_start: 18.367417\n"
+        "silence_end: 69.064 | silence_duration: 50.696583"
+    )
+    runner = Mock(return_value=completed)
+
+    spoken_end = detect_trailing_silence(
+        tmp_path / "voice.mp3",
+        total_duration_ms=269_126,
+        analysis_window_ms=69_126,
+        runner=runner,
+    )
+
+    assert spoken_end == 218_367
+    command = runner.call_args.args[0]
+    assert command[command.index("-ss") + 1] == "200.000"
 
 
 def test_clean_audio_and_srt_creates_derivatives_without_changing_sources(tmp_path: Path):
