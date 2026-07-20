@@ -165,26 +165,43 @@ def clean_audio_and_srt(
     *,
     spoken_end_ms: int,
     runner: Callable[..., Any] = subprocess.run,
+    probe_duration: Callable[[Path], int] | None = None,
 ) -> tuple[Path, Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     cleaned_audio = output_dir / "voice.cleaned.mp3"
     cleaned_srt = output_dir / "voice.cleaned.srt"
 
-    runner(
-        [
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(audio_path),
-            "-t",
-            f"{spoken_end_ms / 1000:.3f}",
-            "-c:a",
-            "libmp3lame",
-            str(cleaned_audio),
-        ],
-        check=True,
-        capture_output=True,
-    )
+    duration_probe = probe_duration or (lambda path: probe_media(path).duration_ms)
+    requested_duration_ms = spoken_end_ms
+    actual_duration_ms = 0
+    for _ in range(3):
+        runner(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(audio_path),
+                "-af",
+                "apad=pad_dur=1",
+                "-t",
+                f"{requested_duration_ms / 1000:.3f}",
+                "-c:a",
+                "libmp3lame",
+                str(cleaned_audio),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        actual_duration_ms = duration_probe(cleaned_audio)
+        difference_ms = spoken_end_ms - actual_duration_ms
+        if abs(difference_ms) <= 40:
+            break
+        requested_duration_ms = max(1, requested_duration_ms + difference_ms)
+    else:
+        raise RuntimeError(
+            "Cleaned audio duration differs from spoken boundary: "
+            f"{actual_duration_ms}ms vs {spoken_end_ms}ms"
+        )
     source_srt = subtitle_path.read_text(encoding="utf-8-sig")
     cleaned_srt.write_text(_clamp_srt(source_srt, spoken_end_ms), encoding="utf-8")
     return cleaned_audio, cleaned_srt

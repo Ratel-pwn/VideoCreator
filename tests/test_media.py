@@ -89,6 +89,7 @@ def test_clean_audio_and_srt_creates_derivatives_without_changing_sources(tmp_pa
         tmp_path / "cleaned",
         spoken_end_ms=2_200,
         runner=runner,
+        probe_duration=lambda _: 2_200,
     )
 
     assert cleaned_audio.name == "voice.cleaned.mp3"
@@ -100,3 +101,27 @@ def test_clean_audio_and_srt_creates_derivatives_without_changing_sources(tmp_pa
     command = runner.call_args.args[0]
     assert command[0] == "ffmpeg"
     assert command[command.index("-t") + 1] == "2.200"
+
+
+def test_clean_audio_retries_with_measured_encoder_shortfall(tmp_path: Path):
+    audio = tmp_path / "voice.mp3"
+    subtitle = tmp_path / "voice.srt"
+    audio.write_bytes(b"audio")
+    subtitle.write_text(
+        "1\n00:00:00,000 --> 00:00:02,200\nCaption\n", encoding="utf-8"
+    )
+    runner = Mock()
+    measured = iter([1_936, 2_200])
+
+    clean_audio_and_srt(
+        audio,
+        subtitle,
+        tmp_path / "cleaned",
+        spoken_end_ms=2_200,
+        runner=runner,
+        probe_duration=lambda _: next(measured),
+    )
+
+    assert runner.call_count == 2
+    second_command = runner.call_args_list[1].args[0]
+    assert second_command[second_command.index("-t") + 1] == "2.464"
