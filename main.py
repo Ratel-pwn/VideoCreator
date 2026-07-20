@@ -14,6 +14,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from videocreator.workflow_state import STAGES, missing_stage_handlers
+
 
 STAGE_PREPARE = "prepare"
 STAGE_CHAT = "chat"
@@ -25,7 +27,8 @@ STAGE_VISUAL_PLAN = "visual_plan"
 STAGE_VISUAL_PLAN_CONFIRM = "visual_plan_confirm"
 STAGE_VISUAL_ASSETS = "visual_assets"
 STAGE_VISUAL_ASSETS_CONFIRM = "visual_assets_confirm"
-STAGE_VIDEO_STUB = "video_stub"
+STAGE_VIDEO_RENDER = "video_render"
+STAGE_VIDEO_RENDER_CONFIRM = "video_render_confirm"
 STAGE_DONE = "done"
 
 FINAL_ARTIFACT_KEYS = {
@@ -645,30 +648,26 @@ def run_visual_assets(ctx: WorkflowContext) -> None:
 def confirm_visual_assets(ctx: WorkflowContext) -> None:
     print(f"????????{ctx.manifest['artifacts']['asset_manifest']}")
     if not ctx.config["confirm"].get("assets", True):
-        ctx.set_stage(STAGE_VIDEO_STUB, status="ready")
+        ctx.set_stage(STAGE_VIDEO_RENDER, status="ready")
         return
     decision = request_confirmation("??????")
     if decision == "y":
-        ctx.set_stage(STAGE_VIDEO_STUB, status="ready")
+        ctx.set_stage(STAGE_VIDEO_RENDER, status="ready")
         return
     if decision == "q":
         raise SystemExit(0)
     print("??? visual-plan.json??????????????????")
     ctx.set_stage(STAGE_VISUAL_ASSETS, status="ready")
-def run_video_stub(ctx: WorkflowContext) -> None:
-    ctx.set_stage(STAGE_VIDEO_STUB)
-    note = {
-        "status": "placeholder",
-        "message": "Video stage is reserved only. See docs/workflow-roadmap.md for the next implementation step.",
-        "updated_at": now_iso(),
-    }
-    save_json(ctx.run_dir / "video_stub.json", note)
-    if ctx.config["confirm"]["video"]:
-        decision = request_confirmation("视频阶段当前仅占位，是否确认结束本次流程")
-        if decision == "q":
-            raise SystemExit(0)
-    cleanup_intermediate(ctx)
-    ctx.set_stage(STAGE_DONE, status="completed")
+def run_video_render(ctx: WorkflowContext) -> None:
+    raise RuntimeError(
+        "Remotion renderer is not installed; finish renderer setup before entering video_render"
+    )
+
+
+def confirm_video_render(ctx: WorkflowContext) -> None:
+    raise RuntimeError(
+        "Remotion renderer is not installed; finish renderer setup before confirming video_render"
+    )
 
 
 def cleanup_intermediate(ctx: WorkflowContext) -> None:
@@ -719,28 +718,42 @@ def resume_context(repo_root: Path, config_path: Path, run_dir: Path) -> Workflo
     )
 
 
+def finish_workflow(ctx: WorkflowContext) -> bool:
+    print(f"流程已完成：{ctx.run_dir}")
+    return True
+
+
+def build_stage_handlers() -> dict[str, Any]:
+    return {
+        STAGE_PREPARE: run_prepare,
+        STAGE_CHAT: run_chat,
+        STAGE_DRAFT: run_draft,
+        STAGE_DRAFT_CONFIRM: run_draft,
+        STAGE_TTS: run_tts,
+        STAGE_TTS_CONFIRM: confirm_tts,
+        STAGE_VISUAL_PLAN: run_visual_plan,
+        STAGE_VISUAL_PLAN_CONFIRM: confirm_visual_plan,
+        STAGE_VISUAL_ASSETS: run_visual_assets,
+        STAGE_VISUAL_ASSETS_CONFIRM: confirm_visual_assets,
+        STAGE_VIDEO_RENDER: run_video_render,
+        STAGE_VIDEO_RENDER_CONFIRM: confirm_video_render,
+        STAGE_DONE: finish_workflow,
+    }
+
+
 def execute_from_current_stage(ctx: WorkflowContext) -> None:
+    handlers = build_stage_handlers()
+    missing = missing_stage_handlers(handlers)
+    if missing:
+        raise RuntimeError(f"Missing stage handlers: {', '.join(missing)}")
+
     while True:
         stage = ctx.state.get("current_stage")
-        if stage == STAGE_PREPARE:
-            run_prepare(ctx)
-        elif stage == STAGE_CHAT:
-            run_chat(ctx)
-        elif stage == STAGE_DRAFT:
-            run_draft(ctx)
-        elif stage == STAGE_DRAFT_CONFIRM:
-            run_draft(ctx)
-        elif stage == STAGE_TTS:
-            run_tts(ctx)
-        elif stage == STAGE_TTS_CONFIRM:
-            confirm_tts(ctx)
-        elif stage == STAGE_VIDEO_STUB:
-            run_video_stub(ctx)
-        elif stage == STAGE_DONE:
-            print(f"流程已完成：{ctx.run_dir}")
-            break
-        else:
+        handler = handlers.get(stage)
+        if handler is None:
             raise RuntimeError(f"Unknown stage: {stage}")
+        if handler(ctx):
+            break
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Unified topic -> draft -> voice -> visual workflow")
