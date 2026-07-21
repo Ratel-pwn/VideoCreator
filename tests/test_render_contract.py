@@ -1,3 +1,5 @@
+import pytest
+
 from videocreator.render_contract import build_render_input, normalize_scenes
 
 
@@ -61,3 +63,70 @@ def test_build_render_input_uses_last_scene_as_duration():
     assert value["fps"] == 25
     assert value["durationInFrames"] == 55
     assert value["audioPath"] == "audio/voice.cleaned.mp3"
+
+
+def test_build_render_input_maps_project_presentation_to_frame():
+    scenes = [
+        {
+            "id": "scene-001",
+            "fromFrame": 0,
+            "durationInFrames": 25,
+            "assetType": "subtitle_only",
+            "assetPath": "",
+            "fitMode": "cover",
+            "trimBeforeFrames": 0,
+            "mediaDurationInFrames": 0,
+            "shortVideoPolicy": "reject",
+            "motionPreset": "none",
+        }
+    ]
+
+    value = build_render_input(
+        video_id="capitalism-pandora",
+        scenes=scenes,
+        audio_path="audio/voice.cleaned.mp3",
+        subtitle_path="audio/voice.cleaned.srt",
+        presentation={
+            "frame_preset": "editorial-wide",
+            "video_title": "\u8d44\u672c\u4e3b\u4e49\u7684\u6f58\u591a\u62c9\u9b54\u76d2\u662f\u5982\u4f55\u5f00\u542f\u7684\uff1f",
+            "publication_date": "2026.07.21",
+            "creator_handle": "@\u901a\u804c\u8005Ratel",
+        },
+    )
+
+    assert value["frame"] == {
+        "preset": "editorial-wide",
+        "videoTitle": "\u8d44\u672c\u4e3b\u4e49\u7684\u6f58\u591a\u62c9\u9b54\u76d2\u662f\u5982\u4f55\u5f00\u542f\u7684\uff1f",
+        "publicationDate": "2026.07.21",
+        "creatorHandle": "@\u901a\u804c\u8005Ratel",
+    }
+
+
+def test_build_render_input_rejects_incomplete_presentation():
+    scenes = [
+        {
+            "id": "scene-001",
+            "fromFrame": 0,
+            "durationInFrames": 25,
+            "assetType": "subtitle_only",
+            "assetPath": "",
+            "fitMode": "cover",
+            "trimBeforeFrames": 0,
+            "mediaDurationInFrames": 0,
+            "shortVideoPolicy": "reject",
+            "motionPreset": "none",
+        }
+    ]
+
+    with pytest.raises(ValueError, match="publication_date"):
+        build_render_input(
+            video_id="capitalism-pandora",
+            scenes=scenes,
+            audio_path="audio/voice.cleaned.mp3",
+            subtitle_path="audio/voice.cleaned.srt",
+            presentation={
+                "frame_preset": "editorial-wide",
+                "video_title": "Title",
+                "creator_handle": "@Ratel",
+            },
+        )

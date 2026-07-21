@@ -727,6 +727,7 @@ def run_video_render(ctx: WorkflowContext) -> None:
         audio_path=project_relative(render_audio),
         subtitle_path=project_relative(render_subtitle),
         fps=int(renderer_cfg["fps"]),
+        presentation=ctx.project_config.get("presentation"),
     )
     render_input_path = ctx.run_dir / "render-input.json"
     final_video_path = ctx.run_dir / "final.mp4"

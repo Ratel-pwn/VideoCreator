@@ -7,6 +7,26 @@ def ms_to_frame(milliseconds: int, fps: int) -> int:
     return round(milliseconds * fps / 1000)
 
 
+def normalize_frame_config(presentation: dict[str, Any]) -> dict[str, str]:
+    fields = {
+        "frame_preset": "preset",
+        "video_title": "videoTitle",
+        "publication_date": "publicationDate",
+        "creator_handle": "creatorHandle",
+    }
+    missing = [
+        source
+        for source in fields
+        if not str(presentation.get(source, "")).strip()
+    ]
+    if missing:
+        raise ValueError(f"Presentation config is missing: {', '.join(missing)}")
+    return {
+        target: str(presentation[source]).strip()
+        for source, target in fields.items()
+    }
+
+
 def normalize_scenes(
     visual_plan: dict[str, Any],
     assets_by_scene: dict[str, dict[str, Any]],
@@ -67,12 +87,13 @@ def build_render_input(
     audio_path: str,
     subtitle_path: str,
     fps: int = 25,
+    presentation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if not scenes:
         raise ValueError("At least one scene is required")
     last_scene = scenes[-1]
     duration = last_scene["fromFrame"] + last_scene["durationInFrames"]
-    return {
+    render_input = {
         "videoId": video_id,
         "width": 1920,
         "height": 1080,
@@ -83,3 +104,6 @@ def build_render_input(
         "backgroundColor": "#080b0f",
         "scenes": scenes,
     }
+    if presentation is not None:
+        render_input["frame"] = normalize_frame_config(presentation)
+    return render_input
