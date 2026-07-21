@@ -85,4 +85,13 @@ describe('render input', () => {
       ),
     ).toThrow('expected frame 25, got 24');
   });
+
+  it('accepts v2 entity and explainer scenes', () => {
+    const media = {assetType: 'image', assetPath: 'assets/a.jpg', fitMode: 'cover', trimBeforeFrames: 0, mediaDurationInFrames: 0, shortVideoPolicy: 'reject'};
+    const value = renderInputSchema.parse({videoId: 'v2', width: 1920, height: 1080, fps: 25, durationInFrames: 50, audioPath: 'audio/a.mp3', subtitlePath: 'audio/a.srt', backgroundColor: '#000', scenes: [
+      {id: 's1', fromFrame: 0, durationInFrames: 25, presentationMode: 'entity_card', backgroundAsset: media, displayAsset: {...media, fitMode: 'contain'}, entity: {primaryLabel: 'Book', secondaryLabel: 'Title'}},
+      {id: 's2', fromFrame: 25, durationInFrames: 25, presentationMode: 'explainer', backgroundAsset: media, explainer: {kind: 'list', items: ['A', 'B']}},
+    ]});
+    expect(value.scenes).toHaveLength(2);
+  });
 });

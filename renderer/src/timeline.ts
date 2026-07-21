@@ -1,5 +1,3 @@
-import type {RenderScene} from './schema';
-
 export const sceneAtFrame = <
   T extends {fromFrame: number; durationInFrames: number},
 >(
@@ -13,7 +11,7 @@ export const sceneAtFrame = <
   );
 
 export const assertContinuousTimeline = (
-  scenes: RenderScene[],
+  scenes: Array<{id: string; fromFrame: number; durationInFrames: number}>,
   durationInFrames: number,
 ) => {
   let cursor = 0;

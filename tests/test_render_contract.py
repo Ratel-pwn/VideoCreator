@@ -1,6 +1,6 @@
 import pytest
 
-from videocreator.render_contract import build_render_input, normalize_scenes
+from videocreator.render_contract import build_render_input, normalize_scenes, normalize_v2_scenes
 
 
 def test_normalize_scenes_absorbs_gaps_and_ends_at_audio_boundary():
@@ -130,3 +130,30 @@ def test_build_render_input_rejects_incomplete_presentation():
                 "creator_handle": "@Ratel",
             },
         )
+
+
+def test_normalize_v2_scenes_builds_mode_aware_payloads():
+    plan = {
+        "schema_version": 2,
+        "segments": [
+            {"segment_id": "scene-001", "start_ms": 0, "end_ms": 1000, "presentation_mode": "footage", "slots": [{"role": "primary", "required_type": "video"}]},
+            {"segment_id": "scene-002", "start_ms": 1000, "end_ms": 2000, "presentation_mode": "entity_card", "slots": [{"role": "background", "required_type": "image"}, {"role": "display", "required_type": "image"}], "entity": {"primary_label": "Book", "secondary_label": "Title"}},
+            {"segment_id": "scene-003", "start_ms": 2000, "end_ms": 3000, "presentation_mode": "explainer", "slots": [{"role": "background", "required_type": "image"}], "explainer": {"kind": "list", "items": ["A", "B"]}},
+            {"segment_id": "scene-004", "start_ms": 3000, "end_ms": 4000, "presentation_mode": "subtitle_only", "slots": []},
+        ],
+    }
+    assets = {
+        "scene-001:primary": {"asset_type": "video", "local_path": "assets/open.mp4", "fit_mode": "cover", "duration_ms": 1000},
+        "scene-002:background": {"asset_type": "image", "local_path": "assets/bg.jpg", "fit_mode": "cover"},
+        "scene-002:display": {"asset_type": "image", "local_path": "assets/book.jpg", "fit_mode": "contain"},
+        "scene-003:background": {"asset_type": "image", "local_path": "assets/concept.jpg", "fit_mode": "cover"},
+    }
+
+    scenes = normalize_v2_scenes(plan, assets, fps=25, spoken_end_ms=4000)
+
+    assert scenes[0]["presentationMode"] == "footage"
+    assert scenes[0]["primaryAsset"]["assetType"] == "video"
+    assert scenes[1]["displayAsset"]["assetPath"] == "assets/book.jpg"
+    assert scenes[1]["entity"]["primaryLabel"] == "Book"
+    assert scenes[2]["explainer"]["kind"] == "list"
+    assert scenes[3]["presentationMode"] == "subtitle_only"

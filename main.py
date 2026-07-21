@@ -20,7 +20,7 @@ from videocreator.media import (
     detect_trailing_silence,
     probe_media,
 )
-from videocreator.render_contract import build_render_input, normalize_scenes
+from videocreator.render_contract import build_render_input, normalize_scenes, normalize_v2_scenes
 from videocreator.workflow_state import STAGES, missing_stage_handlers
 
 
@@ -704,16 +704,13 @@ def run_video_render(ctx: WorkflowContext) -> None:
         spoken_end_ms = duration_ms
         render_audio, render_subtitle = audio_path, subtitle_path
 
-    records = {
-        record["scene_id"]: record for record in asset_manifest.get("segments", [])
-    }
     renderer_cfg = ctx.config["renderer"]
-    scenes = normalize_scenes(
-        visual_plan,
-        records,
-        fps=int(renderer_cfg["fps"]),
-        spoken_end_ms=spoken_end_ms,
-    )
+    if int(visual_plan.get("schema_version", 1)) == 2:
+        records = {record["request_id"]: record for record in asset_manifest.get("assets", [])}
+        scenes = normalize_v2_scenes(visual_plan, records, fps=int(renderer_cfg["fps"]), spoken_end_ms=spoken_end_ms)
+    else:
+        records = {record["scene_id"]: record for record in asset_manifest.get("segments", [])}
+        scenes = normalize_scenes(visual_plan, records, fps=int(renderer_cfg["fps"]), spoken_end_ms=spoken_end_ms)
 
     def project_relative(path: Path) -> str:
         try:

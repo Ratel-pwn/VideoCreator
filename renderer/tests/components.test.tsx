@@ -2,6 +2,7 @@ import {renderToStaticMarkup} from 'react-dom/server';
 import {describe, expect, it} from 'vitest';
 import {StillScene} from '../src/components/StillScene';
 import {EditorialFrame} from '../src/components/EditorialFrame';
+import {EntityCardScene} from '../src/components/EntityCardScene';
 import {
   getSingleLineFontSize,
   normalizeCaptionText,
@@ -125,5 +126,14 @@ describe('render components', () => {
     expect(markup).toContain('bottom:54px');
     expect(markup).toContain('max-width:1500px');
     expect(markup).toContain('white-space:nowrap');
+  });
+
+  it('renders a fixed entity image over a blurred background with labels', () => {
+    const media = {assetType: 'image' as const, assetPath: 'assets/bg.jpg', fitMode: 'cover' as const, trimBeforeFrames: 0, mediaDurationInFrames: 0, shortVideoPolicy: 'reject' as const};
+    const markup = renderToStaticMarkup(<EntityCardScene scene={{id: 's', fromFrame: 0, durationInFrames: 25, presentationMode: 'entity_card', backgroundAsset: media, displayAsset: {...media, assetPath: 'assets/book.jpg', fitMode: 'contain'}, entity: {primaryLabel: 'Book', secondaryLabel: 'Title'}}} />);
+    expect(markup).toContain('blur(22px)');
+    expect(markup).toContain('Book');
+    expect(markup).toContain('Title');
+    expect(markup).toContain('assets/book.jpg');
   });
 });
