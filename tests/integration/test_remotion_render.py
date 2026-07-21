@@ -89,6 +89,12 @@ def test_remotion_renders_verified_three_second_mp4(tmp_path: Path):
                 "audioPath": "audio/voice.wav",
                 "subtitlePath": "audio/voice.srt",
                 "backgroundColor": "#080b0f",
+                "frame": {
+                    "preset": "editorial-wide",
+                    "videoTitle": "Fixture title?",
+                    "publicationDate": "2026.07.21",
+                    "creatorHandle": "@Ratel",
+                },
                 "scenes": [
                     {
                         "id": "still",

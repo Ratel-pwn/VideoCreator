@@ -15,6 +15,13 @@ const scene = {
   motionPreset: 'push-left' as const,
 };
 
+const frame = {
+  preset: 'editorial-wide' as const,
+  videoTitle: '资本主义的潘多拉魔盒是如何开启的？',
+  publicationDate: '2026.07.21',
+  creatorHandle: '@通职者Ratel',
+};
+
 describe('render input', () => {
   it('accepts the locked 1080p 25fps contract', () => {
     const value = renderInputSchema.parse({
@@ -30,6 +37,44 @@ describe('render input', () => {
     });
 
     expect(value.captions).toEqual([]);
+  });
+
+  it('accepts a complete editorial frame contract', () => {
+    const value = renderInputSchema.parse({
+      videoId: 'fixture',
+      width: 1920,
+      height: 1080,
+      fps: 25,
+      durationInFrames: 25,
+      audioPath: 'audio/voice.cleaned.mp3',
+      subtitlePath: 'audio/voice.cleaned.srt',
+      backgroundColor: '#080b0f',
+      scenes: [scene],
+      frame,
+    });
+
+    expect(value.frame).toEqual(frame);
+  });
+
+  it('rejects incomplete editorial frame metadata', () => {
+    expect(() =>
+      renderInputSchema.parse({
+        videoId: 'fixture',
+        width: 1920,
+        height: 1080,
+        fps: 25,
+        durationInFrames: 25,
+        audioPath: 'audio/voice.cleaned.mp3',
+        subtitlePath: 'audio/voice.cleaned.srt',
+        backgroundColor: '#080b0f',
+        scenes: [scene],
+        frame: {
+          preset: 'editorial-wide',
+          videoTitle: 'Title',
+          creatorHandle: '@Ratel',
+        },
+      }),
+    ).toThrow();
   });
 
   it('rejects a gap or overlap in the hard-cut timeline', () => {

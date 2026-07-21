@@ -4,7 +4,8 @@ import type {captionSchema} from '../schema';
 type Caption = z.infer<typeof captionSchema>;
 
 const MAX_FONT_SIZE = 58;
-const MAX_CAPTION_WIDTH = 1600;
+const FULL_BLEED_CAPTION_WIDTH = 1600;
+const EDITORIAL_CAPTION_WIDTH = 1500;
 const WIDTH_SAFETY_FACTOR = 0.94;
 
 export const normalizeCaptionText = (text: string) =>
@@ -19,14 +20,17 @@ const estimateTextWidthInEm = (text: string) =>
     return width + 0.65;
   }, 0);
 
-export const getSingleLineFontSize = (text: string) => {
+export const getSingleLineFontSize = (
+  text: string,
+  maxCaptionWidth = FULL_BLEED_CAPTION_WIDTH,
+) => {
   const estimatedWidth = estimateTextWidthInEm(normalizeCaptionText(text));
   if (estimatedWidth === 0) return MAX_FONT_SIZE;
 
   return Math.min(
     MAX_FONT_SIZE,
     Math.floor(
-      ((MAX_CAPTION_WIDTH * WIDTH_SAFETY_FACTOR) / estimatedWidth) * 10,
+      ((maxCaptionWidth * WIDTH_SAFETY_FACTOR) / estimatedWidth) * 10,
     ) / 10,
   );
 };
@@ -35,10 +39,12 @@ export const SubtitleTrack = ({
   captions,
   frame,
   fps,
+  layout = 'full-bleed',
 }: {
   captions: Caption[];
   frame: number;
   fps: number;
+  layout?: 'full-bleed' | 'editorial';
 }) => {
   const currentMs = (frame * 1000) / fps;
   const caption = captions.find(
@@ -48,14 +54,18 @@ export const SubtitleTrack = ({
   if (!caption) return null;
 
   const text = normalizeCaptionText(caption.text);
+  const editorial = layout === 'editorial';
+  const maxCaptionWidth = editorial
+    ? EDITORIAL_CAPTION_WIDTH
+    : FULL_BLEED_CAPTION_WIDTH;
 
   return (
     <div
       style={{
         position: 'absolute',
-        left: 160,
-        right: 160,
-        bottom: 150,
+        left: editorial ? 80 : 160,
+        right: editorial ? 80 : 160,
+        bottom: editorial ? 54 : 150,
         display: 'flex',
         justifyContent: 'center',
         pointerEvents: 'none',
@@ -63,10 +73,10 @@ export const SubtitleTrack = ({
     >
       <div
         style={{
-          maxWidth: MAX_CAPTION_WIDTH,
+          maxWidth: maxCaptionWidth,
           color: 'white',
           fontFamily: 'Noto Sans SC, Microsoft YaHei, sans-serif',
-          fontSize: getSingleLineFontSize(text),
+          fontSize: getSingleLineFontSize(text, maxCaptionWidth),
           fontWeight: 600,
           lineHeight: 1.28,
           textAlign: 'center',

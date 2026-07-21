@@ -8,6 +8,13 @@ export const captionSchema = z.object({
   confidence: z.number(),
 });
 
+export const frameSchema = z.object({
+  preset: z.literal('editorial-wide'),
+  videoTitle: z.string().trim().min(1),
+  publicationDate: z.string().trim().min(1),
+  creatorHandle: z.string().trim().min(1),
+});
+
 export const renderSceneSchema = z.object({
   id: z.string().min(1),
   fromFrame: z.number().int().nonnegative(),
@@ -32,7 +39,9 @@ export const renderInputSchema = z.object({
   backgroundColor: z.string().min(1),
   scenes: z.array(renderSceneSchema).min(1),
   captions: z.array(captionSchema).default([]),
+  frame: frameSchema.optional(),
 });
 
 export type RenderScene = z.infer<typeof renderSceneSchema>;
 export type RenderInput = z.infer<typeof renderInputSchema>;
+export type EditorialFrameConfig = z.infer<typeof frameSchema>;

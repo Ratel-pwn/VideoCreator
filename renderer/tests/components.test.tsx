@@ -1,6 +1,7 @@
 import {renderToStaticMarkup} from 'react-dom/server';
 import {describe, expect, it} from 'vitest';
 import {StillScene} from '../src/components/StillScene';
+import {EditorialFrame} from '../src/components/EditorialFrame';
 import {
   getSingleLineFontSize,
   normalizeCaptionText,
@@ -23,6 +24,29 @@ const baseScene: RenderScene = {
 };
 
 describe('render components', () => {
+  it('renders configured metadata around a clipped editorial viewport', () => {
+    const markup = renderToStaticMarkup(
+      <EditorialFrame
+        frame={{
+          preset: 'editorial-wide',
+          videoTitle: '资本主义的潘多拉魔盒是如何开启的？',
+          publicationDate: '2026.07.21',
+          creatorHandle: '@通职者Ratel',
+        }}
+      >
+        <div>timeline</div>
+      </EditorialFrame>,
+    );
+
+    expect(markup).toContain('资本主义的潘多拉魔盒是如何开启的？');
+    expect(markup).toContain('2026.07.21');
+    expect(markup).toContain('@通职者Ratel');
+    expect(markup).toContain('width:1700px');
+    expect(markup).toContain('height:852px');
+    expect(markup).toContain('border-radius:24px');
+    expect(markup).toContain('overflow:hidden');
+  });
+
   it('renders still images with cover fit and deterministic motion', () => {
     const element = StillScene({scene: baseScene, frame: 25});
     const image = element.props.children;
@@ -86,5 +110,20 @@ describe('render components', () => {
   it('removes trailing punctuation while preserving punctuation within a caption', () => {
     expect(normalizeCaptionText('价格，信号！？。”  \n')).toBe('价格，信号');
     expect(normalizeCaptionText('Market, signal?!')).toBe('Market, signal');
+  });
+
+  it('positions captions relative to the editorial media viewport', () => {
+    const captions = [
+      {text: 'Caption.', startMs: 0, endMs: 1000, timestampMs: 0, confidence: 1},
+    ];
+    const markup = renderToStaticMarkup(
+      <SubtitleTrack captions={captions} frame={0} fps={25} layout="editorial" />,
+    );
+
+    expect(markup).toContain('left:80px');
+    expect(markup).toContain('right:80px');
+    expect(markup).toContain('bottom:54px');
+    expect(markup).toContain('max-width:1500px');
+    expect(markup).toContain('white-space:nowrap');
   });
 });
