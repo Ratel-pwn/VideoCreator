@@ -11,7 +11,7 @@ Turn narration-aligned text into subtitle segments that are stable, readable, an
 
 ## Owns
 
-- one-line preference
+- mandatory single-line output
 - semantic splitting before forced wrap
 - orphan-word prevention
 - trailing punctuation removal
@@ -32,8 +32,10 @@ Turn narration-aligned text into subtitle segments that are stable, readable, an
 
 ## Rules
 
-- Keep subtitles to one line whenever possible for the chosen ratio.
+- Every subtitle must render as exactly one visual line for the chosen ratio.
 - If a segment would wrap, split it into two semantic segments before rendering.
+- Embedded line breaks are forbidden and must be normalized before rendering.
+- Render-time font shrinking is a safeguard, not a substitute for readable segmentation.
 - Do not leave a single word or very short tail phrase alone on a second line.
 - Do not leave punctuation at the end of subtitle segments.
 - Preserve readable timing when splitting.
@@ -55,7 +57,8 @@ Turn narration-aligned text into subtitle segments that are stable, readable, an
 
 - Every output segment must reference a source timing span.
 - No output segment may end with trailing punctuation.
-- Segments that would create a one-word second line must be split into two entries instead.
+- No output segment may contain an embedded line break or require visual wrapping.
+- Segments that would create a one-word tail must be split into two entries instead.
 - New segments must preserve readable minimum duration and avoid flash-like fragments.
 
 ## Failure Conditions
@@ -63,4 +66,4 @@ Turn narration-aligned text into subtitle segments that are stable, readable, an
 - missing aligned timing source
 - unsupported aspect ratio with no width heuristic
 - source timing too short to split without violating minimum duration
-- output contains wrap-risk segments after rule application
+- output contains embedded line breaks or wrap-risk segments after rule application

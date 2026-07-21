@@ -29,8 +29,10 @@ Convert aligned narration timing into display-ready subtitle segments that stay 
 
 ## Validation Rules
 
-- One-line preference is the default for every supported ratio.
+- Exactly one rendered line is required for every supported ratio.
 - Split before visual wrap whenever a semantic break is available.
+- Reject embedded line breaks in display text.
+- Allow render-time font shrinking only as a final no-wrap safeguard.
 - Remove trailing punctuation from display text.
 - Avoid one-word or tiny tail wraps by splitting into separate entries.
 - Reject outputs that create ultra-short flash segments.
@@ -40,7 +42,7 @@ Convert aligned narration timing into display-ready subtitle segments that stay 
 - any segment lacks a valid start/end timestamp
 - split would violate `min_duration_ms`
 - unsupported ratio with no fallback width rule
-- output still contains wrap-risk segments
+- output still contains embedded line breaks or wrap-risk segments
 
 ## Dependencies
 

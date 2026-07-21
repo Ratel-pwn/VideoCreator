@@ -112,6 +112,8 @@ If a future script requires credentials, read local config first and treat examp
 - Whisper is used for timestamps only
 - If Whisper text differs from the article text, keep the article text and use Whisper timing
 - The expected final subtitle artifact is the normal `.srt` beside the final audio
+- Burned-in subtitles must always render as exactly one visual line; automatic or explicit line wrapping is not allowed
+- Split long captions at semantic boundaries before rendering; the renderer may shrink text only as a final safeguard
 
 ### Visual planning
 

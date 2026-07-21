@@ -52,7 +52,7 @@ To render an already prepared `render-input.json` directly:
 python scripts/render_video.py --project-root projects/<project> --input projects/<project>/runs/<run-id>/render-input.json --output projects/<project>/runs/<run-id>/final.mp4
 ```
 
-The final quality gate requires an approved provenance record for every non-text scene. The renderer outputs 1920x1080, 25fps H.264/AAC MP4 with adjacent hard cuts and burned-in SRT captions.
+The final quality gate requires an approved provenance record for every non-text scene. The renderer outputs 1920x1080, 25fps H.264/AAC MP4 with adjacent hard cuts and burned-in SRT captions. Burned-in captions are always rendered on one line: long captions should be split semantically upstream, while the renderer removes embedded line breaks and shrinks text as a final safeguard.
 
 ## Repository policy
 

@@ -1,7 +1,11 @@
 import {renderToStaticMarkup} from 'react-dom/server';
 import {describe, expect, it} from 'vitest';
 import {StillScene} from '../src/components/StillScene';
-import {SubtitleTrack} from '../src/components/SubtitleTrack';
+import {
+  getSingleLineFontSize,
+  normalizeCaptionText,
+  SubtitleTrack,
+} from '../src/components/SubtitleTrack';
 import {VideoScene} from '../src/components/VideoScene';
 import type {RenderScene} from '../src/schema';
 
@@ -51,5 +55,31 @@ describe('render components', () => {
 
     expect(markup).toContain('Visible');
     expect(markup).not.toContain('Hidden');
+  });
+
+  it('renders embedded subtitle line breaks as one line', () => {
+    const captions = [
+      {
+        text: '钱原本只是交换工具\n后来却像会自己繁殖的东西。',
+        startMs: 0,
+        endMs: 1000,
+        timestampMs: 0,
+        confidence: 1,
+      },
+    ];
+    const markup = renderToStaticMarkup(
+      <SubtitleTrack captions={captions} frame={0} fps={25} />,
+    );
+
+    expect(markup).toContain('钱原本只是交换工具 后来却像会自己繁殖的东西。');
+    expect(markup).not.toContain('\n');
+    expect(markup).toContain('white-space:nowrap');
+  });
+
+  it('shrinks long captions instead of allowing them to wrap', () => {
+    const text = '钱原本只是交换工具，后来却越来越像一种会自己繁殖的东西。';
+
+    expect(normalizeCaptionText(`  ${text}\r\n  `)).toBe(text);
+    expect(getSingleLineFontSize(text)).toBeLessThan(58);
   });
 });

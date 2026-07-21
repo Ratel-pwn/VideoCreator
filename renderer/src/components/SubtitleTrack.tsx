@@ -3,6 +3,34 @@ import type {captionSchema} from '../schema';
 
 type Caption = z.infer<typeof captionSchema>;
 
+const MAX_FONT_SIZE = 58;
+const MAX_CAPTION_WIDTH = 1600;
+const WIDTH_SAFETY_FACTOR = 0.94;
+
+export const normalizeCaptionText = (text: string) =>
+  text.replace(/\s+/g, ' ').trim();
+
+const estimateTextWidthInEm = (text: string) =>
+  Array.from(text).reduce((width, character) => {
+    if (/\s/.test(character)) return width + 0.35;
+    if (character.codePointAt(0)! > 0xff) return width + 1;
+    if (/[A-Z]/.test(character)) return width + 0.7;
+    if (/[a-z0-9]/.test(character)) return width + 0.58;
+    return width + 0.65;
+  }, 0);
+
+export const getSingleLineFontSize = (text: string) => {
+  const estimatedWidth = estimateTextWidthInEm(normalizeCaptionText(text));
+  if (estimatedWidth === 0) return MAX_FONT_SIZE;
+
+  return Math.min(
+    MAX_FONT_SIZE,
+    Math.floor(
+      ((MAX_CAPTION_WIDTH * WIDTH_SAFETY_FACTOR) / estimatedWidth) * 10,
+    ) / 10,
+  );
+};
+
 export const SubtitleTrack = ({
   captions,
   frame,
@@ -19,6 +47,8 @@ export const SubtitleTrack = ({
   );
   if (!caption) return null;
 
+  const text = normalizeCaptionText(caption.text);
+
   return (
     <div
       style={{
@@ -33,19 +63,19 @@ export const SubtitleTrack = ({
     >
       <div
         style={{
-          maxWidth: 1600,
+          maxWidth: MAX_CAPTION_WIDTH,
           color: 'white',
           fontFamily: 'Noto Sans SC, Microsoft YaHei, sans-serif',
-          fontSize: 58,
+          fontSize: getSingleLineFontSize(text),
           fontWeight: 600,
           lineHeight: 1.28,
           textAlign: 'center',
           textShadow:
             '-2px -2px 0 #111, 2px 2px 0 #111, 0 4px 16px rgba(0,0,0,.75)',
-          whiteSpace: 'pre-wrap',
+          whiteSpace: 'nowrap',
         }}
       >
-        {caption.text}
+        {text}
       </div>
     </div>
   );
