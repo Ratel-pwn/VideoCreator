@@ -19,6 +19,8 @@ The article draft provides semantic continuity.
 Write a machine-readable `visual-plan.json`.
 This file is a scene plan, not a raw subtitle-to-shot map.
 
+New plans must set top-level `schema_version` to `2`.
+
 ## Core rule
 
 A scene may cover one or more consecutive subtitle segments.
@@ -44,10 +46,11 @@ Top-level JSON must contain:
 - `segment_count`
 - `segments`
 
-Each item in `segments` must contain:
+Each v2 item in `segments` must contain:
 - `subtitle_segment_ids`
 - `brief`
-- `material_type`
+- `presentation_mode`
+- `slots`
 - `asset_strategy`
 - `visual_role`
 - `search_queries`
@@ -67,7 +70,33 @@ Each item in `segments` must contain:
 - `transition`: short value such as `cut`, `dissolve`, `hold`
 - `notes`: one short sentence explaining the choice
 
-## Material Type Rules
+## Presentation Mode Rules
+
+Choose exactly one of `footage`, `still`, `entity_card`, `explainer`, or
+`subtitle_only`. The opening scene must be `footage`.
+
+- `footage` requires one `primary` video slot.
+- `still` requires one `primary` image slot.
+- `entity_card` requires a `background` image/video slot, a `display` image
+  slot, and `entity.primary_label` plus optional `entity.secondary_label`.
+- `explainer` requires a `background` image/video slot and one explainer config
+  of kind `flow`, `list`, `quote_highlight`, or `relation_loop`.
+- `subtitle_only` has no slots.
+
+Every slot contains `role`, `required_type`, and `search_queries`. Never declare
+an image fallback for a video slot. If video cannot be found, leave the slot
+unresolved or explicitly revise the visual plan; asset resolution must not
+silently downgrade it.
+
+Use `entity_card` flexibly for physical objects or broad entities when the
+specific narration benefits from deliberate identification. Use a fixed display
+image over a blurred contextual background.
+
+Use `explainer` for formulas, processes, lists, quotations, relationships, and
+feedback mechanisms. The first implementation supports flow, list, quote
+highlight, and relation loop; future templates extend the same protocol.
+
+## Legacy Material Type Rules
 
 Use `image` when the main job of the visual is to show what something is.
 Typical `image` cases:

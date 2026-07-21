@@ -115,3 +115,76 @@ def test_audit_rejects_low_resolution_video(monkeypatch, tmp_path: Path):
     result = audit_asset_manifest(tmp_path, plan(), manifest)
 
     assert "scene-001: video resolution must be at least 1280x720" in result.errors
+
+
+def v2_plan():
+    return {
+        "schema_version": 2,
+        "segments": [
+            {
+                "segment_id": "scene-001",
+                "start_ms": 0,
+                "end_ms": 3000,
+                "presentation_mode": "footage",
+                "slots": [{"role": "primary", "required_type": "video", "search_queries": ["factory"]}],
+            },
+            {
+                "segment_id": "scene-002",
+                "start_ms": 3000,
+                "end_ms": 6000,
+                "presentation_mode": "entity_card",
+                "slots": [
+                    {"role": "background", "required_type": "image", "search_queries": ["archive desk"]},
+                    {"role": "display", "required_type": "image", "search_queries": ["book cover"]},
+                ],
+            },
+        ],
+    }
+
+
+def test_v2_requests_are_generated_per_required_slot():
+    result = create_asset_requests(v2_plan())
+
+    assert [item["request_id"] for item in result["requests"]] == [
+        "scene-001:primary",
+        "scene-002:background",
+        "scene-002:display",
+    ]
+    assert result["requests"][0]["required_asset_type"] == "video"
+
+
+def test_v2_audit_rejects_video_slot_resolved_as_image(tmp_path: Path):
+    asset = tmp_path / "assets" / "opening.jpg"
+    asset.parent.mkdir()
+    asset.write_bytes(b"image")
+    manifest = {
+        "schema_version": 2,
+        "assets": [
+            {
+                "request_id": "scene-001:primary",
+                "scene_id": "scene-001",
+                "role": "primary",
+                "asset_type": "image",
+                "local_path": "assets/opening.jpg",
+                "source_page_url": "https://example.org/opening",
+                "provider": "Example",
+                "license": "unknown",
+                "credit": "Unknown",
+                "retrieved_at": "2026-07-21",
+                "rights_status": "unknown",
+                "rights_note": "Publicly accessible; rights unknown.",
+                "review_status": "approved",
+            }
+        ],
+    }
+
+    result = audit_asset_manifest(tmp_path, {"schema_version": 2, "segments": [v2_plan()["segments"][0]]}, manifest, probe_media=False)
+
+    assert "scene-001:primary: expected video, got image" in result.errors
+    assert any("rights_status is unknown" in warning for warning in result.warnings)
+
+
+def test_v2_audit_rejects_manifest_version_mismatch(tmp_path: Path):
+    result = audit_asset_manifest(tmp_path, v2_plan(), {"segments": []}, probe_media=False)
+
+    assert "schema_version mismatch: visual plan v2 requires manifest v2" in result.errors

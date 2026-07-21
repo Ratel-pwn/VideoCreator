@@ -20,6 +20,10 @@ class AssetRecord:
     trim_start_ms: int
     short_video_policy: str
     review_status: str
+    request_id: str = ""
+    role: str = ""
+    rights_status: str = ""
+    rights_note: str = ""
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "AssetRecord":
@@ -38,6 +42,10 @@ class AssetRecord:
             trim_start_ms=int(value.get("trim_start_ms", 0)),
             short_video_policy=str(value.get("short_video_policy", "reject")),
             review_status=str(value.get("review_status", "pending")),
+            request_id=str(value.get("request_id", "")),
+            role=str(value.get("role", "")),
+            rights_status=str(value.get("rights_status", "")),
+            rights_note=str(value.get("rights_note", "")),
         )
 
 
