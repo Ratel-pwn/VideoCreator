@@ -24,13 +24,15 @@ This skill manages the high-level sequence only.
 
 ## Rules
 
-- At `prepare`, use `prepare-topic-chat` if enabled.
-- At `draft`, use `article-from-chat`.
+- Before `prepare`, validate the project's `template_id` and load the run template snapshot.
+- At `prepare`, use the selected template's `prepare.md`.
+- At `draft`, use the selected template's `writing.md`.
 - At `tts`, call the configured TTS script with the approved draft text.
-- At `visual_plan`, call the visual planning script with the final subtitle file and write `drafts/visual-plan.json`.
-- At `visual_assets`, call the configured asset-building script with `drafts/visual-plan.json` and write `runs/asset-manifest.json`.
+- At `visual_plan`, use the template visual, pacing, and subtitle declarations and write run `visual/` artifacts.
+- At `visual_assets`, resolve reusable project `media/` and write manifests under run `visual/`.
+- At `video_render`, freeze `render/render-input.json` and assemble `render/final.mp4` with Remotion.
 - Stop for confirmation at any stage whose config flag is true.
-- Do not invent final video assembly behavior yet. Keep that as a documented placeholder.
+- Scenario strategy belongs only to declarative templates.
 
 ## Output
 

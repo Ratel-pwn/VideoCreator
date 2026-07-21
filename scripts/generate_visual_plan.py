@@ -176,6 +176,13 @@ def normalize_plan(subtitle_segments: list[dict[str, Any]], plan: dict[str, Any]
         text = ''.join(part['text'] for part in parts).strip()
         search_queries = scene.get('search_queries') or {}
         generation_prompts = scene.get('generation_prompts') or {}
+        material_type = scene.get('material_type', 'image')
+        presentation_mode = scene.get('presentation_mode') or {
+            'video': 'footage', 'image': 'still', 'subtitle_only': 'subtitle_only'
+        }.get(material_type, 'still')
+        slots = list(scene.get('slots') or [])
+        if not slots and presentation_mode in {'footage', 'still'}:
+            slots = [{'role': 'primary', 'required_type': 'video' if presentation_mode == 'footage' else 'image'}]
         normalized.append({
             'segment_id': f'scene-{idx:03d}',
             'subtitle_segment_ids': subtitle_ids,
@@ -185,6 +192,8 @@ def normalize_plan(subtitle_segments: list[dict[str, Any]], plan: dict[str, Any]
             'end_ms': end_ms,
             'duration_seconds': round((end_ms - start_ms) / 1000, 3),
             'text': text,
+            'subtitle_text': text.rstrip('。！？!?；;，,：:'),
+            'subtitle_blocks': len(subtitle_ids),
             'brief': scene.get('brief') or text[:18],
             'material_type': scene.get('material_type', 'image'),
             'asset_strategy': scene.get('asset_strategy', 'search_first'),
@@ -199,10 +208,16 @@ def normalize_plan(subtitle_segments: list[dict[str, Any]], plan: dict[str, Any]
             },
             'transition': scene.get('transition', 'cut'),
             'notes': scene.get('notes', ''),
+            'presentation_mode': presentation_mode,
+            'slots': slots,
+            'entity': scene.get('entity'),
+            'explainer': scene.get('explainer'),
+            'long_hold_reason': scene.get('long_hold_reason', ''),
         })
         if normalized[-1]['material_type'] not in {'video', 'image', 'subtitle_only'}:
             raise RuntimeError(f"Unsupported material_type: {normalized[-1]['material_type']}")
     return {
+        'schema_version': 2,
         'topic': topic,
         'category': category,
         'source_subtitle_segment_count': len(subtitle_segments),
@@ -219,6 +234,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--topic', default='')
     parser.add_argument('--category', default='general')
     parser.add_argument('--output', required=True)
+    parser.add_argument('--skill-file', default='')
+    parser.add_argument('--pacing-file', default='')
+    parser.add_argument('--subtitle-policy-file', default='')
     return parser.parse_args()
 
 
@@ -229,7 +247,7 @@ def main() -> int:
     api_key = os.environ.get(llm['api_key_env'], '')
     if not api_key:
         raise RuntimeError(f"Missing API key env: {llm['api_key_env']}")
-    skill_path = Path(args.workflow_config).resolve().parent / workflow_config['visual_plan']['skill_path_project']
+    skill_path = Path(args.skill_file) if args.skill_file else Path(args.workflow_config).resolve().parent / workflow_config['visual_plan']['skill_path_project']
     skill_text = skill_path.read_text(encoding='utf-8')
     srt_text = Path(args.srt_file).read_text(encoding='utf-8-sig')
     raw_segments = parse_srt(srt_text)
@@ -254,6 +272,10 @@ def main() -> int:
                     'subtitle_segment_ids': ['sub-001', 'sub-002'],
                     'brief': 'scene brief in Chinese',
                     'material_type': 'video|image|subtitle_only',
+                    'presentation_mode': 'footage|still|entity_card|explainer|subtitle_only',
+                    'slots': [{'role': 'primary|background|display', 'required_type': 'image|video'}],
+                    'entity': {'primary_label': 'required for entity_card', 'secondary_label': 'optional'},
+                    'explainer': {'kind': 'formula|process|list|function|score|code|quote', 'items': ['declarative content']},
                     'asset_strategy': 'search_first|generate_only|subtitle_only',
                     'visual_role': 'evidential|illustrative|abstract|atmospheric',
                     'search_queries': {'image': ['...'], 'video': ['...']},

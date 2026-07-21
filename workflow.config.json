@@ -18,18 +18,11 @@
     "api_key_env": "OPENAI_API_KEY",
     "model": "gpt-4o-mini"
   },
-  "skills": {
-    "prepare_skill_path_project": "skills/prepare-topic-chat/SKILL.md",
-    "prepare_skill_name_installed": "prepare-topic-chat",
-    "article_skill_path_project": "skills/article-from-chat/SKILL.md",
-    "article_skill_name_installed": "article-from-chat",
-    "controller_skill_path_project": "skills/workflow-controller/SKILL.md",
-    "controller_skill_name_installed": "workflow-controller"
+  "templates": {
+    "root": "templates"
   },
   "visual_plan": {
     "script": "scripts/generate_visual_plan.py",
-    "skill_path_project": "skills/segment-visual-planner/SKILL.md",
-    "skill_name_installed": "segment-visual-planner",
     "default_category": "general"
   },
   "visual_assets": {

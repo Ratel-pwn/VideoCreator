@@ -1,0 +1,9 @@
+{
+  "frame": "editorial-wide",
+  "transition": "hard-cut",
+  "brand": "@通职者Ratel",
+  "title_source": "project.title",
+  "date_source": "project.publication_date",
+  "video_audio": "muted"
+}
+

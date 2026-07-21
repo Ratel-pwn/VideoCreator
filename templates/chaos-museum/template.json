@@ -1,0 +1,23 @@
+{
+  "id": "chaos-museum",
+  "display_name": "混乱博物馆",
+  "version": 1,
+  "capabilities": [
+    "prepare",
+    "writing",
+    "tts",
+    "subtitles",
+    "visual_planning",
+    "asset_collection",
+    "final_assembly"
+  ],
+  "paths": {
+    "prepare": "prepare.md",
+    "writing": "writing.md",
+    "visual_planning": "visual-planning.md",
+    "pacing": "pacing.json",
+    "subtitle": "subtitle.json",
+    "composition": "composition.json"
+  }
+}
+

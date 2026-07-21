@@ -21,6 +21,14 @@ from videocreator.media import (
     probe_media,
 )
 from videocreator.render_contract import build_render_input, normalize_scenes, normalize_v2_scenes
+from videocreator.project_layout import create_run, initialize_project
+from videocreator.templates import (
+    TemplateDefinition,
+    discover_templates,
+    load_template,
+    resolve_library,
+)
+from videocreator.visual_plan import audit_visual_plan
 from videocreator.workflow_state import STAGES, missing_stage_handlers
 
 
@@ -228,6 +236,7 @@ class WorkflowContext:
     state: dict[str, Any] = field(default_factory=dict)
     manifest: dict[str, Any] = field(default_factory=dict)
     project_config: dict[str, Any] = field(default_factory=dict)
+    template: TemplateDefinition | None = None
 
     @property
     def output_root(self) -> Path:
@@ -250,6 +259,10 @@ class WorkflowContext:
 
     @property
     def active_style_library_dir(self) -> Path:
+        if self.template:
+            selected = resolve_library(self.repo_root, self.project_root, self.template, "style")
+            if selected.root:
+                return selected.root
         configured = self.project_config.get("style_library_dir")
         if configured:
             candidate = resolve_from(self.project_root, configured)
@@ -262,6 +275,11 @@ class WorkflowContext:
 
     @property
     def active_voice_source_file(self) -> Path:
+        if self.template:
+            selected = resolve_library(self.repo_root, self.project_root, self.template, "voice")
+            candidates = [item.path for item in selected.files if item.path.suffix.lower() in {".mp3", ".wav", ".m4a"}]
+            if candidates:
+                return candidates[0]
         configured = self.project_config.get("voice_source_file")
         if configured:
             candidate = resolve_from(self.project_root, configured)
@@ -281,7 +299,14 @@ class WorkflowContext:
         return api_key
 
     def artifact_path(self, group: str, name: str) -> Path:
-        return self.project_root / group / f"{self.run_id}_{name}"
+        group_map = {"sessions": "session", "drafts": "writing", "audio": "audio"}
+        name_map = {
+            "session.json": "conversation.json", "session.md": "conversation.md",
+            "draft.approved.md": "script.approved.md", "voice.mp3": "narration.generated.mp3",
+        }
+        if name == "voice.srt":
+            return self.run_dir / "subtitles" / "subtitles.aligned.srt"
+        return self.run_dir / group_map.get(group, group) / name_map.get(name, name)
 
     def register_artifact(self, key: str, path: Path) -> None:
         self.manifest.setdefault("artifacts", {})[key] = str(path)
@@ -304,28 +329,32 @@ class WorkflowContext:
         save_json(self.run_dir / "manifest.json", self.manifest)
 
 
-def make_run_context(repo_root: Path, config_path: Path, mode: str, topic: str, run_id: str | None, imported_chat: Path | None) -> WorkflowContext:
+def make_run_context(repo_root: Path, config_path: Path, mode: str, topic: str, run_id: str | None, imported_chat: Path | None, project_name_override: str | None = None, template_id: str | None = None) -> WorkflowContext:
     config = load_json(config_path)
     if not config:
         raise RuntimeError(f"Config not found or empty: {config_path}")
     stem = slugify(topic or (imported_chat.stem if imported_chat else "workflow"))
-    project_name = normalize_project_name(topic or (imported_chat.stem if imported_chat else stem))
+    project_name = project_name_override or normalize_project_name(topic or (imported_chat.stem if imported_chat else stem))
     actual_run_id = run_id or f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{stem}"
     projects_root = resolve_path(repo_root, config.get("projects", {}).get("root") or config.get("output", {}).get("root") or "projects")
     project_root = projects_root / project_name
-    for folder in ["runs", "assets", "audio", "drafts", "sessions", "library/style", "library/voice"]:
-        (project_root / folder).mkdir(parents=True, exist_ok=True)
     project_config_path = project_root / "project.json"
     if project_config_path.exists():
         project_config = load_json(project_config_path)
     else:
-        project_config = {
-            "style_library_dir": "library/style",
-            "voice_source_file": "library/voice/voice.mp3"
-        }
-        save_json(project_config_path, project_config)
+        if not template_id:
+            raise RuntimeError("Project must be initialized with a template before generation")
+        template = load_template(resolve_path(repo_root, config.get("templates", {}).get("root", "templates")), template_id)
+        project_root = initialize_project(projects_root, project_name, template)
+        project_config = load_json(project_root / "project.json")
+    selected_template_id = project_config.get("template_id")
+    if not selected_template_id:
+        raise RuntimeError("Project is missing template_id; migrate or initialize it first")
+    template = load_template(resolve_path(repo_root, config.get("templates", {}).get("root", "templates")), selected_template_id)
+    libraries = {kind: resolve_library(repo_root, project_root, template, kind) for kind in ("style", "voice")}
     run_dir = project_root / "runs" / actual_run_id
-    run_dir.mkdir(parents=True, exist_ok=True)
+    if not run_dir.exists():
+        create_run(project_root, actual_run_id, template, libraries)
 
     state_path = run_dir / "state.json"
     manifest_path = run_dir / "manifest.json"
@@ -338,6 +367,15 @@ def make_run_context(repo_root: Path, config_path: Path, mode: str, topic: str, 
         "created_at": now_iso(),
         "updated_at": now_iso(),
     }
+    state.update({
+        "run_id": actual_run_id,
+        "project_name": project_name,
+        "mode": mode,
+    })
+    state.setdefault("current_stage", STAGE_PREPARE if mode == "chat" else STAGE_DRAFT)
+    state.setdefault("status", "created")
+    state.setdefault("created_at", now_iso())
+    state.setdefault("updated_at", now_iso())
     manifest = load_json(manifest_path) if manifest_path.exists() else {
         "run_id": actual_run_id,
         "project_name": project_name,
@@ -345,8 +383,17 @@ def make_run_context(repo_root: Path, config_path: Path, mode: str, topic: str, 
         "topic": topic,
         "created_at": now_iso(),
         "artifacts": {},
-        "skills": config.get("skills", {}),
+        "template": {"id": template.id, "version": template.version},
     }
+    manifest.update({
+        "run_id": actual_run_id,
+        "project_name": project_name,
+        "mode": mode,
+        "topic": topic,
+        "template": {"id": template.id, "version": template.version},
+    })
+    manifest.setdefault("created_at", now_iso())
+    manifest.setdefault("artifacts", {})
     ctx = WorkflowContext(
         repo_root=repo_root,
         config_path=config_path,
@@ -360,6 +407,7 @@ def make_run_context(repo_root: Path, config_path: Path, mode: str, topic: str, 
         state=state,
         manifest=manifest,
         project_config=project_config,
+        template=template,
     )
     ctx.manifest["resources"] = {
         "style_library_dir": str(ctx.active_style_library_dir),
@@ -373,7 +421,7 @@ def load_or_init_chat_messages(ctx: WorkflowContext) -> list[dict[str, str]]:
     session_json = ctx.artifact_path("sessions", "session.json")
     if session_json.exists():
         return json.loads(session_json.read_text(encoding="utf-8"))
-    system_prompt = read_text(resolve_path(ctx.repo_root, ctx.config["skills"]["prepare_skill_path_project"])).strip()
+    system_prompt = read_text(ctx.template.paths["prepare"]).strip()
     return [{"role": "system", "content": system_prompt}]
 
 
@@ -389,7 +437,7 @@ def persist_chat(ctx: WorkflowContext, messages: list[dict[str, str]]) -> None:
 
 def run_prepare(ctx: WorkflowContext) -> None:
     ctx.set_stage(STAGE_PREPARE)
-    skill_path = resolve_path(ctx.repo_root, ctx.config["skills"]["prepare_skill_path_project"])
+    skill_path = ctx.template.paths["prepare"]
     skill_text = read_text(skill_path)
     feedback = ""
     while True:
@@ -461,7 +509,7 @@ def import_chat(ctx: WorkflowContext) -> None:
 
 
 def generate_draft(ctx: WorkflowContext, feedback: str = "") -> str:
-    article_skill = read_text(resolve_path(ctx.repo_root, ctx.config["skills"]["article_skill_path_project"]))
+    article_skill = read_text(ctx.template.paths["writing"])
     session_md = Path(ctx.manifest["artifacts"]["session_md"])
     transcript = read_text(session_md)
     style_reference = build_style_reference(ctx.active_style_library_dir)
@@ -592,7 +640,7 @@ def run_visual_plan(ctx: WorkflowContext) -> None:
     script_path = resolve_path(ctx.repo_root, visual_cfg["script"])
     subtitle_path = Path(ctx.manifest["artifacts"]["voice_subtitle"])
     draft_path = Path(ctx.manifest["artifacts"]["draft_approved"])
-    output_path = ctx.project_root / "drafts" / "visual-plan.json"
+    output_path = ctx.run_dir / "visual" / "visual-plan.json"
     command = [
         sys.executable,
         str(script_path),
@@ -602,12 +650,25 @@ def run_visual_plan(ctx: WorkflowContext) -> None:
         "--topic", ctx.topic,
         "--category", detect_topic_category(ctx),
         "--output", str(output_path),
+        "--skill-file", str(ctx.template.paths["visual_planning"]),
+        "--pacing-file", str(ctx.template.paths["pacing"]),
+        "--subtitle-policy-file", str(ctx.template.paths["subtitle"]),
     ]
     try:
         subprocess.run(command, check=True)
     except subprocess.CalledProcessError as exc:
         raise RuntimeError(f"Visual plan script failed with code {exc.returncode}") from exc
+    audit = audit_visual_plan(
+        load_json(output_path),
+        load_json(ctx.template.paths["pacing"]),
+        load_json(ctx.template.paths["subtitle"]),
+    )
+    audit_path = ctx.run_dir / "visual" / "visual-plan-audit.json"
+    save_json(audit_path, audit)
     ctx.register_artifact("visual_plan", output_path)
+    ctx.register_artifact("visual_plan_audit", audit_path)
+    if not audit["ok"]:
+        raise RuntimeError(f"Visual plan audit failed with {len(audit['errors'])} error(s): {audit_path}")
     ctx.set_stage(STAGE_VISUAL_PLAN_CONFIRM, status="awaiting_confirmation")
 
 
@@ -622,7 +683,7 @@ def confirm_visual_plan(ctx: WorkflowContext) -> None:
         return
     if decision == "q":
         raise SystemExit(0)
-    print("???? segment-visual-planner ?????????????")
+    print("请修改当前模板的视觉规划声明后重新生成")
     ctx.set_stage(STAGE_VISUAL_PLAN, status="ready")
 
 
@@ -636,13 +697,13 @@ def run_visual_assets(ctx: WorkflowContext) -> None:
     video_script = resolve_path(ctx.repo_root, jimeng_cfg["video_script"])
     jimeng_config = resolve_path(ctx.repo_root, jimeng_cfg["client_config"])
     plan_path = Path(ctx.manifest["artifacts"]["visual_plan"])
-    manifest_path = ctx.run_dir / visual_cfg.get("manifest_name", "asset-manifest.json")
+    manifest_path = ctx.run_dir / "visual" / visual_cfg.get("manifest_name", "asset-manifest.json")
     command = [
         sys.executable,
         str(script_path),
         "--plan-file", str(plan_path),
         "--config", str(config_path),
-        "--output-dir", str(ctx.project_root / "assets"),
+        "--output-dir", str(ctx.project_root / "media"),
         "--manifest-file", str(manifest_path),
         "--image-script", str(image_script),
         "--video-script", str(video_script),
@@ -697,7 +758,8 @@ def run_video_render(ctx: WorkflowContext) -> None:
         render_audio, render_subtitle = clean_audio_and_srt(
             audio_path,
             subtitle_path,
-            ctx.project_root / "audio",
+            ctx.run_dir / "audio",
+            subtitle_output_dir=ctx.run_dir / "subtitles",
             spoken_end_ms=spoken_end_ms,
         )
     else:
@@ -718,17 +780,26 @@ def run_video_render(ctx: WorkflowContext) -> None:
         except ValueError as exc:
             raise RuntimeError(f"Render media must be inside project root: {path}") from exc
 
+    composition = load_json(ctx.template.paths["composition"]) if ctx.template else {}
+    presentation = None
+    if composition.get("frame") == "editorial-wide":
+        presentation = {
+            "frame_preset": composition["frame"],
+            "video_title": ctx.project_config.get("title", ""),
+            "publication_date": ctx.project_config.get("publication_date", ""),
+            "creator_handle": composition.get("brand", ""),
+        }
     render_input = build_render_input(
         video_id=slugify(ctx.project_name),
         scenes=scenes,
         audio_path=project_relative(render_audio),
         subtitle_path=project_relative(render_subtitle),
         fps=int(renderer_cfg["fps"]),
-        presentation=ctx.project_config.get("presentation"),
+        presentation=presentation,
     )
-    render_input_path = ctx.run_dir / "render-input.json"
-    final_video_path = ctx.run_dir / "final.mp4"
-    render_report_path = ctx.run_dir / "render-report.json"
+    render_input_path = ctx.run_dir / "render" / "render-input.json"
+    final_video_path = ctx.run_dir / "render" / "final.mp4"
+    render_report_path = ctx.run_dir / "render" / "render-report.json"
     save_json(render_input_path, render_input)
     command = [
         sys.executable,
@@ -801,6 +872,9 @@ def resume_context(repo_root: Path, config_path: Path, run_dir: Path) -> Workflo
     project_name = state.get("project_name") or manifest.get("project_name") or (run_dir.parent.parent.name if run_dir.parent.name == "runs" else "legacy")
     project_root = run_dir.parent.parent if run_dir.parent.name == "runs" else run_dir.parent
     project_config = load_json(project_root / "project.json")
+    template = None
+    if project_config.get("template_id"):
+        template = load_template(resolve_path(repo_root, config.get("templates", {}).get("root", "templates")), project_config["template_id"])
     return WorkflowContext(
         repo_root=repo_root,
         config_path=config_path,
@@ -815,6 +889,7 @@ def resume_context(repo_root: Path, config_path: Path, run_dir: Path) -> Workflo
         state=state,
         manifest=manifest,
         project_config=project_config,
+        template=template,
     )
 
 
@@ -860,14 +935,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", default="workflow.config.json", help="Path to workflow config")
     sub = parser.add_subparsers(dest="command", required=True)
 
+    sub.add_parser("templates", help="List valid declarative templates")
+
+    project = sub.add_parser("project", help="Manage projects")
+    project_sub = project.add_subparsers(dest="project_command", required=True)
+    project_init = project_sub.add_parser("init", help="Initialize a project")
+    project_init.add_argument("--template", required=True, help="Template id")
+    project_init.add_argument("--name", required=True, help="Project directory and display name")
+    project_init.add_argument("--title", default="", help="Video title")
+    project_init.add_argument("--publication-date", default="", help="Fixed publication date")
+
     chat = sub.add_parser("chat", help="Start a new conversation workflow")
     chat.add_argument("--topic", default="", help="Topic to start with")
     chat.add_argument("--run-id", default=None, help="Optional custom run id")
+    chat.add_argument("--project", default="", help="Initialized project name")
+    chat.add_argument("--template", default="", help="Template for implicit project initialization")
 
     imported = sub.add_parser("import-chat", help="Import an existing chat record and continue from draft stage")
     imported.add_argument("chat_file", help="Path to the imported chat markdown or text file")
     imported.add_argument("--topic", default="", help="Optional topic label")
     imported.add_argument("--run-id", default=None, help="Optional custom run id")
+    imported.add_argument("--project", default="", help="Initialized project name")
+    imported.add_argument("--template", default="", help="Template for implicit project initialization")
 
     resume = sub.add_parser("resume", help="Resume an existing run from state.json")
     resume.add_argument("run_dir", help="Path to projects/<project>/runs/<run-id>")
@@ -880,14 +969,24 @@ def main() -> int:
     config_path = resolve_path(repo_root, args.config)
 
     try:
-        if args.command == "chat":
+        if args.command == "templates":
+            templates_root = resolve_path(repo_root, load_json(config_path).get("templates", {}).get("root", "templates"))
+            for template in discover_templates(templates_root).values():
+                print(f"{template.id}\t{template.raw.get('display_name', template.id)}\tv{template.version}")
+        elif args.command == "project" and args.project_command == "init":
+            config = load_json(config_path)
+            template = load_template(resolve_path(repo_root, config.get("templates", {}).get("root", "templates")), args.template)
+            projects_root = resolve_path(repo_root, config.get("projects", {}).get("root", "projects"))
+            metadata = {key: value for key, value in {"title": args.title, "publication_date": args.publication_date}.items() if value}
+            print(initialize_project(projects_root, args.name, template, **metadata))
+        elif args.command == "chat":
             topic = args.topic.strip() or input("请输入本次话题：").strip()
-            ctx = make_run_context(repo_root, config_path, "chat", topic, args.run_id, None)
+            ctx = make_run_context(repo_root, config_path, "chat", topic, args.run_id, None, args.project or None, args.template or None)
             execute_from_current_stage(ctx)
         elif args.command == "import-chat":
             imported_chat = resolve_path(repo_root, args.chat_file)
             topic = args.topic.strip() or imported_chat.stem
-            ctx = make_run_context(repo_root, config_path, "import-chat", topic, args.run_id, imported_chat)
+            ctx = make_run_context(repo_root, config_path, "import-chat", topic, args.run_id, imported_chat, args.project or None, args.template or None)
             import_chat(ctx)
             execute_from_current_stage(ctx)
         elif args.command == "resume":

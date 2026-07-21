@@ -1,110 +1,81 @@
 # VideoCreator
 
-VideoCreator is a local-first content production pipeline for short-form humanities, science, and technology videos.
+VideoCreator is a local-first pipeline for topic preparation, reference-based writing, narration, aligned subtitles, visual planning, online asset collection, and Remotion final assembly.
 
-This repository also serves as the integration workspace for extracting reusable video-production capabilities from:
+## Templates
 
-- `E:\Projects\AIGC\ChaosMuseum`
-- `E:\Projects\Experiment\remotion-demo`
-
-## What it does
-
-- guided topic discussion
-- article generation from conversation records
-- Volcengine TTS voice synthesis
-- subtitle alignment using original text plus Whisper timestamps
-- semantic visual planning from subtitles and draft text
-- AI-curated web asset requests and local media audit
-- Remotion final assembly with hard cuts, narration, and burned-in subtitles
-- reusable skill boundary design for future multi-scenario orchestration
-
-## Final video assembly
-
-Install the locked Remotion dependencies once:
+Scenario behavior is declarative and lives under `templates/`. The core contains executable capabilities only. Included templates are `chaos-museum`, `product-intro`, `science-explainer`, and `ai-daily`.
 
 ```powershell
-npm --prefix renderer install
-```
-
-Register an existing project without moving its draft, audio, subtitle, or visual-plan files:
-
-```powershell
-python scripts/import_legacy_project.py projects/<project> --run-id <run-id>
-```
-
-Create the web-research request, then have AI find and download suitable online assets into the project's `assets/` directory. Generation providers are disabled by default.
-
-```powershell
-python scripts/create_asset_request.py projects/<project>/drafts/visual-plan.json projects/<project>/drafts/asset-request.json
-python scripts/audit_asset_manifest.py projects/<project> projects/<project>/drafts/visual-plan.json projects/<project>/runs/<run-id>/asset-manifest.json
-```
-
-Preview the composition or resume the full workflow:
-
-```powershell
-npm --prefix renderer run studio
+python main.py templates
+python main.py project init --template chaos-museum --name "新项目" --title "视频标题" --publication-date "2026.07.21"
+python main.py chat --project "新项目" --topic "讨论主题"
+python main.py import-chat input.md --project "新项目"
 python main.py resume projects/<project>/runs/<run-id>
 ```
 
-To render an already prepared `render-input.json` directly:
+A project without a valid `template_id` cannot generate or resume. Templates contain JSON, Markdown, and library resources only; executable Python/TypeScript/Remotion code remains in the core.
 
-```powershell
-python scripts/render_video.py --project-root projects/<project> --input projects/<project>/runs/<run-id>/render-input.json --output projects/<project>/runs/<run-id>/final.mp4
+## Layout
+
+```text
+templates/                              # Declarative writing, pacing, subtitle, and composition policy
+skills/                                 # Shared executable capability contracts and orchestration guidance
+scripts/                                # Workflow and migration command-line programs
+videocreator/                           # Python core models, validation, and orchestration helpers
+renderer/                               # Shared typed Remotion compositor
+config/                                 # Public examples and ignored local configuration
+library/                                # Global style and voice resources
+projects/                               # Local projects and generated artifacts, ignored by default
+docs/                                   # Architecture, external API references, and implementation plans
 ```
 
-The final quality gate requires an approved provenance record for every non-text scene. The renderer outputs 1920x1080, 25fps H.264/AAC MP4 with adjacent hard cuts and burned-in SRT captions. Burned-in captions are always rendered on one line and never end with punctuation: long captions should be split semantically upstream, while the renderer removes embedded line breaks, strips trailing punctuation, and shrinks text as a final safeguard.
+```text
+projects/<project>/                     # One long-lived production project
+├── project.json                        # Project metadata and required template_id
+├── sources/                            # Imported source documents and metadata
+├── library/                            # Project-level complete resource overrides
+├── media/                              # Reusable immutable images and muted videos
+└── runs/<run-id>/                      # One reproducible production attempt
+    ├── state.json                      # Resumable stage state
+    ├── manifest.json                   # Template lineage and artifact index
+    ├── inputs/                         # Frozen template, project, source, and library snapshots
+    ├── session/                        # Preparation and conversation records
+    ├── writing/                        # Raw and approved scripts
+    ├── audio/                          # Generated and render narration
+    ├── subtitles/                      # Aligned and render SRT files
+    ├── visual/                         # Plan, pacing audit, requests, manifests, and asset audit
+    ├── render/                         # Remotion input, report, log, and final.mp4
+    └── review/                         # Review frames and QA notes
+```
 
-## Repository policy
+Library selection is a complete override per resource type: populated project library, then populated template library, then populated global default. Files from levels are never merged, and empty directories do not override.
 
-This public repository intentionally excludes private reference materials, local secrets, and generated project outputs.
+## Visual And Render Rules
 
-Included:
-- source code
-- project skills
-- workflow configuration
-- public config examples
-- docs for API integration
-- one sample project structure under `projects/sample-project`
-- empty global library structure under `library/`
-- integration plans under `plans/`
+The planner consumes final subtitles and emits visual-plan schema v2. Deterministic audit runs before asset lookup and checks continuity, shot density, duration, subtitle block/character limits, entity/explainer declarations, and template subtitle policy.
 
-Excluded:
-- real style library files
-- real voice source files
-- generated project outputs under `projects/` except the sample project template
-- local config files with real API keys or machine-specific paths
+Online images and videos require source URLs and attribution. Source video audio is always muted. Remotion assembles 1920x1080, 25 fps H.264/AAC output with hard cuts by default. The Chaos Museum template additionally enforces one-line captions without sentence-final punctuation, mixed image/video material, entity cards, declarative explainers, and its editorial frame.
 
-## Directory layout
+Install and verify the renderer:
 
-- `skills/`: project-owned skills and reusable capability definitions
-- `scripts/`: workflow and utility scripts
-- `docs/`: external API docs and reference material
-- `plans/`: roadmap and integration decisions
-- `config/`: public config examples and local config conventions
-- `library/`: global style and voice directory skeleton only
-- `projects/`: project template plus local/generated project work
-- `renderer/`: typed Remotion composition and local rendering bridge
+```powershell
+npm --prefix renderer install
+npm --prefix renderer test
+npm --prefix renderer run typecheck
+npm --prefix renderer run studio
+```
 
-## Config files
+Render an already frozen input:
 
-The repository only tracks example configuration files.
-Real local configs should stay untracked.
+```powershell
+python scripts/render_video.py --project-root projects/<project> --input projects/<project>/runs/<run-id>/render/render-input.json --output projects/<project>/runs/<run-id>/render/final.mp4
+```
 
-Tracked examples:
-- `scripts/jimeng_visual.config.example.json`
-- `scripts/volc_tts_ws.config.example.json`
-- `scripts/whisper_batch_transcribe.config.example.json`
-- `scripts/yt_batch_download.config.example.json`
-- `config/video-creator.example.json`
+## Configuration
 
-Before running the scripts locally, copy the example file you need to its local counterpart and fill in your own values or environment variable names.
-
-Repository-level config convention:
-- public example: `config/video-creator.example.json`
-- local only: `config/video-creator.local.json`
-
-The local file is ignored by git and must hold any real API keys or machine-specific paths.
+Only example configuration is committed. API keys, tokens, and machine-specific paths belong in ignored `*.local.json` or script `.config.json` files. Never put real credentials in an example, template, project snapshot, or run manifest.
 
 ## License
 
-This project is licensed under GPL-3.0. If you distribute a modified version or a derivative work, it must also remain open under the GPL terms.
+GPL-3.0.

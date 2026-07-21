@@ -1,0 +1,72 @@
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from .templates import LibrarySelection, TemplateDefinition, snapshot_template
+
+
+def _write_json(path: Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+@dataclass(frozen=True)
+class RunPaths:
+    root: Path
+    inputs: Path
+    session: Path
+    writing: Path
+    audio: Path
+    subtitles: Path
+    visual: Path
+    render: Path
+    review: Path
+
+    @property
+    def visual_plan(self) -> Path:
+        return self.visual / "visual-plan.json"
+
+    @property
+    def state(self) -> Path:
+        return self.root / "state.json"
+
+    @property
+    def manifest(self) -> Path:
+        return self.root / "manifest.json"
+
+
+def initialize_project(projects_root: Path, name: str, template: TemplateDefinition, **metadata: Any) -> Path:
+    project = projects_root / name
+    if project.exists():
+        raise FileExistsError(f"project already exists: {project}")
+    for relative in ("sources", "library/style", "library/voice", "media/images", "media/videos", "runs"):
+        (project / relative).mkdir(parents=True, exist_ok=True)
+    config = {"schema_version": 2, "name": name, "template_id": template.id, **metadata}
+    _write_json(project / "project.json", config)
+    return project
+
+
+def create_run(project_root: Path, run_id: str, template: TemplateDefinition, libraries: dict[str, LibrarySelection]) -> RunPaths:
+    root = project_root / "runs" / run_id
+    if root.exists():
+        raise FileExistsError(f"run already exists: {root}")
+    names = ("inputs", "session", "writing", "audio", "subtitles", "visual", "render", "review")
+    for name in names:
+        (root / name).mkdir(parents=True, exist_ok=True)
+    paths = RunPaths(root, *(root / name for name in names))
+    project = json.loads((project_root / "project.json").read_text(encoding="utf-8"))
+    _write_json(paths.inputs / "template.snapshot.json", snapshot_template(template))
+    _write_json(paths.inputs / "project.snapshot.json", project)
+    _write_json(paths.inputs / "source-selection.json", {"files": []})
+    _write_json(paths.inputs / "library.snapshot.json", {
+        kind: {"level": item.level, "root": str(item.root) if item.root else None, "files": [
+            {"path": str(file.path), "sha256": file.sha256} for file in item.files
+        ]} for kind, item in sorted(libraries.items())
+    })
+    _write_json(paths.state, {"schema_version": 2, "run_id": run_id, "stages": {}})
+    _write_json(paths.manifest, {"schema_version": 2, "run_id": run_id, "project": project["name"], "template": {"id": template.id, "version": template.version}, "artifacts": {}})
+    return paths
+

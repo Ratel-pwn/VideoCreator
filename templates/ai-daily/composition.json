@@ -1,0 +1,9 @@
+{
+  "frame": "full-bleed",
+  "transition": "hard-cut",
+  "brand": null,
+  "title_source": "project.title",
+  "date_source": "project.publication_date",
+  "video_audio": "muted"
+}
+

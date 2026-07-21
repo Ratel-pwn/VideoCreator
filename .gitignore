@@ -20,24 +20,6 @@ Thumbs.db
 
 # Runtime outputs
 projects/**
-!projects/sample-project/
-!projects/sample-project/README.md
-!projects/sample-project/project.json
-!projects/sample-project/assets/
-!projects/sample-project/assets/.gitkeep
-!projects/sample-project/audio/
-!projects/sample-project/audio/.gitkeep
-!projects/sample-project/drafts/
-!projects/sample-project/drafts/.gitkeep
-!projects/sample-project/library/
-!projects/sample-project/library/style/
-!projects/sample-project/library/style/.gitkeep
-!projects/sample-project/library/voice/
-!projects/sample-project/library/voice/.gitkeep
-!projects/sample-project/runs/
-!projects/sample-project/runs/.gitkeep
-!projects/sample-project/sessions/
-!projects/sample-project/sessions/.gitkeep
 
 library/**
 !library/style/

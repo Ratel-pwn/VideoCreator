@@ -7,12 +7,12 @@ description: Coordinate reusable video skills by stage and scenario without abso
 
 ## Goal
 
-Route a video request through the correct reusable skills based on scenario and stage.
+Route a video request through shared capabilities based on the project's validated declarative template and stage.
 
 ## Owns
 
 - stage progression
-- scenario dispatch
+- template validation and snapshot dispatch
 - artifact handoff
 - stop / confirm points
 
@@ -22,3 +22,4 @@ Route a video request through the correct reusable skills based on scenario and 
 - subtitle internals
 - visual internals
 - packaging internals
+- template-owned writing, pacing, subtitle, and composition policy

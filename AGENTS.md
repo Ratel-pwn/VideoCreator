@@ -2,150 +2,79 @@
 
 ## Purpose
 
-This repository now serves two closely related purposes:
-
-1. it remains a local-first short-video production pipeline
-2. it is the integration workspace for extracting reusable capabilities from:
-   - `E:\Projects\AIGC\ChaosMuseum`
-   - `E:\Projects\Experiment\remotion-demo`
-
-Do not modify the two source projects during the integration design phase.
-Use this repository to stabilize reusable contracts, skills, and orchestration boundaries first.
+VideoCreator is a local-first production pipeline and the integration workspace for reusable video capabilities. Do not modify external source projects while working here.
 
 ## Source Of Truth
 
-Use these locations consistently:
+```text
+templates/                              # Scenario-owned declarative policy and resources
+skills/                                 # Shared capability contracts and orchestration only
+scripts/                                # Executable workflow and utility scripts only
+videocreator/                           # Shared Python implementation and data contracts
+renderer/                               # Shared Remotion implementation
+docs/                                   # Architecture, plans, and external API references
+config/                                 # Public examples plus ignored local configuration
+library/                                # Global style and voice defaults
+projects/<project>/                     # Project inputs, reusable media, and generated runs
+```
 
-- `skills/` stores project-owned skills and reusable capability definitions
-- `scripts/` stores executable workflow and utility scripts only
-- `docs/` stores external API docs and reference material only
-- `plans/` stores roadmap, split decisions, and architecture notes
-- `config/` stores public config examples plus local-only ignored config files
-- `library/` stores global style and voice resources
-- `projects/<project>/` stores generated artifacts and project-local overrides
+Reusable prompts that choose writing or visual strategy belong in a template, not `docs/` or scenario-specific skill directories. Templates may not contain executable code.
 
-Do not place new skill-like prompts in `docs/`.
-If a prompt governs agent behavior or a reusable workflow step, it belongs in `skills/`.
+## Workflow
 
-## Current Workflow
+1. Validate the project's `template_id` and snapshot the effective template and libraries.
+2. Prepare the topic and retain the conversation in the run.
+3. Generate and approve the script.
+4. Generate chunked narration with Volcengine TTS.
+5. Align original approved text to Whisper timestamps.
+6. Apply template subtitle policy and generate visual-plan schema v2.
+7. Run deterministic visual-plan density/schema audit.
+8. Find reusable public online assets first, recording source and attribution; generation is an optional fallback.
+9. Mute source video audio and assemble the final video with Remotion.
 
-The currently implemented pipeline is still:
+## Project Layout
 
-1. topic discussion and collection
-2. article generation from the conversation
-3. voice generation through Volcengine TTS
-4. subtitle alignment using original text plus Whisper timestamps
-5. visual planning from subtitle segments
-6. asset collection or generation per segment
-7. final video assembly reserved only, not implemented yet
+```text
+projects/<project>/                     # Long-lived project boundary
+├── project.json                        # Schema v2 metadata and required template_id
+├── sources/                            # Imported source files and source metadata
+├── library/                            # Project style/voice complete overrides
+├── media/                              # Project-reusable images and silent video clips
+└── runs/<run-id>/                      # Immutable production attempt
+    ├── state.json                      # Resume state
+    ├── manifest.json                   # Artifact index and lineage
+    ├── inputs/                         # Effective input snapshots
+    ├── session/                        # Topic preparation and conversation
+    ├── writing/                        # Raw draft and approved script
+    ├── audio/                          # Generated and cleaned narration
+    ├── subtitles/                      # Aligned and render subtitles
+    ├── visual/                         # Plan, audit, request, manifest, and provenance
+    ├── render/                         # Frozen input, log, report, and final video
+    └── review/                         # Human QA material
+```
 
-Preserve that workflow unless the user explicitly requests a redesign.
+All generated artifacts belong to a run. Only sources, project library overrides, and reusable media live at project level. Do not rediscover artifacts by broad glob when `manifest.json` has a path.
 
-## Integration Direction
+## Libraries
 
-The long-term architecture should separate:
+Resolve each resource type independently with complete override: populated project resource directory, then populated template resource directory, then populated global default. Do not merge levels. Empty directories do not override.
 
-1. shared infrastructure
-2. scenario-specific writing and visual strategy
-3. orchestration / composition
+## Subtitles And Visuals
 
-Preferred build order:
+- Final subtitle text comes from the approved script; Whisper supplies timing only.
+- Template subtitle policy controls segmentation and render constraints.
+- Chaos Museum captions are exactly one visual line and have no sentence-final punctuation.
+- Visual planning consumes final render subtitles, not rough drafts.
+- Ordinary material changes use hard cuts.
+- Public footage is muted and must retain source URL and attribution.
+- Entity cards use a blurred material background, a fixed display image, a primary name, and an optional secondary name.
+- Declarative explainers cover formulas, processes, lists, functions, scores, code, and quoted passages with animated emphasis.
+- Visual-plan audit must pass before asset collection or render.
 
-1. define reusable skill boundaries
-2. define input/output contracts
-3. implement shared subtitle / TTS / packaging infrastructure
-4. implement scenario-level writing and visual planners
-5. implement orchestration
+## Configuration And Security
 
-Do not silently merge everything into one giant workflow skill.
-
-## Output Layout
-
-Generated artifacts and project overrides must use this structure:
-
-- `projects/<project>/project.json`
-- `projects/<project>/runs/`
-- `projects/<project>/assets/`
-- `projects/<project>/audio/`
-- `projects/<project>/drafts/`
-- `projects/<project>/sessions/`
-
-Rules:
-
-- `runs/` stores per-run state, manifest, and resumable workflow records
-- `assets/` stores project visual materials only, including searched or generated images and videos
-- `audio/` stores final audio and final subtitle outputs
-- `drafts/` stores article drafts and approved article files
-- `sessions/` stores conversation records and preparation notes
-
-## Config Rules
-
-Sensitive values such as API keys, access tokens, and machine-specific paths must stay in local config files and must not be committed.
-
-- committed examples belong in `config/*.example.json` or existing script-level example config files
-- local real values belong in `config/*.local.json` or ignored script-level `.config.json` files
-
-If a future script requires credentials, read local config first and treat example config as documentation only.
-
-## Workflow Rules
-
-### Topic chat
-
-- The prepare/chat behavior is defined by `skills/prepare-topic-chat/SKILL.md`
-- The chat phase should gather useful angles, examples, definitions, disputes, and hooks for later writing
-
-### Article generation
-
-- The article-writing behavior is defined by `skills/article-from-chat/SKILL.md`
-- Default style alignment is driven by `library/style/default`
-- If a project provides `projects/<project>/library/style`, that project-local library overrides the global default
-
-### TTS generation
-
-- Long article TTS must be synthesized in chunks, not as a single full-text request
-- TTS is responsible for audio generation only
-- Do not treat Volcengine subtitle events as the final subtitle source for long-form outputs
-
-### Subtitle generation
-
-- Final subtitles must use the original approved article text as the subtitle text source
-- Whisper is used for timestamps only
-- If Whisper text differs from the article text, keep the article text and use Whisper timing
-- The expected final subtitle artifact is the normal `.srt` beside the final audio
-- Burned-in subtitles must always render as exactly one visual line; automatic or explicit line wrapping is not allowed
-- Split long captions at semantic boundaries before rendering; the renderer may shrink text only as a final safeguard
-- Burned-in subtitle text must not end with punctuation; preserve punctuation inside the sentence and strip every trailing punctuation mark before rendering
-
-### Visual planning
-
-- The visual-planning behavior is defined by `skills/segment-visual-planner/SKILL.md`
-- The planning input is the final `.srt` file, not a rough text draft
-- The planning output is `drafts/visual-plan.json`
-- The plan must be structured and machine-readable, not prose
-
-### Visual assets
-
-- Asset lookup must try reusable online material first when the plan says `search_first`
-- If no usable online material is found, fallback to Jimeng image/video generation
-- Asset files must be saved under `projects/<project>/assets/`
-- `runs/asset-manifest.json` is the source of truth for resolved assets
+Commit public examples as `*.example.json`. Store real keys, tokens, and machine paths only in ignored `*.local.json` or script `.config.json` files. Templates and run snapshots must never contain credentials.
 
 ## Quality Bar
 
-Every reusable skill should answer:
-
-- what exact problem it solves
-- what input it expects
-- what output it must produce
-- what it explicitly does not own
-
-If those four points are blurry, the skill boundary is still wrong.
-
-## Current Non-Goals
-
-These are intentionally not implemented yet:
-
-- final video timeline assembly
-- automatic compositor selection
-- silently replacing the original working pipelines
-- creating one universal mega skill before the contracts are stable
+Every shared capability must define its problem, exact input, exact output, and explicit non-ownership. Every template must be valid, declarative, independently selectable, and free of executable source files. Verify Python tests, Remotion tests, TypeScript checks, manifests, media decode, and sibling-project isolation before completion.

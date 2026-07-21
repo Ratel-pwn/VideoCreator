@@ -164,12 +164,15 @@ def clean_audio_and_srt(
     output_dir: Path,
     *,
     spoken_end_ms: int,
+    subtitle_output_dir: Path | None = None,
     runner: Callable[..., Any] = subprocess.run,
     probe_duration: Callable[[Path], int] | None = None,
 ) -> tuple[Path, Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
-    cleaned_audio = output_dir / "voice.cleaned.mp3"
-    cleaned_srt = output_dir / "voice.cleaned.srt"
+    subtitle_dir = subtitle_output_dir or output_dir
+    subtitle_dir.mkdir(parents=True, exist_ok=True)
+    cleaned_audio = output_dir / ("narration.render.mp3" if subtitle_output_dir else "voice.cleaned.mp3")
+    cleaned_srt = subtitle_dir / ("subtitles.render.srt" if subtitle_output_dir else "voice.cleaned.srt")
 
     duration_probe = probe_duration or (lambda path: probe_media(path).duration_ms)
     requested_duration_ms = spoken_end_ms
