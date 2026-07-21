@@ -71,7 +71,7 @@ describe('render components', () => {
       <SubtitleTrack captions={captions} frame={0} fps={25} />,
     );
 
-    expect(markup).toContain('钱原本只是交换工具 后来却像会自己繁殖的东西。');
+    expect(markup).toContain('钱原本只是交换工具 后来却像会自己繁殖的东西');
     expect(markup).not.toContain('\n');
     expect(markup).toContain('white-space:nowrap');
   });
@@ -79,7 +79,12 @@ describe('render components', () => {
   it('shrinks long captions instead of allowing them to wrap', () => {
     const text = '钱原本只是交换工具，后来却越来越像一种会自己繁殖的东西。';
 
-    expect(normalizeCaptionText(`  ${text}\r\n  `)).toBe(text);
+    expect(normalizeCaptionText(`  ${text}\r\n  `)).toBe(text.slice(0, -1));
     expect(getSingleLineFontSize(text)).toBeLessThan(58);
+  });
+
+  it('removes trailing punctuation while preserving punctuation within a caption', () => {
+    expect(normalizeCaptionText('价格，信号！？。”  \n')).toBe('价格，信号');
+    expect(normalizeCaptionText('Market, signal?!')).toBe('Market, signal');
   });
 });

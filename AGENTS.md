@@ -114,6 +114,7 @@ If a future script requires credentials, read local config first and treat examp
 - The expected final subtitle artifact is the normal `.srt` beside the final audio
 - Burned-in subtitles must always render as exactly one visual line; automatic or explicit line wrapping is not allowed
 - Split long captions at semantic boundaries before rendering; the renderer may shrink text only as a final safeguard
+- Burned-in subtitle text must not end with punctuation; preserve punctuation inside the sentence and strip every trailing punctuation mark before rendering
 
 ### Visual planning
 

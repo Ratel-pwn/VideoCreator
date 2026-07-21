@@ -8,7 +8,7 @@ const MAX_CAPTION_WIDTH = 1600;
 const WIDTH_SAFETY_FACTOR = 0.94;
 
 export const normalizeCaptionText = (text: string) =>
-  text.replace(/\s+/g, ' ').trim();
+  text.replace(/\s+/g, ' ').trim().replace(/\p{P}+$/gu, '').trimEnd();
 
 const estimateTextWidthInEm = (text: string) =>
   Array.from(text).reduce((width, character) => {
