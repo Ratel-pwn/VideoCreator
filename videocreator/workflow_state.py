@@ -1,5 +1,6 @@
 STAGES = (
     "prepare",
+    "prepare_confirm",
     "chat",
     "draft",
     "draft_confirm",

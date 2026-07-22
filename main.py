@@ -15,6 +15,12 @@ from pathlib import Path
 from typing import Any
 
 from videocreator.asset_manifest import audit_asset_manifest
+from videocreator.interactions import (
+    ConsoleInteractionPort,
+    InteractionPort,
+    InteractionRequired,
+    WorkflowOutcome,
+)
 from videocreator.media import (
     clean_audio_and_srt,
     detect_trailing_silence,
@@ -33,6 +39,7 @@ from videocreator.workflow_state import STAGES, missing_stage_handlers
 
 
 STAGE_PREPARE = "prepare"
+STAGE_PREPARE_CONFIRM = "prepare_confirm"
 STAGE_CHAT = "chat"
 STAGE_DRAFT = "draft"
 STAGE_DRAFT_CONFIRM = "draft_confirm"
@@ -237,6 +244,7 @@ class WorkflowContext:
     manifest: dict[str, Any] = field(default_factory=dict)
     project_config: dict[str, Any] = field(default_factory=dict)
     template: TemplateDefinition | None = None
+    interactions: InteractionPort = field(default_factory=ConsoleInteractionPort)
 
     @property
     def output_root(self) -> Path:
@@ -435,34 +443,43 @@ def persist_chat(ctx: WorkflowContext, messages: list[dict[str, str]]) -> None:
     ctx.register_artifact("session_md", session_md)
 
 
+def ask_confirmation(ctx: WorkflowContext, key: str, prompt: str) -> str:
+    return ctx.interactions.ask(ctx, key, prompt, "confirmation", ("y", "n", "q"))
+
+
 def run_prepare(ctx: WorkflowContext) -> None:
     ctx.set_stage(STAGE_PREPARE)
     skill_path = ctx.template.paths["prepare"]
     skill_text = read_text(skill_path)
-    feedback = ""
-    while True:
-        messages = [
-            {"role": "system", "content": skill_text},
-            {"role": "user", "content": f"主题：{ctx.topic}\n\n请输出本次话题讨论的准备提纲。{feedback}"},
-        ]
-        result = call_compatible_openai(ctx.config["llm"]["base_url"], ctx.llm_api_key, ctx.config["llm"]["model"], messages)
-        prepare_path = ctx.artifact_path("sessions", "prepare.md")
-        prepare_path.parent.mkdir(parents=True, exist_ok=True)
-        prepare_path.write_text(result + "\n", encoding="utf-8")
-        ctx.register_artifact("prepare_note", prepare_path)
-        print("\n=== 前置准备 ===\n")
-        print(result)
-        print()
-        if not ctx.config["confirm"]["prepare"]:
-            break
-        decision = request_confirmation("前置准备是否可用")
-        if decision == "y":
-            break
-        if decision == "q":
-            raise SystemExit(0)
-        extra = input("补充想调整的方向，直接回车则按同一主题重试： ").strip()
-        feedback = f"\n\n用户补充要求：{extra}" if extra else ""
-    ctx.set_stage(STAGE_CHAT, status="ready")
+    feedback = ctx.state.pop("prepare_feedback", "")
+    messages = [
+        {"role": "system", "content": skill_text},
+        {"role": "user", "content": f"主题：{ctx.topic}\n\n请输出本次话题讨论的准备提纲。{feedback}"},
+    ]
+    result = call_compatible_openai(ctx.config["llm"]["base_url"], ctx.llm_api_key, ctx.config["llm"]["model"], messages)
+    prepare_path = ctx.artifact_path("sessions", "prepare.md")
+    prepare_path.parent.mkdir(parents=True, exist_ok=True)
+    prepare_path.write_text(result + "\n", encoding="utf-8")
+    ctx.register_artifact("prepare_note", prepare_path)
+    print("\n=== 前置准备 ===\n")
+    print(result)
+    print()
+    next_stage = STAGE_PREPARE_CONFIRM if ctx.config["confirm"]["prepare"] else STAGE_CHAT
+    ctx.set_stage(next_stage, status="ready" if next_stage == STAGE_CHAT else "awaiting_confirmation")
+
+
+def confirm_prepare(ctx: WorkflowContext) -> None:
+    decision = ask_confirmation(ctx, "prepare-approval", "前置准备是否可用")
+    if decision == "y":
+        ctx.interactions.clear(ctx, "prepare-approval", "prepare-revision")
+        ctx.set_stage(STAGE_CHAT, status="ready")
+        return
+    if decision == "q":
+        raise SystemExit(0)
+    extra = ctx.interactions.ask(ctx, "prepare-revision", "补充想调整的方向", "text")
+    ctx.state["prepare_feedback"] = f"\n\n用户补充要求：{extra}" if extra else ""
+    ctx.interactions.clear(ctx, "prepare-approval", "prepare-revision")
+    ctx.set_stage(STAGE_PREPARE, status="ready")
 
 
 def run_chat(ctx: WorkflowContext) -> None:
@@ -480,16 +497,20 @@ def run_chat(ctx: WorkflowContext) -> None:
 
     print("输入 /done 结束聊天并进入文稿阶段。\n")
     while True:
-        user_text = input("你：").strip()
+        interaction_key = f"chat-message-{sum(item['role'] == 'user' for item in messages)}"
+        user_text = ctx.interactions.ask(ctx, interaction_key, "你", "text").strip()
         if not user_text:
+            ctx.interactions.clear(ctx, interaction_key)
             continue
         if user_text == "/done":
+            ctx.interactions.clear(ctx, interaction_key)
             break
         messages.append({"role": "user", "content": user_text})
         reply = call_compatible_openai(ctx.config["llm"]["base_url"], ctx.llm_api_key, ctx.config["llm"]["model"], messages)
         messages.append({"role": "assistant", "content": reply})
         persist_chat(ctx, messages)
         print(f"\n助手：{reply}\n")
+        ctx.interactions.clear(ctx, interaction_key)
     persist_chat(ctx, messages)
     ctx.set_stage(STAGE_DRAFT, status="ready")
 
@@ -530,33 +551,41 @@ def generate_draft(ctx: WorkflowContext, feedback: str = "") -> str:
 
 def run_draft(ctx: WorkflowContext) -> None:
     ctx.set_stage(STAGE_DRAFT)
-    feedback = ""
-    while True:
-        draft = generate_draft(ctx, feedback)
-        raw_path = ctx.artifact_path("drafts", "draft.raw.md")
-        raw_path.parent.mkdir(parents=True, exist_ok=True)
-        raw_path.write_text(draft + "\n", encoding="utf-8")
-        ctx.register_artifact("draft_raw", raw_path)
-        print("\n=== 文稿草稿 ===\n")
-        print(draft)
-        print()
-        ctx.set_stage(STAGE_DRAFT_CONFIRM, status="awaiting_confirmation")
-        if not ctx.config["confirm"]["draft"]:
-            approved_path = ctx.artifact_path("drafts", "draft.approved.md")
-            approved_path.write_text(draft + "\n", encoding="utf-8")
-            ctx.register_artifact("draft_approved", approved_path)
-            break
-        decision = request_confirmation("文稿是否可用")
-        if decision == "y":
-            approved_path = ctx.artifact_path("drafts", "draft.approved.md")
-            approved_path.write_text(draft + "\n", encoding="utf-8")
-            ctx.register_artifact("draft_approved", approved_path)
-            break
-        if decision == "q":
-            raise SystemExit(0)
-        extra = input("补充修改要求，直接回车则按当前规则重写： ").strip()
-        feedback = f"\n\n用户补充修改要求：{extra}" if extra else ""
+    feedback = ctx.state.pop("draft_feedback", "")
+    draft = generate_draft(ctx, feedback)
+    raw_path = ctx.artifact_path("drafts", "draft.raw.md")
+    raw_path.parent.mkdir(parents=True, exist_ok=True)
+    raw_path.write_text(draft + "\n", encoding="utf-8")
+    ctx.register_artifact("draft_raw", raw_path)
+    print("\n=== 文稿草稿 ===\n")
+    print(draft)
+    print()
+    if not ctx.config["confirm"]["draft"]:
+        approve_draft(ctx)
+        return
+    ctx.set_stage(STAGE_DRAFT_CONFIRM, status="awaiting_confirmation")
+
+
+def approve_draft(ctx: WorkflowContext) -> None:
+    raw_path = Path(ctx.manifest["artifacts"]["draft_raw"])
+    approved_path = ctx.artifact_path("drafts", "draft.approved.md")
+    approved_path.write_text(read_text(raw_path), encoding="utf-8")
+    ctx.register_artifact("draft_approved", approved_path)
     ctx.set_stage(STAGE_TTS, status="ready")
+
+
+def confirm_draft(ctx: WorkflowContext) -> None:
+    decision = ask_confirmation(ctx, "draft-approval", "文稿是否可用")
+    if decision == "y":
+        ctx.interactions.clear(ctx, "draft-approval", "draft-revision")
+        approve_draft(ctx)
+        return
+    if decision == "q":
+        raise SystemExit(0)
+    extra = ctx.interactions.ask(ctx, "draft-revision", "补充修改要求", "text")
+    ctx.state["draft_feedback"] = f"\n\n用户补充修改要求：{extra}" if extra else ""
+    ctx.interactions.clear(ctx, "draft-approval", "draft-revision")
+    ctx.set_stage(STAGE_DRAFT, status="ready")
 
 def run_tts(ctx: WorkflowContext) -> None:
     ctx.set_stage(STAGE_TTS)
@@ -612,12 +641,14 @@ def confirm_tts(ctx: WorkflowContext) -> None:
     if not ctx.config["confirm"]["tts"]:
         ctx.set_stage(STAGE_VISUAL_PLAN, status="ready")
         return
-    decision = request_confirmation("??????")
+    decision = ask_confirmation(ctx, "tts-approval", "配音与字幕是否可用")
     if decision == "y":
+        ctx.interactions.clear(ctx, "tts-approval")
         ctx.set_stage(STAGE_VISUAL_PLAN, status="ready")
         return
     if decision == "q":
         raise SystemExit(0)
+    ctx.interactions.clear(ctx, "tts-approval")
     print("????? scripts/volc_tts_ws.config.json ?????????")
     ctx.set_stage(STAGE_TTS, status="ready")
 
@@ -677,12 +708,14 @@ def confirm_visual_plan(ctx: WorkflowContext) -> None:
     if not ctx.config["confirm"].get("visual_plan", True):
         ctx.set_stage(STAGE_VISUAL_ASSETS, status="ready")
         return
-    decision = request_confirmation("????????")
+    decision = ask_confirmation(ctx, "visual-plan-approval", "视觉规划是否可用")
     if decision == "y":
+        ctx.interactions.clear(ctx, "visual-plan-approval")
         ctx.set_stage(STAGE_VISUAL_ASSETS, status="ready")
         return
     if decision == "q":
         raise SystemExit(0)
+    ctx.interactions.clear(ctx, "visual-plan-approval")
     print("请修改当前模板的视觉规划声明后重新生成")
     ctx.set_stage(STAGE_VISUAL_PLAN, status="ready")
 
@@ -724,12 +757,14 @@ def confirm_visual_assets(ctx: WorkflowContext) -> None:
     if not ctx.config["confirm"].get("assets", True):
         ctx.set_stage(STAGE_VIDEO_RENDER, status="ready")
         return
-    decision = request_confirmation("??????")
+    decision = ask_confirmation(ctx, "visual-assets-approval", "视觉素材是否可用")
     if decision == "y":
+        ctx.interactions.clear(ctx, "visual-assets-approval")
         ctx.set_stage(STAGE_VIDEO_RENDER, status="ready")
         return
     if decision == "q":
         raise SystemExit(0)
+    ctx.interactions.clear(ctx, "visual-assets-approval")
     print("??? visual-plan.json??????????????????")
     ctx.set_stage(STAGE_VISUAL_ASSETS, status="ready")
 def run_video_render(ctx: WorkflowContext) -> None:
@@ -830,13 +865,15 @@ def confirm_video_render(ctx: WorkflowContext) -> None:
         cleanup_intermediate(ctx)
         ctx.set_stage(STAGE_DONE, status="completed")
         return
-    decision = request_confirmation("Approve final video")
+    decision = ask_confirmation(ctx, "video-approval", "Approve final video")
     if decision == "y":
+        ctx.interactions.clear(ctx, "video-approval")
         cleanup_intermediate(ctx)
         ctx.set_stage(STAGE_DONE, status="completed")
         return
     if decision == "q":
         raise SystemExit(0)
+    ctx.interactions.clear(ctx, "video-approval")
     ctx.set_stage(STAGE_VIDEO_RENDER, status="ready")
 
 
@@ -901,9 +938,10 @@ def finish_workflow(ctx: WorkflowContext) -> bool:
 def build_stage_handlers() -> dict[str, Any]:
     return {
         STAGE_PREPARE: run_prepare,
+        STAGE_PREPARE_CONFIRM: confirm_prepare,
         STAGE_CHAT: run_chat,
         STAGE_DRAFT: run_draft,
-        STAGE_DRAFT_CONFIRM: run_draft,
+        STAGE_DRAFT_CONFIRM: confirm_draft,
         STAGE_TTS: run_tts,
         STAGE_TTS_CONFIRM: confirm_tts,
         STAGE_VISUAL_PLAN: run_visual_plan,
@@ -916,7 +954,7 @@ def build_stage_handlers() -> dict[str, Any]:
     }
 
 
-def execute_from_current_stage(ctx: WorkflowContext) -> None:
+def execute_until_boundary(ctx: WorkflowContext) -> WorkflowOutcome:
     handlers = build_stage_handlers()
     missing = missing_stage_handlers(handlers)
     if missing:
@@ -927,8 +965,23 @@ def execute_from_current_stage(ctx: WorkflowContext) -> None:
         handler = handlers.get(stage)
         if handler is None:
             raise RuntimeError(f"Unknown stage: {stage}")
-        if handler(ctx):
-            break
+        try:
+            if handler(ctx):
+                return WorkflowOutcome("completed")
+        except InteractionRequired as exc:
+            return WorkflowOutcome("waiting_for_input", interaction=exc.interaction)
+        except SystemExit:
+            ctx.set_stage(stage, status="cancelled")
+            return WorkflowOutcome("cancelled")
+        except Exception as exc:
+            ctx.set_stage(stage, status="failed", error=str(exc))
+            return WorkflowOutcome("failed", error=str(exc))
+
+
+def execute_from_current_stage(ctx: WorkflowContext) -> None:
+    outcome = execute_until_boundary(ctx)
+    if outcome.status == "failed":
+        raise RuntimeError(outcome.error or "Workflow failed")
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Unified topic -> draft -> voice -> visual workflow")
