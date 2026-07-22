@@ -12,7 +12,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from videocreator.asset_manifest import audit_asset_manifest
 from videocreator.interactions import (
@@ -245,6 +245,7 @@ class WorkflowContext:
     project_config: dict[str, Any] = field(default_factory=dict)
     template: TemplateDefinition | None = None
     interactions: InteractionPort = field(default_factory=ConsoleInteractionPort)
+    should_cancel: Callable[[], bool] = field(default=lambda: False)
 
     @property
     def output_root(self) -> Path:
@@ -962,6 +963,9 @@ def execute_until_boundary(ctx: WorkflowContext) -> WorkflowOutcome:
 
     while True:
         stage = ctx.state.get("current_stage")
+        if ctx.should_cancel():
+            ctx.set_stage(stage, status="cancelled")
+            return WorkflowOutcome("cancelled")
         handler = handlers.get(stage)
         if handler is None:
             raise RuntimeError(f"Unknown stage: {stage}")

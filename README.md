@@ -41,6 +41,30 @@ python main.py import-chat input.md --project "新项目"
 python main.py resume projects/<project>/runs/<run-id>
 ```
 
+## MCP Service
+
+VideoCreator exposes the same project and run workflow to Codex and other MCP-capable agents through Streamable HTTP. Start the local service and register it with Codex:
+
+```powershell
+vc mcp start
+codex mcp add videocreator --url http://127.0.0.1:8765/mcp
+```
+
+Manage the service with:
+
+```powershell
+vc mcp status
+vc mcp logs
+vc mcp stop
+vc mcp serve
+```
+
+`start_workflow` returns immediately with a run ID. Agents poll `get_workflow_status`; when a run reports `waiting_for_input`, they present the returned interaction and call `submit_workflow_input` with the matching interaction ID. Closing the MCP client does not stop the worker.
+
+The service provides ten high-level tools: template and project listing, project initialization, workflow start/list/status/input/resume/cancel, and result lookup. Text artifacts may be returned as text; audio and video remain path or URL metadata and are never embedded in MCP responses.
+
+The committed configuration binds to `127.0.0.1:8765`. `mcp.host`, `port`, `path`, `public_base_url`, and `allowed_hosts` can be changed for containers, LANs, or remote servers. For remote deployments, set `mcp.auth.mode` to `bearer`, provide the token through `VIDEO_CREATOR_MCP_TOKEN`, and terminate TLS at a trusted reverse proxy. The application warns but does not block an unauthenticated non-loopback deployment.
+
 A project without a valid `template_id` cannot generate or resume. Templates contain JSON, Markdown, and library resources only; executable Python/TypeScript/Remotion code remains in the core.
 
 ## Layout

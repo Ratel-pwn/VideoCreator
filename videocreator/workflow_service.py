@@ -161,7 +161,7 @@ class WorkflowService:
         job = self.queue.get(project, run_id)
         if state.get("pending_interaction"):
             status = "waiting_for_input"
-        elif job and job.status in {"queued", "leased", "waiting", "cancelled"}:
+        elif job and job.status in {"queued", "leased", "waiting", "completed", "failed", "cancelled"}:
             status = {"leased": "running", "waiting": "waiting_for_input"}.get(job.status, job.status)
         elif state.get("current_stage") == "done" or state.get("status") == "completed":
             status = "completed"
@@ -255,4 +255,3 @@ class WorkflowService:
                 item["content"] = path.read_text(encoding="utf-8-sig")
             artifacts[key] = item
         return {**self.get_workflow_status(project, run_id), "artifacts": artifacts}
-

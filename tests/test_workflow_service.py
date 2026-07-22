@@ -78,3 +78,16 @@ def test_result_returns_text_but_never_media_binary(tmp_path: Path):
     assert result["artifacts"]["draft_approved"]["content"] == "approved"
     assert "content" not in result["artifacts"]["final_video"]
     assert result["artifacts"]["final_video"]["size"] == len(b"not-returned")
+
+
+def test_queue_failure_is_projected_as_workflow_failure(tmp_path: Path):
+    service = build_service(tmp_path)
+    service.initialize_project("demo", "chaos-museum")
+    service.start_workflow("demo", "A topic", run_id="run-1")
+    job = service.queue.claim("worker", 60)
+    service.queue.fail(job.id, "worker", "worker crashed")
+
+    status = service.get_workflow_status("demo", "run-1")
+
+    assert status["status"] == "failed"
+    assert status["error"] == "worker crashed"

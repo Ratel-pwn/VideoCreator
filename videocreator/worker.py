@@ -46,6 +46,7 @@ class WorkflowWorker:
             run = self.service._run(job.project, job.run_id)
             ctx = workflow.resume_context(self.service.home, self.service.config_path, run)
             ctx.interactions = DurableInteractionPort()
+            ctx.should_cancel = lambda: self.queue.is_cancel_requested(job.id)
             outcome = self.execute(ctx) if self.execute else workflow.execute_until_boundary(ctx)
             if outcome.status == "waiting_for_input":
                 self.queue.release_waiting(job.id, self.worker_id)
@@ -67,4 +68,3 @@ class WorkflowWorker:
         while not stop_event.is_set():
             if not self.run_once():
                 stop_event.wait(self.poll_seconds)
-

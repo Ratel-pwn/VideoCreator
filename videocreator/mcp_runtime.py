@@ -66,7 +66,7 @@ def _pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
         return pid > 0
-    except OSError:
+    except (OSError, SystemError):
         return False
 
 
@@ -196,4 +196,3 @@ def _main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(_main())
-

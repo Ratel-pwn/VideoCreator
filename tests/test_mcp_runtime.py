@@ -1,7 +1,7 @@
 import asyncio
 from pathlib import Path
 
-from videocreator.mcp_runtime import BearerAuthMiddleware, service_status
+from videocreator.mcp_runtime import BearerAuthMiddleware, _pid_alive, service_status
 from videocreator.runtime_config import AuthConfig, McpRuntimeConfig
 
 
@@ -16,6 +16,11 @@ def runtime(tmp_path: Path) -> McpRuntimeConfig:
 
 def test_service_status_reports_stopped_without_metadata(tmp_path: Path):
     assert service_status(runtime(tmp_path))["status"] == "stopped"
+
+
+def test_pid_probe_treats_windows_system_error_as_stopped(monkeypatch):
+    monkeypatch.setattr("videocreator.mcp_runtime.os.kill", lambda pid, sig: (_ for _ in ()).throw(SystemError("gone")))
+    assert not _pid_alive(123)
 
 
 def test_bearer_middleware_rejects_missing_token_and_accepts_valid_token():
