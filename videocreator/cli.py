@@ -83,6 +83,13 @@ def build_parser() -> argparse.ArgumentParser:
     runs = subcommands.add_parser("runs", help="列出项目历史 run")
     runs.add_argument("project", metavar="PROJECT", help="项目名称")
     runs.add_argument("--json", action="store_true", help="使用 JSON 输出")
+    mcp = subcommands.add_parser("mcp", help="Manage the VideoCreator MCP service")
+    mcp_sub = mcp.add_subparsers(dest="mcp_command", required=True)
+    for name in ("start", "stop", "status", "serve"):
+        command = mcp_sub.add_parser(name)
+        command.add_argument("--json", action="store_true")
+    logs = mcp_sub.add_parser("logs")
+    logs.add_argument("--lines", type=int, default=100)
     return parser
 
 
@@ -200,6 +207,30 @@ def run_cli(
     args = build_parser().parse_args(argv)
     home = resolve_home(args.home, environ or os.environ, package_root or Path(__file__).resolve().parents[1])
     config_path = _config_path(home, args.config)
+    if args.command == "mcp":
+        from .mcp_runtime import read_logs, serve, service_status, start_service, stop_service
+        from .runtime_config import McpRuntimeConfig
+
+        config = _load_config(config_path)
+        runtime = McpRuntimeConfig.from_workflow(config, home, environ or os.environ)
+        if args.mcp_command == "serve":
+            return serve(home, config_path)
+        if args.mcp_command == "start":
+            value = start_service(home, config_path)
+        elif args.mcp_command == "stop":
+            value = stop_service(runtime)
+        elif args.mcp_command == "status":
+            value = service_status(runtime)
+        else:
+            print(read_logs(runtime, args.lines), file=stdout)
+            return 0
+        if args.global_json or args.json:
+            print(json.dumps(value, ensure_ascii=False, indent=2), file=stdout)
+        else:
+            print(f"MCP: {value['status']}", file=stdout)
+            if value.get("url"):
+                print(value["url"], file=stdout)
+        return 0
     if args.command == "templates":
         templates = discover_templates(home / "templates")
         values = [
