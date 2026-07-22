@@ -32,6 +32,22 @@ Reusable prompts that choose writing or visual strategy belong in a template, no
 8. Find reusable public online assets first, recording source and attribution; generation is an optional fallback.
 9. Mute source video audio and assemble the final video with Remotion.
 
+## CLI
+
+Use the installed `vc` console command for normal operations. `videocreator/cli.py` owns repository discovery, argument parsing, prompts, project/run selection, and status formatting; it must not duplicate workflow stages from `main.py`.
+
+```text
+vc templates                            # List valid declarative templates
+vc init NAME -t TEMPLATE                # Initialize a project, prompting for optional metadata
+vc chat PROJECT TOPIC                   # Start a new production run
+vc import-chat PROJECT FILE             # Start a run from an existing conversation
+vc status PROJECT                       # Inspect the newest run without changing it
+vc runs PROJECT                         # List all runs newest first
+vc resume PROJECT                       # Continue the newest unfinished run
+```
+
+Home resolution order is explicit `--home`, `VIDEO_CREATOR_HOME`, then the editable-install repository. Keep `python main.py` forms compatible until a separately approved removal.
+
 ## Project Layout
 
 ```text

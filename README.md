@@ -6,6 +6,33 @@ VideoCreator is a local-first pipeline for topic preparation, reference-based wr
 
 Scenario behavior is declarative and lives under `templates/`. The core contains executable capabilities only. Included templates are `chaos-museum`, `product-intro`, `science-explainer`, and `ai-daily`.
 
+Install the Git-style command once. Editable installation keeps `vc` connected to this checkout:
+
+```powershell
+python -m pip install -e E:\Projects\AIGC\VideoCreator
+```
+
+When using pyenv-win, refresh its command shims once after installation:
+
+```powershell
+pyenv rehash
+```
+
+Then use it from any directory:
+
+```powershell
+vc templates
+vc init "新项目" -t chaos-museum --title "视频标题" --date 2026.07.22
+vc chat "新项目" "本期讨论主题"
+vc status "新项目"
+vc runs "新项目"
+vc resume "新项目"
+```
+
+`vc init` prompts for omitted values unless `--non-interactive` is set. `vc chat` always starts a new run; `vc resume` continues the newest unfinished run, or a specific run selected with `-r RUN_ID`. Set `VIDEO_CREATOR_HOME` or pass `--home PATH` when the command should use a different checkout. `--config FILE` selects another workflow configuration, and `--json` gives machine-readable `templates`, `status`, and `runs` output.
+
+The previous Python entry point remains compatible:
+
 ```powershell
 python main.py templates
 python main.py project init --template chaos-museum --name "新项目" --title "视频标题" --publication-date "2026.07.21"
