@@ -6,10 +6,16 @@ import pytest
 from videocreator.templates import TemplateError, discover_templates, load_template, resolve_library
 
 
-def test_repository_exposes_four_declarative_templates():
+def test_repository_exposes_declarative_templates():
     root = Path(__file__).parents[1]
     templates = discover_templates(root / "templates")
-    assert set(templates) == {"chaos-museum", "product-intro", "science-explainer", "ai-daily"}
+    assert set(templates) == {
+        "chaos-museum",
+        "product-intro",
+        "science-explainer",
+        "ai-daily",
+        "infinite-game-manifesto",
+    }
     assert all(not list(item.root.rglob("*.py")) for item in templates.values())
     assert all(not list(item.root.rglob("*.ts")) for item in templates.values())
 

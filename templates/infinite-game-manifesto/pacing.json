@@ -1,0 +1,8 @@
+{
+  "target_duration_ms": [3000, 6500],
+  "soft_max_duration_ms": 8000,
+  "hard_max_duration_ms": 10000,
+  "max_subtitle_blocks": 1,
+  "max_chinese_chars": 28,
+  "min_shots_per_minute": 12
+}

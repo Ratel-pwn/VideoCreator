@@ -2,6 +2,7 @@ import io
 import json
 import tomllib
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -63,7 +64,13 @@ def test_templates_support_text_and_json_output():
     json_output = io.StringIO()
     assert run_cli(["--home", str(REPO), "templates", "--json"], stdout=json_output) == 0
     values = json.loads(json_output.getvalue())
-    assert [item["id"] for item in values] == ["ai-daily", "chaos-museum", "product-intro", "science-explainer"]
+    assert [item["id"] for item in values] == [
+        "ai-daily",
+        "chaos-museum",
+        "infinite-game-manifesto",
+        "product-intro",
+        "science-explainer",
+    ]
 
 
 def test_init_supports_short_scriptable_arguments(tmp_path):
@@ -183,3 +190,50 @@ def test_status_and_runs_support_json_and_empty_projects(tmp_path):
     values = json.loads(output.getvalue())
     assert values[0]["run_id"] == "run-1"
     assert values[0]["current_stage"] == "visual_plan"
+
+
+@pytest.mark.parametrize(
+    ("command", "repair"),
+    [("audit", False), ("repair", True)],
+)
+def test_subtitle_sync_commands_dispatch_selected_run(
+    tmp_path, monkeypatch, command, repair
+):
+    config = config_for_projects(tmp_path)
+    project = tmp_path / "projects" / "project"
+    project.mkdir(parents=True)
+    (project / "project.json").write_text(
+        json.dumps({"template_id": "chaos-museum"}),
+        encoding="utf-8",
+    )
+    run = write_project_run(
+        project,
+        "run-1",
+        "ready",
+        "subtitle_sync",
+        "2026-07-22T10:00:00+08:00",
+    )
+    context = SimpleNamespace(run_dir=run)
+    calls = []
+    monkeypatch.setattr(
+        "main.resume_context",
+        lambda _home, _config, run_path: context if run_path == run else None,
+    )
+    monkeypatch.setattr(
+        "main.audit_subtitles_for_context",
+        lambda selected, allow_repair: calls.append((selected, allow_repair))
+        or {"status": "passed"},
+    )
+
+    assert run_cli([
+        "--home",
+        str(REPO),
+        "--config",
+        str(config),
+        command,
+        "subtitles",
+        "project",
+        "--run",
+        "run-1",
+    ]) == 0
+    assert calls == [(context, repair)]

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -21,6 +22,12 @@ from videocreator.media import (
     probe_media,
 )
 from videocreator.render_contract import build_render_input, normalize_scenes, normalize_v2_scenes
+from videocreator.subtitle_sync import (
+    SyncThresholds,
+    audit_subtitle_sync,
+    sha256_file,
+)
+from videocreator.subtitle_repair import choose_repair, run_repair
 from videocreator.project_layout import create_run, initialize_project
 from videocreator.templates import (
     TemplateDefinition,
@@ -38,6 +45,7 @@ STAGE_DRAFT = "draft"
 STAGE_DRAFT_CONFIRM = "draft_confirm"
 STAGE_TTS = "tts"
 STAGE_TTS_CONFIRM = "tts_confirm"
+STAGE_SUBTITLE_SYNC = "subtitle_sync"
 STAGE_VISUAL_PLAN = "visual_plan"
 STAGE_VISUAL_PLAN_CONFIRM = "visual_plan_confirm"
 STAGE_VISUAL_ASSETS = "visual_assets"
@@ -558,18 +566,86 @@ def run_draft(ctx: WorkflowContext) -> None:
         feedback = f"\n\n用户补充修改要求：{extra}" if extra else ""
     ctx.set_stage(STAGE_TTS, status="ready")
 
+
+def prepare_cloned_voice(
+    ctx: WorkflowContext,
+    tts_config: Path,
+    runner: Any = subprocess.run,
+) -> dict[str, Any]:
+    source = ctx.active_voice_source_file
+    if not source.is_file():
+        raise RuntimeError(f"Voice source file not found: {source}")
+    if not tts_config.is_file():
+        raise RuntimeError(f"TTS config file not found: {tts_config}")
+
+    config = load_json(tts_config)
+    speaker_id = str(config.get("clone_speaker_id") or config.get("speaker_id") or "").strip()
+    if not speaker_id:
+        raise RuntimeError(f"Missing clone_speaker_id or speaker_id in TTS config: {tts_config}")
+
+    source_sha256 = hashlib.sha256(source.read_bytes()).hexdigest()
+    resources = {
+        "voice_source_file": str(source),
+        "voice_source_sha256": source_sha256,
+        "voice_speaker_fingerprint": hashlib.sha256(
+            speaker_id.encode("utf-8")
+        ).hexdigest(),
+    }
+    already_bound = (
+        config.get("voice_source_sha256") == source_sha256
+        and config.get("voice_source_speaker_id") == speaker_id
+    )
+    if not already_bound:
+        voice_source_mode = ctx.config.get("tts", {}).get("voice_source_mode", "clone")
+        if voice_source_mode == "existing_speaker":
+            raise RuntimeError(
+                f"Voice source is not bound to the configured existing speaker: {source}"
+            )
+        clone_script_value = ctx.config.get("tts", {}).get("clone_script")
+        if not clone_script_value:
+            raise RuntimeError("TTS clone_script is required when voice_source_mode is clone")
+        clone_script = resolve_path(ctx.repo_root, clone_script_value)
+        runner(
+            [
+                sys.executable,
+                str(clone_script),
+                "--config",
+                str(tts_config),
+                "--audio",
+                str(source),
+            ],
+            check=True,
+        )
+        config["voice_source_sha256"] = source_sha256
+        config["voice_source_speaker_id"] = speaker_id
+        tts_config.write_text(
+            json.dumps(config, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+    ctx.manifest.setdefault("resources", {}).update(resources)
+    ctx.save_manifest()
+    return {**resources, "cloned": not already_bound}
+
+
 def run_tts(ctx: WorkflowContext) -> None:
     ctx.set_stage(STAGE_TTS)
     draft_path = Path(ctx.manifest["artifacts"]["draft_approved"])
     draft_text = strip_markdown(read_text(draft_path))
-    source_text_path = ctx.run_dir / "voice_source.txt"
+    source_text_path = ctx.run_dir / "audio" / "narration.txt"
+    source_text_path.parent.mkdir(parents=True, exist_ok=True)
     source_text_path.write_text(draft_text + "\n", encoding="utf-8")
     tts_script = resolve_path(ctx.repo_root, ctx.config["tts"]["script"])
     tts_config = resolve_path(ctx.repo_root, ctx.config["tts"]["config"])
     subtitle_script = resolve_path(ctx.repo_root, ctx.config["subtitle"]["script"])
     subtitle_config = resolve_path(ctx.repo_root, ctx.config["subtitle"]["config"])
+    if ctx.config["tts"].get("voice_source_mode"):
+        prepare_cloned_voice(ctx, tts_config)
     output_audio = ctx.artifact_path("audio", f"voice.{ctx.config['tts']['output_format']}")
     subtitle_path = ctx.artifact_path("audio", "voice.srt")
+    segment_manifest_path = ctx.run_dir / "audio" / "tts-segments.json"
+    timing_path = ctx.run_dir / "subtitles" / "alignment-timing.json"
+    alignment_report_path = ctx.run_dir / "subtitles" / "alignment-report.json"
     tts_command = [
         sys.executable,
         str(tts_script),
@@ -580,6 +656,8 @@ def run_tts(ctx: WorkflowContext) -> None:
         "--output",
         str(output_audio),
         "--no-subtitle",
+        "--segment-manifest",
+        str(segment_manifest_path),
     ]
     subtitle_command = [
         sys.executable,
@@ -592,6 +670,10 @@ def run_tts(ctx: WorkflowContext) -> None:
         str(source_text_path),
         "--output-srt",
         str(subtitle_path),
+        "--output-timing-json",
+        str(timing_path),
+        "--output-report",
+        str(alignment_report_path),
     ]
     try:
         subprocess.run(tts_command, check=True)
@@ -599,8 +681,12 @@ def run_tts(ctx: WorkflowContext) -> None:
     except subprocess.CalledProcessError as exc:
         raise RuntimeError(f"Audio/subtitle script failed with code {exc.returncode}") from exc
     ctx.register_artifact("voice_audio", output_audio)
+    ctx.register_artifact("narration_text", source_text_path)
+    ctx.register_artifact("tts_segment_manifest", segment_manifest_path)
     if subtitle_path.exists():
         ctx.register_artifact("voice_subtitle", subtitle_path)
+    ctx.register_artifact("subtitle_alignment_timing", timing_path)
+    ctx.register_artifact("subtitle_alignment_report", alignment_report_path)
     ctx.set_stage(STAGE_TTS_CONFIRM, status="awaiting_confirmation")
 
 
@@ -610,16 +696,278 @@ def confirm_tts(ctx: WorkflowContext) -> None:
     if "voice_subtitle" in ctx.manifest.get("artifacts", {}):
         print(f"??????{ctx.manifest['artifacts']['voice_subtitle']}")
     if not ctx.config["confirm"]["tts"]:
-        ctx.set_stage(STAGE_VISUAL_PLAN, status="ready")
+        ctx.set_stage(STAGE_SUBTITLE_SYNC, status="ready")
         return
     decision = request_confirmation("??????")
     if decision == "y":
-        ctx.set_stage(STAGE_VISUAL_PLAN, status="ready")
+        ctx.set_stage(STAGE_SUBTITLE_SYNC, status="ready")
         return
     if decision == "q":
         raise SystemExit(0)
     print("????? scripts/volc_tts_ws.config.json ?????????")
     ctx.set_stage(STAGE_TTS, status="ready")
+
+
+def ensure_subtitle_sync_gate(
+    audio_path: Path,
+    subtitle_path: Path,
+    alignment_report_path: Path,
+    audit_output_path: Path,
+    config: dict[str, Any],
+    segment_manifest_path: Path | None = None,
+) -> dict[str, Any]:
+    if not alignment_report_path.is_file():
+        raise RuntimeError(
+            f"Subtitle synchronization alignment report is missing: "
+            f"{alignment_report_path}"
+        )
+    thresholds = SyncThresholds.from_dict(config)
+    result = write_subtitle_sync_audit(
+        audio_path,
+        subtitle_path,
+        alignment_report_path,
+        thresholds=thresholds,
+        audit_output_path=audit_output_path,
+        segment_manifest_path=segment_manifest_path,
+    )
+    if result["status"] != "passed":
+        codes = ", ".join(
+            sorted({item["code"] for item in result.get("findings", [])})
+        )
+        raise RuntimeError(
+            f"Subtitle synchronization audit failed ({codes}): "
+            f"{audit_output_path}"
+        )
+    return result
+
+
+def write_subtitle_sync_audit(
+    audio_path: Path,
+    subtitle_path: Path,
+    alignment_report_path: Path,
+    *,
+    thresholds: SyncThresholds,
+    audit_output_path: Path,
+    segment_manifest_path: Path | None = None,
+) -> dict[str, Any]:
+    result = audit_subtitle_sync(
+        audio_path,
+        subtitle_path,
+        alignment_report_path,
+        thresholds=thresholds,
+        segment_manifest=(
+            segment_manifest_path
+            if segment_manifest_path and segment_manifest_path.is_file()
+            else None
+        ),
+    )
+    audit_output_path.parent.mkdir(parents=True, exist_ok=True)
+    save_json(audit_output_path, result)
+    return result
+
+
+def bind_render_inputs_to_sync_audit(
+    result: dict[str, Any],
+    *,
+    audio_path: Path,
+    subtitle_path: Path,
+    audit_output_path: Path,
+) -> dict[str, Any]:
+    source_inputs = result.get("inputs") or {}
+    render_audio_hash = sha256_file(audio_path)
+    render_srt_hash = sha256_file(subtitle_path)
+    result["render_inputs"] = {
+        "audio_path": str(audio_path),
+        "audio_sha256": render_audio_hash,
+        "srt_path": str(subtitle_path),
+        "srt_sha256": render_srt_hash,
+        "derived_from_audited_inputs": (
+            source_inputs.get("audio_sha256") != render_audio_hash
+            or source_inputs.get("srt_sha256") != render_srt_hash
+        ),
+    }
+    save_json(audit_output_path, result)
+    return result
+
+
+def _run_alignment(ctx: WorkflowContext, *, stronger: bool = False) -> str:
+    artifacts = ctx.manifest["artifacts"]
+    command = [
+        sys.executable,
+        str(resolve_path(ctx.repo_root, ctx.config["subtitle"]["script"])),
+        "--config",
+        str(resolve_path(ctx.repo_root, ctx.config["subtitle"]["config"])),
+        "--audio-file",
+        str(artifacts["voice_audio"]),
+        "--text-file",
+        str(artifacts["narration_text"]),
+        "--output-srt",
+        str(artifacts["voice_subtitle"]),
+        "--output-timing-json",
+        str(artifacts["subtitle_alignment_timing"]),
+        "--output-report",
+        str(artifacts["subtitle_alignment_report"]),
+    ]
+    if stronger:
+        command.extend(["--beam-size", "8"])
+    subprocess.run(command, check=True)
+    return "alignment rebuilt"
+
+
+def _reassemble_tts_audio(ctx: WorkflowContext, _target: str) -> str:
+    from scripts.volc_tts_ws import load_config as load_tts_manifest
+    from scripts.volc_tts_ws import write_audio_chunks, write_tts_segment_manifest
+
+    artifacts = ctx.manifest["artifacts"]
+    manifest_path = Path(artifacts["tts_segment_manifest"])
+    manifest = load_tts_manifest(manifest_path)
+    segments = sorted(
+        manifest.get("segments") or [],
+        key=lambda item: int(item.get("ordinal", 0)),
+    )
+    audio = [Path(item["audio_path"]).read_bytes() for item in segments]
+    output = Path(artifacts["voice_audio"])
+    write_audio_chunks(
+        audio,
+        output,
+        audio_format=ctx.config["tts"]["output_format"],
+    )
+    write_tts_segment_manifest(
+        manifest_path,
+        segments=segments,
+        output=output,
+        speaker_fingerprint=str(manifest.get("speaker_fingerprint", "")),
+    )
+    _run_alignment(ctx)
+    return "TTS segments reassembled"
+
+
+def _regenerate_tts_segment(ctx: WorkflowContext, target: str) -> str:
+    if not target.startswith("segment-"):
+        raise RuntimeError(
+            f"Cannot localize TTS regeneration to a declared segment: {target}"
+        )
+    artifacts = ctx.manifest["artifacts"]
+    command = [
+        sys.executable,
+        str(resolve_path(ctx.repo_root, ctx.config["tts"]["script"])),
+        "--config",
+        str(resolve_path(ctx.repo_root, ctx.config["tts"]["config"])),
+        "--text-file",
+        str(artifacts["narration_text"]),
+        "--output",
+        str(artifacts["voice_audio"]),
+        "--no-subtitle",
+        "--segment-manifest",
+        str(artifacts["tts_segment_manifest"]),
+        "--repair-segment",
+        target,
+    ]
+    subprocess.run(command, check=True)
+    _run_alignment(ctx)
+    return f"regenerated {target}"
+
+
+def _repair_subtitle_sync(ctx: WorkflowContext, audit_path: Path) -> dict[str, Any]:
+    history_path = ctx.run_dir / "review" / "subtitle-sync-repairs.json"
+    history_payload = load_json(history_path) if history_path.exists() else {}
+    history = history_payload.get("by_fingerprint", {})
+    attempts = history_payload.get("attempts", [])
+    artifacts = ctx.manifest["artifacts"]
+    thresholds = SyncThresholds.from_dict(ctx.config.get("subtitle_sync", {}))
+    segment_manifest = (
+        Path(artifacts["tts_segment_manifest"])
+        if artifacts.get("tts_segment_manifest")
+        else None
+    )
+    for _ in range(8):
+        audit = load_json(audit_path)
+        if audit.get("status") == "passed":
+            return audit
+        action = choose_repair(audit, history)
+        if action is None:
+            break
+        handlers = {
+            "rebuild_alignment": lambda _target: _run_alignment(ctx),
+            "realign_range": lambda _target: _run_alignment(ctx),
+            "recognize_window": lambda _target: _run_alignment(
+                ctx, stronger=True
+            ),
+            "reassemble_audio": lambda target: _reassemble_tts_audio(
+                ctx, target
+            ),
+            "regenerate_segment": lambda target: _regenerate_tts_segment(
+                ctx, target
+            ),
+        }
+        attempt = run_repair(action, handlers=handlers)
+        history[action["fingerprint"]] = attempt
+        attempts.append(attempt)
+        save_json(history_path, {
+            "schema_version": 1,
+            "attempts": attempts,
+            "by_fingerprint": history,
+        })
+        if attempt["status"] != "completed":
+            break
+        write_subtitle_sync_audit(
+            Path(artifacts["voice_audio"]),
+            Path(artifacts["voice_subtitle"]),
+            Path(artifacts["subtitle_alignment_report"]),
+            thresholds=thresholds,
+            audit_output_path=audit_path,
+            segment_manifest_path=segment_manifest,
+        )
+    return load_json(audit_path)
+
+
+def audit_subtitles_for_context(
+    ctx: WorkflowContext,
+    allow_repair: bool,
+) -> dict[str, Any]:
+    artifacts = ctx.manifest.get("artifacts", {})
+    audit_path = ctx.run_dir / "review" / "subtitle-sync-audit.json"
+    audio_path = Path(artifacts["voice_audio"])
+    subtitle_path = Path(artifacts["voice_subtitle"])
+    report_path = Path(artifacts["subtitle_alignment_report"])
+    segment_manifest = (
+        Path(artifacts["tts_segment_manifest"])
+        if artifacts.get("tts_segment_manifest")
+        else None
+    )
+    thresholds = SyncThresholds.from_dict(ctx.config.get("subtitle_sync", {}))
+    result = write_subtitle_sync_audit(
+        audio_path,
+        subtitle_path,
+        report_path,
+        thresholds=thresholds,
+        audit_output_path=audit_path,
+        segment_manifest_path=segment_manifest,
+    )
+    if result["status"] != "passed" and allow_repair:
+        result = _repair_subtitle_sync(ctx, audit_path)
+    ctx.register_artifact("subtitle_sync_audit", audit_path)
+    return result
+
+
+def run_subtitle_sync(ctx: WorkflowContext) -> None:
+    ctx.set_stage(STAGE_SUBTITLE_SYNC)
+    audit_path = ctx.run_dir / "review" / "subtitle-sync-audit.json"
+    result = audit_subtitles_for_context(ctx, allow_repair=True)
+    if result["status"] == "passed":
+        ctx.set_stage(STAGE_VISUAL_PLAN, status="ready")
+        return
+    codes = ", ".join(
+        sorted({item["code"] for item in result.get("findings", [])})
+    )
+    ctx.set_stage(
+        STAGE_SUBTITLE_SYNC,
+        status="blocked",
+        error=f"Subtitle synchronization remains unresolved: {codes}",
+    )
+    raise RuntimeError(
+        f"Subtitle synchronization remains unresolved ({codes}): {audit_path}"
+    )
 
 
 def detect_topic_category(ctx: WorkflowContext) -> str:
@@ -750,6 +1098,23 @@ def run_video_render(ctx: WorkflowContext) -> None:
     if not audit.ok:
         raise RuntimeError("Asset audit failed:\n" + "\n".join(audit.errors))
 
+    sync_audit_path = ctx.run_dir / "review" / "subtitle-sync-audit.json"
+    sync_result: dict[str, Any] | None = None
+    alignment_report = artifacts.get("subtitle_alignment_report")
+    if ctx.config.get("subtitle_sync", {}).get("enabled", True):
+        if not alignment_report:
+            raise RuntimeError("Subtitle synchronization alignment report is missing")
+        sync_result = ensure_subtitle_sync_gate(
+            audio_path,
+            subtitle_path,
+            Path(alignment_report),
+            sync_audit_path,
+            ctx.config.get("subtitle_sync", {}),
+            Path(artifacts["tts_segment_manifest"])
+            if artifacts.get("tts_segment_manifest")
+            else None,
+        )
+
     duration_ms = probe_media(audio_path).duration_ms
     spoken_end_ms = detect_trailing_silence(
         audio_path, total_duration_ms=duration_ms
@@ -765,6 +1130,15 @@ def run_video_render(ctx: WorkflowContext) -> None:
     else:
         spoken_end_ms = duration_ms
         render_audio, render_subtitle = audio_path, subtitle_path
+
+    if sync_result is not None:
+        bind_render_inputs_to_sync_audit(
+            sync_result,
+            audio_path=render_audio,
+            subtitle_path=render_subtitle,
+            audit_output_path=sync_audit_path,
+        )
+        ctx.register_artifact("subtitle_sync_audit", sync_audit_path)
 
     renderer_cfg = ctx.config["renderer"]
     if int(visual_plan.get("schema_version", 1)) == 2:
@@ -906,6 +1280,7 @@ def build_stage_handlers() -> dict[str, Any]:
         STAGE_DRAFT_CONFIRM: run_draft,
         STAGE_TTS: run_tts,
         STAGE_TTS_CONFIRM: confirm_tts,
+        STAGE_SUBTITLE_SYNC: run_subtitle_sync,
         STAGE_VISUAL_PLAN: run_visual_plan,
         STAGE_VISUAL_PLAN_CONFIRM: confirm_visual_plan,
         STAGE_VISUAL_ASSETS: run_visual_assets,

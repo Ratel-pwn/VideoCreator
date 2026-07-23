@@ -1,0 +1,5 @@
+{
+  "single_line": true,
+  "omit_sentence_final_punctuation": true,
+  "max_lines": 1
+}
