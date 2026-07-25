@@ -374,11 +374,179 @@ def _load_download_ledger(request: BgmResolutionRequest) -> dict[str, Any]:
         dict,
     ) or value.get("request_fingerprint") != _request_fingerprint(request):
         raise RuntimeError(f"Invalid BGM download ledger: {path}")
+    value = _migrate_legacy_download_ledger(request, value, path)
     for fingerprint, entry in value["candidates"].items():
         if not isinstance(entry, dict) or not _valid_fingerprint(fingerprint):
             raise RuntimeError(f"Invalid BGM download ledger: {path}")
         _validate_candidate_entry(request, fingerprint, entry)
     return value
+
+
+def _migrate_legacy_download_ledger(
+    request: BgmResolutionRequest,
+    ledger: dict[str, Any],
+    ledger_path: Path,
+) -> dict[str, Any]:
+    changed = False
+    owned_dir = _request_candidate_dir(request)
+    candidates = ledger["candidates"]
+    for fingerprint, entry in candidates.items():
+        if not isinstance(entry, dict) or not _valid_fingerprint(fingerprint):
+            continue
+        raw_path = entry.get("path")
+        if raw_path is not None:
+            source = _legacy_candidate_path(
+                request,
+                fingerprint,
+                raw_path,
+            )
+            if source is not None:
+                destination = owned_dir / source.name
+                _verify_legacy_candidate_entry(
+                    request,
+                    fingerprint,
+                    entry,
+                    source,
+                    destination,
+                )
+                _move_legacy_candidate(source, destination)
+                relative = _relative_artifact(request, destination)
+                entry["path"] = relative
+                track = entry.get("track")
+                if isinstance(track, dict):
+                    track["path"] = relative
+                    track["metadata_path"] = relative
+                changed = True
+        for suffix in sorted(SUPPORTED_AUDIO_SUFFIXES):
+            for name in (
+                f"candidate-{fingerprint}{suffix}",
+                f".candidate-{fingerprint}{suffix}.part",
+            ):
+                source = request.download_dir / name
+                destination = owned_dir / name
+                if not source.is_file():
+                    continue
+                if entry.get("status") == "validated" and name.startswith(
+                    "candidate-"
+                ):
+                    # Validated final media was checked through entry.path.
+                    if Path(str(raw_path)).name != name:
+                        raise RuntimeError(
+                            "Invalid legacy validated BGM candidate"
+                        )
+                    continue
+                _move_legacy_candidate(source, destination)
+                changed = True
+    cleanup = ledger.get("cleanup")
+    if isinstance(cleanup, dict):
+        paths = cleanup.get("paths")
+        if isinstance(paths, list):
+            migrated_paths = []
+            for raw in paths:
+                if not isinstance(raw, str):
+                    raise RuntimeError("Invalid legacy BGM cleanup path")
+                migrated_paths.append(
+                    _migrate_legacy_cleanup_path(
+                        request,
+                        raw,
+                        set(candidates),
+                    )
+                )
+            if migrated_paths != paths:
+                cleanup["paths"] = migrated_paths
+                changed = True
+        selected = cleanup.get("selected")
+        if isinstance(selected, str):
+            migrated_selected = _migrate_legacy_cleanup_path(
+                request,
+                selected,
+                set(candidates),
+            )
+            if migrated_selected != selected:
+                cleanup["selected"] = migrated_selected
+                changed = True
+    if changed:
+        _atomic_json(ledger_path, ledger)
+    return ledger
+
+
+def _legacy_candidate_path(
+    request: BgmResolutionRequest,
+    fingerprint: str,
+    raw_path: str,
+) -> Path | None:
+    raw = Path(raw_path)
+    if raw.is_absolute():
+        return None
+    resolved = _resolve_artifact(request, raw_path)
+    if resolved.parent == _request_candidate_dir(request):
+        return None
+    if raw.parent != Path("."):
+        return None
+    if raw.name != _candidate_relative_path(fingerprint, raw.suffix):
+        return None
+    return resolved
+
+
+def _verify_legacy_candidate_entry(
+    request: BgmResolutionRequest,
+    fingerprint: str,
+    entry: dict[str, Any],
+    source: Path,
+    destination: Path,
+) -> None:
+    del request
+    if entry.get("status") != "validated":
+        return
+    track = entry.get("track")
+    digest = entry.get("sha256")
+    if (
+        not isinstance(track, dict)
+        or entry.get("candidate_id") != track.get("id")
+        or track.get("path") != source.name
+        or track.get("metadata_path") != source.name
+        or track.get("sha256") != digest
+        or track.get("metadata_sha256") != digest
+        or source.name
+        != _candidate_relative_path(fingerprint, source.suffix)
+    ):
+        raise RuntimeError("Invalid legacy validated BGM candidate ledger")
+    media = source if source.is_file() else destination
+    if not media.is_file() or _sha256_file(media) != digest:
+        raise RuntimeError("Legacy BGM candidate hash mismatch")
+
+
+def _move_legacy_candidate(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.is_file():
+        if source.is_file() and _sha256_file(source) != _sha256_file(destination):
+            raise RuntimeError("Conflicting legacy BGM candidate migration")
+        source.unlink(missing_ok=True)
+        return
+    if not source.is_file():
+        # Cleaned/rejected tombstones may outlive their deterministic file.
+        return
+    os.replace(source, destination)
+    fsync_directory(destination.parent)
+    fsync_directory(source.parent)
+
+
+def _migrate_legacy_cleanup_path(
+    request: BgmResolutionRequest,
+    raw_path: str,
+    fingerprints: set[str],
+) -> str:
+    path = _resolve_artifact(request, raw_path)
+    if path.parent == _request_candidate_dir(request):
+        return raw_path
+    if Path(raw_path).parent != Path("."):
+        raise RuntimeError("Invalid legacy BGM cleanup path")
+    fingerprint = _candidate_artifact_fingerprint(raw_path)
+    if fingerprint is None or fingerprint not in fingerprints:
+        raise RuntimeError("Unowned legacy BGM cleanup path")
+    return (
+        Path(_request_candidate_dir(request).name) / Path(raw_path).name
+    ).as_posix()
 
 
 def _write_download_ledger(
@@ -788,7 +956,50 @@ def _load_committed_resolution(
         return None
     if value.get("status") not in {"committed", "acknowledged"}:
         return None
+    value = _migrate_legacy_resolution_ledger(request, value)
     return _resolution_from_record(request, value)
+
+
+def _migrate_legacy_resolution_ledger(
+    request: BgmResolutionRequest,
+    value: dict[str, Any],
+) -> dict[str, Any]:
+    if value.get("source") not in {"provider", "agent"}:
+        return value
+    track = value.get("track")
+    if not isinstance(track, dict):
+        return value
+    raw_path = track.get("path")
+    raw_metadata = track.get("metadata_path")
+    if not isinstance(raw_path, str) or not isinstance(raw_metadata, str):
+        raise RuntimeError("Invalid legacy BGM resolution track")
+    path = _resolve_artifact(request, raw_path)
+    if path.parent == _request_candidate_dir(request):
+        return value
+    if (
+        Path(raw_path).parent != Path(".")
+        or raw_metadata != raw_path
+        or _candidate_artifact_fingerprint(raw_path) is None
+    ):
+        raise RuntimeError("Invalid legacy BGM resolution path")
+    download_ledger = _load_download_ledger(request)
+    matching = [
+        entry
+        for entry in download_ledger["candidates"].values()
+        if entry.get("status") == "validated"
+        and entry.get("candidate_id") == track.get("id")
+        and entry.get("sha256") == track.get("sha256")
+        and isinstance(entry.get("track"), dict)
+        and entry["track"].get("metadata_sha256")
+        == track.get("metadata_sha256")
+    ]
+    if len(matching) != 1:
+        raise RuntimeError("Legacy BGM resolution does not match download ledger")
+    migrated_path = matching[0]["path"]
+    track["path"] = migrated_path
+    track["metadata_path"] = migrated_path
+    _atomic_json(_resolution_ledger_path(request), value)
+    return value
 
 
 def _commit_resolution(
@@ -842,22 +1053,10 @@ def _claim_resolution_authority(
     return True
 
 
-def _require_cleanup_authority(request: BgmResolutionRequest) -> None:
-    current = _read_json(_current_resolution_path(request))
-    if (
-        current.get("schema_version") != 1
-        or current.get("request_fingerprint") != _request_fingerprint(request)
-    ):
-        raise RuntimeError(
-            "Refusing stale cleanup for a non-authoritative BGM request"
-        )
-
-
 def _cleanup_downloads(
     request: BgmResolutionRequest,
     selected_path: Path | None,
 ) -> None:
-    _require_cleanup_authority(request)
     ledger = _load_download_ledger(request)
     selected = selected_path.resolve() if selected_path else None
     selected_relative = (

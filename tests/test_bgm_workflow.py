@@ -1043,10 +1043,16 @@ def test_stale_request_cleanup_cannot_delete_new_request_selected_media(
     request_a = request(tmp_path, local_tracks=(local,))
     fingerprint_a = bgm_workflow._request_fingerprint(request_a)
     candidate_a = "a" * 64
+    provisional_a = "b" * 64
+    orphan_a = "c" * 64
     owned_a = request_a.download_dir / f"request-{fingerprint_a}"
     owned_a.mkdir(parents=True, exist_ok=True)
     stale_a = owned_a / f"candidate-{candidate_a}.mp3"
+    partial_a = owned_a / f".candidate-{provisional_a}.mp3.part"
+    orphan_file_a = owned_a / f"candidate-{orphan_a}.mp3"
     stale_a.write_bytes(b"request-a-orphan")
+    partial_a.write_bytes(b"request-a-partial")
+    orphan_file_a.write_bytes(b"request-a-untracked")
     bgm_workflow._write_download_ledger(
         request_a,
         {
@@ -1060,6 +1066,12 @@ def test_stale_request_cleanup_cannot_delete_new_request_selected_media(
                         request_a.download_dir
                     ).as_posix(),
                     "reason": "probe failed",
+                },
+                provisional_a: {
+                    "candidate_id": "request-a-provisional",
+                    "status": "provisional",
+                    "path": None,
+                    "path_stem": f"candidate-{provisional_a}",
                 },
             },
         },
@@ -1117,12 +1129,18 @@ def test_stale_request_cleanup_cannot_delete_new_request_selected_media(
     assert media_b.exists()
     assert resolution_b.exists()
 
-    with pytest.raises(RuntimeError, match="stale cleanup"):
-        bgm_workflow.resolve_bgm_for_run(
-            request_a,
-            ConsoleInteractionPort(),
-        )
+    replay_a = bgm_workflow.resolve_bgm_for_run(
+        request_a,
+        ConsoleInteractionPort(),
+    )
 
+    assert replay_a.request_fingerprint == fingerprint_a
+    assert not stale_a.exists()
+    assert not partial_a.exists()
+    assert not orphan_file_a.exists()
+    assert bgm_workflow._load_download_ledger(request_a)["cleanup"][
+        "status"
+    ] == "completed"
     assert media_b.exists()
     assert resolution_b.exists()
     replay_b = bgm_workflow.resolve_bgm_for_run(
@@ -1131,3 +1149,107 @@ def test_stale_request_cleanup_cannot_delete_new_request_selected_media(
     )
     assert replay_b.resolution_id == result_b.resolution_id
     assert replay_b.track.path == media_b
+
+
+def test_prior_root_candidate_layout_migrates_and_resumes_same_request(
+    tmp_path,
+    monkeypatch,
+):
+    from videocreator import bgm_workflow
+
+    candidate = online_candidate("legacy-online")
+
+    def download(item, output_dir, **kwargs):
+        path = output_dir / f"{kwargs['output_name']}.mp3"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"legacy-media")
+        return path
+
+    monkeypatch.setattr(
+        bgm_workflow,
+        "search_configured_providers",
+        lambda *_args, **_kwargs: [candidate],
+    )
+    monkeypatch.setattr(bgm_workflow, "download_candidate", download)
+    monkeypatch.setattr(bgm_workflow, "candidate_to_track", candidate_track)
+    req = request(tmp_path)
+    original = bgm_workflow.resolve_bgm_for_run(
+        req,
+        DurableInteractionPort(),
+    )
+    owned_path = original.track.path
+    legacy_path = req.download_dir / owned_path.name
+    owned_path.replace(legacy_path)
+
+    download_ledger_path = bgm_workflow._download_ledger_path(req)
+    download_ledger = json.loads(
+        download_ledger_path.read_text(encoding="utf-8")
+    )
+    selected_entry = next(
+        entry
+        for entry in download_ledger["candidates"].values()
+        if entry.get("candidate_id") == original.track.id
+    )
+    selected_entry["path"] = legacy_path.name
+    selected_entry["track"]["path"] = legacy_path.name
+    selected_entry["track"]["metadata_path"] = legacy_path.name
+    cleaned_fingerprint = "d" * 64
+    download_ledger["candidates"][cleaned_fingerprint] = {
+        "candidate_id": "legacy-cleaned",
+        "status": "cleaned",
+        "path": f"candidate-{cleaned_fingerprint}.mp3",
+        "cleaned_at": "2026-01-01T00:00:00+00:00",
+    }
+    download_ledger_path.write_text(
+        json.dumps(download_ledger),
+        encoding="utf-8",
+    )
+
+    resolution_path = bgm_workflow._resolution_ledger_path(req)
+    resolution = json.loads(resolution_path.read_text(encoding="utf-8"))
+    resolution["track"]["path"] = legacy_path.name
+    resolution["track"]["metadata_path"] = legacy_path.name
+    resolution_path.write_text(json.dumps(resolution), encoding="utf-8")
+
+    monkeypatch.setattr(
+        bgm_workflow,
+        "search_configured_providers",
+        lambda *_args, **_kwargs: pytest.fail("legacy resume must not search"),
+    )
+    monkeypatch.setattr(
+        bgm_workflow,
+        "download_candidate",
+        lambda *_args, **_kwargs: pytest.fail(
+            "legacy resume must not download"
+        ),
+    )
+
+    resumed = bgm_workflow.resolve_bgm_for_run(
+        req,
+        DurableInteractionPort(),
+    )
+
+    assert resumed.resolution_id == original.resolution_id
+    assert resumed.track.path.parent == bgm_workflow._request_candidate_dir(req)
+    assert resumed.track.path.exists()
+    assert not legacy_path.exists()
+    rewritten_download = json.loads(
+        download_ledger_path.read_text(encoding="utf-8")
+    )
+    rewritten_resolution = json.loads(
+        resolution_path.read_text(encoding="utf-8")
+    )
+    rewritten_selected = next(
+        entry
+        for entry in rewritten_download["candidates"].values()
+        if entry.get("candidate_id") == resumed.track.id
+    )
+    assert rewritten_selected["track"]["path"].startswith(
+        f"request-{resumed.request_fingerprint}/"
+    )
+    assert rewritten_download["candidates"][cleaned_fingerprint][
+        "path"
+    ].startswith(f"request-{resumed.request_fingerprint}/")
+    assert rewritten_resolution["track"]["path"].startswith(
+        f"request-{resumed.request_fingerprint}/"
+    )
