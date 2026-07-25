@@ -150,7 +150,26 @@ def load_bgm_directory(root: Path, level: str) -> tuple[tuple[BgmTrack, ...], tu
                 )
         except (OSError, ValueError, subprocess.CalledProcessError) as exc:
             warnings.append(f"{level} BGM track {audio_path.name} is ineligible: {exc}")
-    return tuple(tracks), tuple(warnings)
+
+    tracks_by_id: dict[str, list[BgmTrack]] = {}
+    for track in tracks:
+        tracks_by_id.setdefault(track.id, []).append(track)
+    duplicate_ids = {
+        track_id for track_id, grouped_tracks in tracks_by_id.items()
+        if len(grouped_tracks) > 1
+    }
+    for track_id in sorted(duplicate_ids):
+        filenames = ", ".join(
+            sorted(track.path.name for track in tracks_by_id[track_id])
+        )
+        warnings.append(
+            f"{level} BGM track id {track_id} is duplicated by "
+            f"{filenames}; all duplicates are ineligible"
+        )
+    eligible_tracks = tuple(
+        track for track in tracks if track.id not in duplicate_ids
+    )
+    return eligible_tracks, tuple(warnings)
 
 
 def resolve_bgm_library(

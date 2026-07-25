@@ -84,6 +84,31 @@ def test_selector_uses_stable_track_id_as_final_tie_breaker():
     assert selected.track.id == "a"
 
 
+def test_selector_is_stable_for_duplicate_ids_when_input_is_reversed():
+    from videocreator.bgm_selection import select_bgm_candidate
+
+    first = track(
+        "duplicate",
+        path=Path("z-track.mp3"),
+        sha256="b" * 64,
+    )
+    second = track(
+        "duplicate",
+        path=Path("a-track.mp3"),
+        sha256="a" * 64,
+    )
+
+    forward = select_bgm_candidate([first, second], neutral_query(), BgmPolicy())
+    reversed_result = select_bgm_candidate(
+        [second, first], neutral_query(), BgmPolicy()
+    )
+
+    assert forward.track is not None
+    assert reversed_result.track is not None
+    assert forward.track.path == Path("a-track.mp3")
+    assert reversed_result.track.path == forward.track.path
+
+
 def test_selector_rejects_non_instrumental_tracks_when_required():
     from videocreator.bgm_selection import score_candidate, select_bgm_candidate
 
@@ -98,13 +123,25 @@ def test_selector_rejects_non_instrumental_tracks_when_required():
     assert selected.track is None
 
 
-def test_selector_penalizes_policy_and_track_avoid_tags():
+def test_selector_penalizes_policy_avoid_tags():
     from videocreator.bgm_selection import BgmQuery, score_candidate
 
     policy = BgmPolicy(avoid_tags=("comedy",))
     query = BgmQuery(("finance",), (), "science-explainer", (), ())
     score = score_candidate(
-        track("avoid", moods=("comedy",), avoid_for=("finance",)), query, policy
+        track("avoid", moods=("comedy",)), query, policy
+    )
+
+    assert score.components["avoid"] == -50.0
+
+
+def test_selector_penalizes_track_level_avoid_for():
+    from videocreator.bgm_selection import BgmQuery, score_candidate
+
+    policy = BgmPolicy(avoid_tags=())
+    query = BgmQuery(("finance",), (), "science-explainer", (), ())
+    score = score_candidate(
+        track("avoid", avoid_for=("finance",)), query, policy
     )
 
     assert score.components["avoid"] == -50.0

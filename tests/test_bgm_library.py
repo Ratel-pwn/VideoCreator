@@ -121,6 +121,33 @@ def test_unknown_rights_status_keeps_track_and_appends_warning(tmp_path, monkeyp
     )
 
 
+def test_duplicate_track_ids_are_rejected_and_lower_level_is_used(
+    tmp_path, monkeypatch
+):
+    from videocreator.bgm_library import resolve_bgm_library
+
+    repo, project, template = make_bgm_tree(tmp_path)
+    write_track(project / "library/bgm", "first", id="duplicate")
+    write_track(project / "library/bgm", "second", id="duplicate")
+    write_track(template.root / "library/bgm", "template-track")
+    monkeypatch.setattr(
+        "videocreator.bgm_library.probe_media",
+        lambda _: MediaMetadata("audio", "mp3", None, None, 1_000),
+    )
+
+    selected = resolve_bgm_library(repo, project, template)
+
+    assert selected.level == "template"
+    assert [track.id for track in selected.tracks] == ["template-track"]
+    assert any(
+        "duplicate" in warning
+        and "first.mp3" in warning
+        and "second.mp3" in warning
+        and "ineligible" in warning
+        for warning in selected.warnings
+    )
+
+
 def test_track_missing_required_sidecar_fields_is_ineligible(tmp_path, monkeypatch):
     from videocreator.bgm_library import resolve_bgm_library
 

@@ -154,6 +154,8 @@ def select_bgm_candidate(
             not item[1].eligible,
             -item[1].total,
             item[0].id,
+            item[0].sha256,
+            item[0].path.as_posix().casefold(),
         )
     )
     scores = tuple(score for _, score in pairs)
