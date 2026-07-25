@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .interactions import interaction_fingerprint
+from .durable_io import atomic_write_json
 from .job_queue import JobCancelledError, JobQueue
 from .project_layout import initialize_project
 from .runtime_config import McpRuntimeConfig
@@ -270,7 +271,7 @@ class WorkflowService:
         state = self._read_json(run / "state.json")
         state["status"] = "ready"
         state.pop("last_error", None)
-        (run / "state.json").write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        atomic_write_json(run / "state.json", state)
         job = self.queue.enqueue(project, run_id)
         return {"project": project, "run_id": run_id, "status": job.status}
 
@@ -284,8 +285,38 @@ class WorkflowService:
             run = self._run(project, run_id)
             state = self._read_json(run / "state.json")
             state["status"] = "cancelled"
-            (run / "state.json").write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            atomic_write_json(run / "state.json", state)
         return {"project": project, "run_id": run_id, "status": job.status}
+
+    def recover_legacy_inputs(self) -> int:
+        recovered = 0
+        for job in self.queue.waiting_jobs():
+            try:
+                state = self._read_json(self._run(job.project, job.run_id) / "state.json")
+            except ServiceError:
+                continue
+            pending = state.get("pending_interaction")
+            if not isinstance(pending, dict) or "response" not in pending:
+                continue
+            interaction_id = str(pending.get("id", ""))
+            if not interaction_id:
+                continue
+            fingerprint = pending.get("fingerprint") or interaction_fingerprint(
+                str(pending.get("kind", "text")),
+                pending.get("payload"),
+            )
+            try:
+                if self.queue.submit_input(
+                    job.project,
+                    job.run_id,
+                    interaction_id,
+                    str(fingerprint),
+                    str(pending["response"]),
+                ):
+                    recovered += 1
+            except (JobCancelledError, KeyError, ValueError):
+                continue
+        return recovered
 
     def get_workflow_result(
         self,

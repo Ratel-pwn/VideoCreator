@@ -284,6 +284,9 @@ class JobQueue:
             if not row:
                 connection.rollback()
                 raise KeyError(f"Job not found: {project}/{run_id}")
+            if row["status"] in {"completed", "failed", "cancelled"}:
+                connection.commit()
+                return self._job(row)
             status = "leased" if row["status"] == "leased" else "cancelled"
             connection.execute(
                 """
@@ -302,6 +305,13 @@ class JobQueue:
             updated = connection.execute("SELECT * FROM jobs WHERE id = ?", (row["id"],)).fetchone()
             connection.commit()
         return self._job(updated)
+
+    def waiting_jobs(self) -> tuple[Job, ...]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM jobs WHERE status = 'waiting' ORDER BY created_at, id"
+            ).fetchall()
+        return tuple(self._job(row) for row in rows)
 
     def is_cancel_requested(self, job_id: str) -> bool:
         with self._connect() as connection:

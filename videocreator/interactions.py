@@ -216,7 +216,10 @@ class DurableInteractionPort:
                 "event": "answered",
                 "id": interaction_id,
                 "key": pending["key"],
-                "response": response,
+                "response_sha256": hashlib.sha256(
+                    response.encode("utf-8")
+                ).hexdigest(),
+                "response_bytes": len(response.encode("utf-8")),
                 "answered_at": pending["answered_at"],
             },
         )

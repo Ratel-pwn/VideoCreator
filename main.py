@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from videocreator.asset_manifest import audit_asset_manifest
+from videocreator.durable_io import atomic_write_json
 from videocreator.bgm_library import resolve_bgm_library
 from videocreator.interactions import (
     ConsoleInteractionPort,
@@ -104,8 +105,7 @@ def load_json(path: Path) -> dict[str, Any]:
 
 
 def save_json(path: Path, data: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_json(path, data)
 
 
 def read_text(path: Path) -> str:

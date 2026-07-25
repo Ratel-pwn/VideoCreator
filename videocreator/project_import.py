@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import json
 from datetime import datetime
 from pathlib import Path
 
+from .durable_io import atomic_write_json
 
 ARTIFACT_PATTERNS = {
     "draft_approved": ("drafts", "*.md"),
@@ -31,10 +31,7 @@ def discover_legacy_artifacts(project_root: Path) -> dict[str, Path]:
 
 
 def _write_json(path: Path, value: dict) -> None:
-    path.write_text(
-        json.dumps(value, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    atomic_write_json(path, value)
 
 
 def import_legacy_project(

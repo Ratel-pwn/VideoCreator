@@ -6,6 +6,8 @@ import shutil
 from pathlib import Path
 from typing import Any
 
+from .durable_io import atomic_write_json
+
 
 def _hash(path: Path) -> str:
     digest = hashlib.sha256()
@@ -16,8 +18,7 @@ def _hash(path: Path) -> str:
 
 
 def _write_json(path: Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    atomic_write_json(path, value)
 
 
 def _rewrite_paths(value: Any) -> Any:

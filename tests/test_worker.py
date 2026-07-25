@@ -2,6 +2,8 @@ import json
 import sqlite3
 from pathlib import Path
 
+import pytest
+
 from videocreator.interactions import (
     InteractionRequired,
     WorkflowOutcome,
@@ -160,3 +162,85 @@ def test_worker_tolerates_cancelled_lease_reconciled_after_crash_boundary(
 
     assert worker.run_once()
     assert service.queue.get("demo", "run-1").status == "cancelled"
+
+
+def test_worker_does_not_acknowledge_input_when_state_save_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    service = prepare(tmp_path)
+    run = tmp_path / "projects/demo/runs/run-1"
+    state_path = run / "state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    payload = {"query": {"subjects": ["economics"]}}
+    fingerprint = interaction_fingerprint("bgm_candidates", payload)
+    state["pending_interaction"] = {
+        "id": "bgm-1",
+        "key": "bgm-online-candidates",
+        "kind": "bgm_candidates",
+        "prompt": "Find BGM",
+        "choices": [],
+        "payload": payload,
+        "fingerprint": fingerprint,
+    }
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    assert service.queue.submit_input(
+        "demo", "run-1", "bgm-1", fingerprint, "secret answer"
+    )
+
+    import main
+
+    monkeypatch.setattr(
+        main,
+        "save_json",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("disk full")),
+    )
+    worker = WorkflowWorker(service, worker_id="worker-save-failure")
+
+    assert worker.run_once()
+
+    job = service.queue.get("demo", "run-1")
+    assert job.status == "queued"
+    assert service.queue.pending_inputs(job.id)[0].response == "secret answer"
+
+
+def test_worker_imports_legacy_state_only_answer_and_wakes_waiting_job(
+    tmp_path: Path,
+):
+    service = prepare(tmp_path)
+    run = tmp_path / "projects/demo/runs/run-1"
+    state_path = run / "state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    payload = {"query": {"subjects": ["economics"]}}
+    fingerprint = interaction_fingerprint("bgm_candidates", payload)
+    state["status"] = "waiting_for_input"
+    state["pending_interaction"] = {
+        "id": "legacy-bgm-1",
+        "key": "bgm-online-candidates",
+        "kind": "bgm_candidates",
+        "prompt": "Find BGM",
+        "choices": [],
+        "payload": payload,
+        "fingerprint": fingerprint,
+        "response": "legacy answer",
+    }
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    claimed = service.queue.claim("setup", 60)
+    service.queue.release_waiting(claimed.id, "setup")
+    observed: dict[str, str] = {}
+
+    def execute(ctx):
+        observed["answer"] = ctx.interactions.ask(
+            ctx,
+            "bgm-online-candidates",
+            "Find BGM",
+            "bgm_candidates",
+            payload=payload,
+        )
+        return WorkflowOutcome("completed")
+
+    worker = WorkflowWorker(service, worker_id="worker-legacy", execute=execute)
+    assert worker.run_once()
+
+    assert observed["answer"] == "legacy answer"
+    assert service.queue.get("demo", "run-1").status == "completed"

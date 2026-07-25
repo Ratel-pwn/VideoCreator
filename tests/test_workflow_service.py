@@ -171,3 +171,28 @@ def test_queue_failure_is_projected_as_workflow_failure(tmp_path: Path):
 
     assert status["status"] == "failed"
     assert status["error"] == "worker crashed"
+
+
+@pytest.mark.parametrize("terminal", ["completed", "failed"])
+def test_service_cancel_preserves_terminal_job_and_run_state(
+    tmp_path: Path,
+    terminal: str,
+):
+    service = build_service(tmp_path)
+    service.initialize_project("demo", "chaos-museum")
+    service.start_workflow("demo", "A topic", run_id="run-1")
+    job = service.queue.claim("worker", 60)
+    if terminal == "completed":
+        service.queue.complete(job.id, "worker")
+    else:
+        service.queue.fail(job.id, "worker", "original failure")
+    state_path = tmp_path / "projects/demo/runs/run-1/state.json"
+    before = state_path.read_bytes()
+
+    cancelled = service.cancel_workflow("demo", "run-1")
+
+    assert cancelled["status"] == terminal
+    assert state_path.read_bytes() == before
+    current = service.queue.get("demo", "run-1")
+    assert current.status == terminal
+    assert current.error == (None if terminal == "completed" else "original failure")

@@ -256,6 +256,8 @@ def _validate_http_url(value: str, label: str) -> None:
     parsed = urlsplit(value)
     if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
         raise BgmSearchError(f"{label} URL must use http or https")
+    if parsed.username is not None or parsed.password is not None:
+        raise BgmSearchError(f"{label} URL must not contain userinfo")
     try:
         address = ipaddress.ip_address(parsed.hostname)
     except ValueError:
@@ -693,10 +695,16 @@ def download_candidate(
     max_download_bytes: int = DEFAULT_MAX_DOWNLOAD_BYTES,
     allowed_hosts: Iterable[str] | None = None,
     resolver: Resolver = _system_resolver,
+    output_name: str | None = None,
 ) -> Path:
     """Download one candidate into a run-owned directory with bounded IO."""
     if max_download_bytes < 1:
         raise BgmSearchError("max_download_bytes must be positive")
+    if output_name is not None and not re.fullmatch(
+        r"candidate-[0-9a-f]{64}",
+        output_name,
+    ):
+        raise BgmSearchError("output_name must be a candidate fingerprint")
     _validate_http_url(candidate.download_url, "download")
     initial_host = urlsplit(candidate.download_url).hostname
     assert initial_host is not None
@@ -717,8 +725,10 @@ def download_candidate(
                 and not content_type.startswith("audio/")
             ):
                 raise BgmSearchError("download content is not supported audio")
-            temporary_path = root / f".bgm-{uuid.uuid4().hex}{suffix}.part"
-            output_path = root / f"bgm-{uuid.uuid4().hex}{suffix}"
+            basename = output_name or f"bgm-{uuid.uuid4().hex}"
+            temporary_path = root / f".{basename}{suffix}.part"
+            output_path = root / f"{basename}{suffix}"
+            temporary_path.unlink(missing_ok=True)
             digest = hashlib.sha256()
             content_length = _header(response, "Content-Length")
             if content_length is not None:

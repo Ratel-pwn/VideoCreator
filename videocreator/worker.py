@@ -29,6 +29,7 @@ class WorkflowWorker:
                 return
 
     def run_once(self) -> bool:
+        self.service.recover_legacy_inputs()
         job = self.queue.claim(self.worker_id, self.service.runtime.lease_seconds)
         if job is None:
             return False
@@ -59,6 +60,9 @@ class WorkflowWorker:
                     # The interaction changed after submission; retain no replayable
                     # answer and let the workflow request the current payload.
                     pass
+                # The outbox tombstone is safe only after the corresponding
+                # state transition (including stale-answer cleanup) is durable.
+                ctx.save_state()
                 self.queue.acknowledge_input(job.id, item.interaction_id)
             outcome = self.execute(ctx) if self.execute else workflow.execute_until_boundary(ctx)
             if outcome.status == "waiting_for_input":

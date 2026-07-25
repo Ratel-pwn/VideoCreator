@@ -514,3 +514,29 @@ def test_direct_candidate_enforces_url_and_normalizes_fields():
     assert value.moods == ("reflective",)
     assert value.energy == "low-medium"
     assert value.template_tags == ("chaos-museum",)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["source_page_url", "download_url"],
+)
+def test_candidate_rejects_url_userinfo(field):
+    values = {
+        field: "https://user:password@media.example.test/file.mp3",
+    }
+
+    with pytest.raises(BgmSearchError, match="userinfo"):
+        candidate(**values)
+
+
+def test_download_can_use_deterministic_candidate_filename(tmp_path):
+    path = download_candidate(
+        candidate(),
+        tmp_path,
+        opener=RecordingOpener(FakeResponse(b"ID3audio")),
+        resolver=public_resolver,
+        output_name="candidate-" + "a" * 64,
+    )
+
+    assert path.name == f"candidate-{'a' * 64}.mp3"
+    assert not list(tmp_path.glob("bgm-*"))

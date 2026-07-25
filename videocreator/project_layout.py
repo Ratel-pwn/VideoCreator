@@ -6,12 +6,12 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .bgm_library import BgmLibrarySelection
+from .durable_io import atomic_write_json
 from .templates import LibrarySelection, TemplateDefinition, snapshot_template
 
 
 def _write_json(path: Path, data: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    atomic_write_json(path, data)
 
 
 @dataclass(frozen=True)

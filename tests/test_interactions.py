@@ -163,3 +163,21 @@ def test_submit_rejects_mismatched_interaction_fingerprint(tmp_path: Path):
             "answer",
             fingerprint="stale",
         )
+
+
+def test_answer_audit_contains_only_bounded_hash_not_raw_response(tmp_path: Path):
+    ctx = Context(tmp_path)
+    port = DurableInteractionPort()
+    with pytest.raises(InteractionRequired) as raised:
+        port.ask(ctx, "bgm", "Find BGM", "bgm_candidates", payload={"query": "x"})
+    secret = '{"download_url":"https://cdn.example/a.mp3?token=TOP-SECRET"}'
+
+    port.submit(ctx, raised.value.interaction["id"], secret)
+
+    audit = (tmp_path / "session/interactions.jsonl").read_text(encoding="utf-8")
+    answered = json.loads(audit.splitlines()[-1])
+    assert "TOP-SECRET" not in audit
+    assert "download_url" not in audit
+    assert "response" not in answered
+    assert len(answered["response_sha256"]) == 64
+    assert answered["response_bytes"] == len(secret.encode("utf-8"))

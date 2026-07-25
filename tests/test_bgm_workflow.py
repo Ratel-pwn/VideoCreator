@@ -160,11 +160,16 @@ def test_local_selection_is_first_and_skips_provider(tmp_path, monkeypatch):
 
     assert result.mode == "bgm"
     assert result.source == "local"
-    assert result.track == local
+    assert result.track.id == local.id
+    assert result.track.sha256 == local.sha256
+    assert result.track.path.parent == request(
+        tmp_path,
+        local_tracks=(local,),
+    ).download_dir
     assert result.resolution_id
-    ledger = json.loads(
-        (tmp_path / "audio/bgm-resolution.json").read_text(encoding="utf-8")
-    )
+    ledger = json.loads(next(
+        (tmp_path / "visual/bgm").glob("bgm-resolution-*.json")
+    ).read_text(encoding="utf-8"))
     assert ledger["status"] == "committed"
 
 
@@ -251,7 +256,7 @@ def test_agent_response_resumes_through_download_validation_and_scoring(
     assert "submitted_interactions" in req.context.state
     assert "pending_interaction" not in req.context.state
     ledger = json.loads(
-        (tmp_path / "audio/bgm-resolution.json").read_text(encoding="utf-8")
+        bgm_workflow._resolution_ledger_path(req).read_text(encoding="utf-8")
     )
     assert ledger["status"] == "committed"
 
@@ -263,7 +268,7 @@ def test_agent_response_resumes_through_download_validation_and_scoring(
     assert "interaction_answers" not in req.context.state
     assert "submitted_interactions" not in req.context.state
     acknowledged = json.loads(
-        (tmp_path / "audio/bgm-resolution.json").read_text(encoding="utf-8")
+        bgm_workflow._resolution_ledger_path(req).read_text(encoding="utf-8")
     )
     assert acknowledged["status"] == "acknowledged"
     assert bgm_workflow.acknowledge_bgm_resolution(
@@ -418,9 +423,11 @@ def test_validated_download_is_reused_after_crash_before_resolution_commit(
         bgm_workflow.resolve_bgm_for_run(req, DurableInteractionPort())
     assert len(downloads) == 1
     ledger = json.loads(
-        (tmp_path / "audio/bgm-downloads.json").read_text(encoding="utf-8")
+        bgm_workflow._download_ledger_path(req).read_text(encoding="utf-8")
     )
-    cached_path = Path(next(iter(ledger["candidates"].values()))["path"])
+    cached_path = req.download_dir / next(
+        iter(ledger["candidates"].values())
+    )["path"]
     assert cached_path.exists()
 
     monkeypatch.setattr(bgm_workflow, "_commit_resolution", original_commit)
@@ -468,10 +475,11 @@ def test_unselected_files_are_cleaned_only_after_durable_commit(
     with pytest.raises(RuntimeError, match="crash"):
         bgm_workflow.resolve_bgm_for_run(req, DurableInteractionPort())
     download_ledger = json.loads(
-        (tmp_path / "audio/bgm-downloads.json").read_text(encoding="utf-8")
+        bgm_workflow._download_ledger_path(req).read_text(encoding="utf-8")
     )
     candidate_paths = [
-        Path(item["path"]) for item in download_ledger["candidates"].values()
+        req.download_dir / item["path"]
+        for item in download_ledger["candidates"].values()
     ]
     assert all(path.exists() for path in candidate_paths)
 
@@ -513,11 +521,14 @@ def test_cleanup_resumes_after_commit_before_cleanup_crash(tmp_path, monkeypatch
 
     with pytest.raises(RuntimeError, match="crash after commit"):
         bgm_workflow.resolve_bgm_for_run(req, DurableInteractionPort())
-    assert (tmp_path / "audio/bgm-resolution.json").is_file()
+    assert bgm_workflow._resolution_ledger_path(req).is_file()
     download_ledger = json.loads(
-        (tmp_path / "audio/bgm-downloads.json").read_text(encoding="utf-8")
+        bgm_workflow._download_ledger_path(req).read_text(encoding="utf-8")
     )
-    paths = [Path(item["path"]) for item in download_ledger["candidates"].values()]
+    paths = [
+        req.download_dir / item["path"]
+        for item in download_ledger["candidates"].values()
+    ]
     assert all(path.exists() for path in paths)
 
     monkeypatch.setattr(bgm_workflow, "_cleanup_downloads", original_cleanup)
@@ -573,3 +584,234 @@ def test_old_resolution_ack_does_not_clear_new_query_interaction(
         old_request.context.state["pending_interaction"]["id"]
         == new_interaction["id"]
     )
+
+
+def test_ledgers_use_relative_paths_inside_download_dir(tmp_path, monkeypatch):
+    from videocreator import bgm_workflow
+
+    candidate = online_candidate()
+    monkeypatch.setattr(
+        bgm_workflow,
+        "search_configured_providers",
+        lambda *_args, **_kwargs: [candidate],
+    )
+
+    def download(item, output_dir, **kwargs):
+        path = output_dir / f"{kwargs['output_name']}.mp3"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"audio")
+        return path
+
+    monkeypatch.setattr(bgm_workflow, "download_candidate", download)
+    monkeypatch.setattr(bgm_workflow, "candidate_to_track", candidate_track)
+    req = request(tmp_path)
+
+    result = bgm_workflow.resolve_bgm_for_run(req, DurableInteractionPort())
+
+    ledgers = list(req.download_dir.glob("bgm-*.json"))
+    assert len(ledgers) == 2
+    assert all(path.parent == req.download_dir for path in ledgers)
+    for ledger_path in ledgers:
+        serialized = ledger_path.read_text(encoding="utf-8")
+        assert str(req.download_dir) not in serialized
+    assert result.track.path.parent == req.download_dir
+
+
+@pytest.mark.parametrize("bad_path", ["../state.json", "C:/outside/state.json"])
+def test_malformed_download_ledger_path_is_rejected_without_unlinking_run_state(
+    tmp_path,
+    monkeypatch,
+    bad_path,
+):
+    from videocreator import bgm_workflow
+
+    candidate = online_candidate()
+    req = request(tmp_path)
+    state_path = tmp_path / "state.json"
+    state_path.write_text('{"sentinel":true}', encoding="utf-8")
+    fingerprint = bgm_workflow.candidate_fingerprint(candidate)
+    ledger_path = bgm_workflow._download_ledger_path(req)
+    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    ledger_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "request_fingerprint": bgm_workflow._request_fingerprint(req),
+                "candidates": {
+                    fingerprint: {
+                        "candidate_id": candidate.id,
+                        "status": "validated",
+                        "path": bad_path,
+                        "sha256": "0" * 64,
+                        "track": {
+                                **bgm_workflow._track_to_dict(
+                                    req,
+                                    track(
+                                        req.download_dir,
+                                        track_id=candidate.id,
+                                    ),
+                                ),
+                            "path": bad_path,
+                            "metadata_path": bad_path,
+                        },
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        bgm_workflow,
+        "search_configured_providers",
+        lambda *_args, **_kwargs: [candidate],
+    )
+
+    with pytest.raises(RuntimeError, match="ledger"):
+        bgm_workflow.resolve_bgm_for_run(req, DurableInteractionPort())
+
+    assert state_path.read_text(encoding="utf-8") == '{"sentinel":true}'
+
+
+def test_provisional_download_is_recovered_after_crash_before_probe(
+    tmp_path,
+    monkeypatch,
+):
+    from videocreator import bgm_workflow
+
+    candidate = online_candidate()
+    req = request(tmp_path)
+    monkeypatch.setattr(
+        bgm_workflow,
+        "search_configured_providers",
+        lambda *_args, **_kwargs: [candidate],
+    )
+    downloads = 0
+
+    def download(item, output_dir, **kwargs):
+        nonlocal downloads
+        downloads += 1
+        path = output_dir / f"{kwargs['output_name']}.mp3"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"audio")
+        return path
+
+    probes = 0
+
+    def crash_then_probe(item, path):
+        nonlocal probes
+        probes += 1
+        if probes == 1:
+            raise KeyboardInterrupt("crash after download")
+        return candidate_track(item, path)
+
+    monkeypatch.setattr(bgm_workflow, "download_candidate", download)
+    monkeypatch.setattr(bgm_workflow, "candidate_to_track", crash_then_probe)
+
+    with pytest.raises(KeyboardInterrupt, match="crash after download"):
+        bgm_workflow.resolve_bgm_for_run(req, DurableInteractionPort())
+    provisional = json.loads(
+        bgm_workflow._download_ledger_path(req).read_text(encoding="utf-8")
+    )
+    assert next(iter(provisional["candidates"].values()))["status"] == "provisional"
+
+    result = bgm_workflow.resolve_bgm_for_run(req, DurableInteractionPort())
+
+    assert downloads == 1
+    assert result.track.path.name.startswith("candidate-")
+
+
+def test_acknowledgement_removes_signed_agent_url_from_runtime_state_and_ledgers(
+    tmp_path,
+    monkeypatch,
+):
+    from videocreator import bgm_workflow
+
+    req = request(tmp_path)
+    port = DurableInteractionPort()
+    with pytest.raises(InteractionRequired) as raised:
+        bgm_workflow.resolve_bgm_for_run(req, port)
+    response = agent_response().replace(
+        "track.mp3",
+        "track.mp3?X-Amz-Signature=DO-NOT-PERSIST",
+    )
+    port.submit(req.context, raised.value.interaction["id"], response)
+
+    def download(item, output_dir, **kwargs):
+        path = output_dir / f"{kwargs['output_name']}.mp3"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"audio")
+        return path
+
+    monkeypatch.setattr(bgm_workflow, "download_candidate", download)
+    monkeypatch.setattr(bgm_workflow, "candidate_to_track", candidate_track)
+    result = bgm_workflow.resolve_bgm_for_run(req, port)
+    assert bgm_workflow.acknowledge_bgm_resolution(
+        req, port, result.resolution_id
+    )
+
+    durable_text = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in req.download_dir.glob("*.json")
+    )
+    durable_text += (tmp_path / "session/interactions.jsonl").read_text(
+        encoding="utf-8"
+    )
+    durable_text += (tmp_path / "state.json").read_text(encoding="utf-8")
+    assert "DO-NOT-PERSIST" not in durable_text
+
+
+def test_copied_resolution_ledger_without_matching_artifact_is_rejected(
+    tmp_path,
+):
+    from videocreator import bgm_workflow
+
+    first_root = tmp_path / "first"
+    first_req = request(
+        first_root,
+        local_tracks=(track(first_root / "local", track_id="local"),),
+    )
+    bgm_workflow.resolve_bgm_for_run(first_req, ConsoleInteractionPort())
+    copied = bgm_workflow._resolution_ledger_path(first_req).read_text(
+        encoding="utf-8"
+    )
+
+    second_root = tmp_path / "second"
+    second_req = request(
+        second_root,
+        local_tracks=(track(second_root / "local", track_id="local"),),
+    )
+    second_ledger = bgm_workflow._resolution_ledger_path(second_req)
+    second_ledger.parent.mkdir(parents=True, exist_ok=True)
+    second_ledger.write_text(copied, encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="missing or changed"):
+        bgm_workflow.resolve_bgm_for_run(
+            second_req,
+            ConsoleInteractionPort(),
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("metadata_path", "../state.json"),
+        ("metadata_sha256", "0" * 64),
+    ],
+)
+def test_resolution_ledger_requires_metadata_path_and_hash_agreement(
+    tmp_path,
+    field,
+    value,
+):
+    from videocreator import bgm_workflow
+
+    local = track(tmp_path / "local", track_id="local")
+    req = request(tmp_path, local_tracks=(local,))
+    bgm_workflow.resolve_bgm_for_run(req, ConsoleInteractionPort())
+    ledger_path = bgm_workflow._resolution_ledger_path(req)
+    ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    ledger["track"][field] = value
+    ledger_path.write_text(json.dumps(ledger), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="ledger|missing or changed"):
+        bgm_workflow.resolve_bgm_for_run(req, ConsoleInteractionPort())

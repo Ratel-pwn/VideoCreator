@@ -233,3 +233,24 @@ def test_job_input_schema_is_added_to_existing_database(tmp_path: Path):
         "answer",
     )
     assert queue.pending_inputs(job.id)[0].interaction_id == "question-1"
+
+
+@pytest.mark.parametrize("terminal", ["completed", "failed"])
+def test_cancel_preserves_completed_and_failed_jobs(
+    tmp_path: Path,
+    terminal: str,
+):
+    queue = JobQueue(tmp_path / "queue.sqlite3")
+    queue.enqueue("project", "run-1")
+    claimed = queue.claim("worker", lease_seconds=60)
+    if terminal == "completed":
+        queue.complete(claimed.id, "worker")
+    else:
+        queue.fail(claimed.id, "worker", "original failure")
+    before = queue.get("project", "run-1")
+
+    after = queue.request_cancel("project", "run-1")
+
+    assert after.status == terminal
+    assert after.error == before.error
+    assert after.cancel_requested is False

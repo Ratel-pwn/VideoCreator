@@ -3,13 +3,15 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import uuid
+import shutil
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
+from urllib.parse import urlsplit, urlunsplit
 
-from .bgm_library import BgmTrack
+from .bgm_library import BgmTrack, SUPPORTED_AUDIO_SUFFIXES
+from .durable_io import atomic_write_json
 from .bgm_policy import BgmPolicy
 from .bgm_search import (
     DEFAULT_MAX_DOWNLOAD_BYTES,
@@ -35,8 +37,6 @@ from .interactions import (
 
 
 INTERACTION_KEY = "bgm-online-candidates"
-_DOWNLOAD_LEDGER = Path("audio/bgm-downloads.json")
-_RESOLUTION_LEDGER = Path("audio/bgm-resolution.json")
 _SENSITIVE_CONFIG_TERMS = (
     "authorization",
     "credential",
@@ -71,17 +71,7 @@ def _canonical_hash(value: Any) -> str:
 
 
 def _atomic_json(path: Path, value: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    try:
-        with temporary.open("x", encoding="utf-8") as stream:
-            json.dump(value, stream, ensure_ascii=False, indent=2)
-            stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    atomic_write_json(path, value)
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -174,14 +164,48 @@ def candidate_fingerprint(candidate: OnlineBgmCandidate) -> str:
     return _canonical_hash(asdict(candidate))
 
 
-def _track_to_dict(track: BgmTrack) -> dict[str, Any]:
+def _redact_url(value: str | None) -> str | None:
+    if not value:
+        return value
+    parsed = urlsplit(value)
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+
+
+def _relative_artifact(request: BgmResolutionRequest, path: Path) -> str:
+    resolved = Path(path).resolve()
+    try:
+        return resolved.relative_to(request.download_dir).as_posix()
+    except ValueError as exc:
+        raise RuntimeError("BGM ledger artifact must stay inside download_dir") from exc
+
+
+def _resolve_artifact(request: BgmResolutionRequest, value: str) -> Path:
+    raw = Path(value)
+    if raw.is_absolute():
+        raise RuntimeError("BGM ledger path must be relative")
+    resolved = (request.download_dir / raw).resolve()
+    try:
+        resolved.relative_to(request.download_dir)
+    except ValueError as exc:
+        raise RuntimeError("BGM ledger path escapes download_dir") from exc
+    return resolved
+
+
+def _track_to_dict(
+    request: BgmResolutionRequest,
+    track: BgmTrack,
+) -> dict[str, Any]:
     value = asdict(track)
-    value["path"] = str(track.path)
-    value["metadata_path"] = str(track.metadata_path)
+    value["path"] = _relative_artifact(request, track.path)
+    value["metadata_path"] = _relative_artifact(request, track.metadata_path)
+    value["source_url"] = _redact_url(track.source_url)
     return value
 
 
-def _track_from_dict(value: dict[str, Any]) -> BgmTrack:
+def _track_from_dict(
+    request: BgmResolutionRequest,
+    value: dict[str, Any],
+) -> BgmTrack:
     tuple_fields = (
         "subjects",
         "moods",
@@ -189,8 +213,11 @@ def _track_from_dict(value: dict[str, Any]) -> BgmTrack:
         "avoid_for",
     )
     normalized = dict(value)
-    normalized["path"] = Path(normalized["path"]).resolve()
-    normalized["metadata_path"] = Path(normalized["metadata_path"]).resolve()
+    normalized["path"] = _resolve_artifact(request, normalized["path"])
+    normalized["metadata_path"] = _resolve_artifact(
+        request,
+        normalized["metadata_path"],
+    )
     for field in tuple_fields:
         normalized[field] = tuple(normalized.get(field, ()))
     return BgmTrack(**normalized)
@@ -297,19 +324,35 @@ def _provider_warning(value: Any) -> str:
 
 
 def _download_ledger_path(request: BgmResolutionRequest) -> Path:
-    return request.context.run_dir / _DOWNLOAD_LEDGER
+    return request.download_dir / (
+        f"bgm-downloads-{_request_fingerprint(request)}.json"
+    )
+
+
+def _resolution_ledger_path(request: BgmResolutionRequest) -> Path:
+    return request.download_dir / (
+        f"bgm-resolution-{_request_fingerprint(request)}.json"
+    )
 
 
 def _load_download_ledger(request: BgmResolutionRequest) -> dict[str, Any]:
     path = _download_ledger_path(request)
     value = _read_json(path)
     if not value:
-        return {"schema_version": 1, "candidates": {}}
+        return {
+            "schema_version": 1,
+            "request_fingerprint": _request_fingerprint(request),
+            "candidates": {},
+        }
     if value.get("schema_version") != 1 or not isinstance(
         value.get("candidates"),
         dict,
-    ):
+    ) or value.get("request_fingerprint") != _request_fingerprint(request):
         raise RuntimeError(f"Invalid BGM download ledger: {path}")
+    for fingerprint, entry in value["candidates"].items():
+        if not isinstance(entry, dict) or not _valid_fingerprint(fingerprint):
+            raise RuntimeError(f"Invalid BGM download ledger: {path}")
+        _validate_candidate_entry(request, fingerprint, entry)
     return value
 
 
@@ -320,23 +363,67 @@ def _write_download_ledger(
     _atomic_json(_download_ledger_path(request), ledger)
 
 
+def _valid_fingerprint(value: str) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _candidate_relative_path(fingerprint: str, suffix: str) -> str:
+    normalized = suffix.casefold()
+    if normalized not in SUPPORTED_AUDIO_SUFFIXES:
+        raise RuntimeError("BGM candidate has an unsupported suffix")
+    return f"candidate-{fingerprint}{normalized}"
+
+
+def _validate_candidate_entry(
+    request: BgmResolutionRequest,
+    fingerprint: str,
+    entry: dict[str, Any],
+) -> None:
+    status = entry.get("status")
+    if status not in {"provisional", "validated", "rejected", "cleaned"}:
+        raise RuntimeError("Invalid BGM download ledger status")
+    path_value = entry.get("path")
+    if path_value is not None:
+        path = _resolve_artifact(request, path_value)
+        if path.name != _candidate_relative_path(fingerprint, path.suffix):
+            raise RuntimeError("Invalid BGM download ledger candidate path")
+    if status != "validated":
+        return
+    if not isinstance(path_value, str) or not isinstance(entry.get("track"), dict):
+        raise RuntimeError("Invalid validated BGM ledger entry")
+    track = _track_from_dict(request, entry["track"])
+    path = _resolve_artifact(request, path_value)
+    digest = entry.get("sha256")
+    if (
+        track.path != path
+        or track.metadata_path != path
+        or track.sha256 != digest
+        or track.metadata_sha256 != digest
+        or not path.is_file()
+        or _sha256_file(path) != digest
+    ):
+        raise RuntimeError("BGM download ledger path, metadata, or hash mismatch")
+
+
 def _cached_track(
     candidate: OnlineBgmCandidate,
+    request: BgmResolutionRequest,
+    fingerprint: str,
     entry: dict[str, Any],
 ) -> BgmTrack | None:
     if entry.get("status") != "validated":
         return None
-    try:
-        track = _track_from_dict(entry["track"])
-    except (KeyError, TypeError, ValueError):
-        return None
+    _validate_candidate_entry(request, fingerprint, entry)
+    track = _track_from_dict(request, entry["track"])
     if (
-        not track.path.is_file()
-        or _sha256_file(track.path) != entry.get("sha256")
-        or track.sha256 != entry.get("sha256")
-        or track.id != candidate.id
+        track.id != candidate.id
+        or entry.get("candidate_id") != candidate.id
     ):
-        return None
+        raise RuntimeError("BGM download ledger candidate identity mismatch")
     return track
 
 
@@ -359,7 +446,7 @@ def _validated_candidate(
     entries = ledger["candidates"]
     existing = entries.get(fingerprint)
     if isinstance(existing, dict):
-        cached = _cached_track(candidate, existing)
+        cached = _cached_track(candidate, request, fingerprint, existing)
         if cached is not None:
             return cached
         if existing.get("status") == "rejected":
@@ -370,9 +457,13 @@ def _validated_candidate(
             return None
 
     request.download_dir.mkdir(parents=True, exist_ok=True)
-    discovered_paths = sorted(
-        request.download_dir.glob(f"candidate-{fingerprint}.*")
-    )
+    discovered_paths = [
+        path
+        for path in sorted(
+            request.download_dir.glob(f"candidate-{fingerprint}.*")
+        )
+        if path.suffix.casefold() in SUPPORTED_AUDIO_SUFFIXES
+    ]
     for discovered in discovered_paths:
         try:
             discovered_track = candidate_to_track(candidate, discovered)
@@ -389,9 +480,9 @@ def _validated_candidate(
         entries[fingerprint] = {
             "candidate_id": candidate.id,
             "status": "validated",
-            "path": str(track.path),
+            "path": _relative_artifact(request, track.path),
             "sha256": digest,
-            "track": _track_to_dict(track),
+            "track": _track_to_dict(request, track),
             "validated_at": _now(),
         }
         _write_download_ledger(request, ledger)
@@ -400,7 +491,7 @@ def _validated_candidate(
         entries[fingerprint] = {
             "candidate_id": candidate.id,
             "status": "rejected",
-            "path": str(discovered_paths[0].resolve()),
+            "path": _relative_artifact(request, discovered_paths[0]),
             "reason": "cached candidate failed validation",
             "rejected_at": _now(),
         }
@@ -411,6 +502,14 @@ def _validated_candidate(
         )
         return None
 
+    entries[fingerprint] = {
+        "candidate_id": candidate.id,
+        "status": "provisional",
+        "path": None,
+        "path_stem": f"candidate-{fingerprint}",
+        "registered_at": _now(),
+    }
+    _write_download_ledger(request, ledger)
     downloaded: Path | None = None
     try:
         max_download_bytes = request.provider_config.get(
@@ -434,8 +533,8 @@ def _validated_candidate(
             request.download_dir,
             max_download_bytes=max_download_bytes,
             allowed_hosts=allowed_hosts,
+            output_name=f"candidate-{fingerprint}",
         )
-        track = candidate_to_track(candidate, downloaded)
         deterministic = _deterministic_candidate_path(
             request,
             fingerprint,
@@ -443,6 +542,13 @@ def _validated_candidate(
         )
         if downloaded.resolve() != deterministic.resolve():
             os.replace(downloaded, deterministic)
+        downloaded = deterministic
+        entries[fingerprint]["path"] = _relative_artifact(
+            request,
+            deterministic,
+        )
+        _write_download_ledger(request, ledger)
+        track = candidate_to_track(candidate, downloaded)
         digest = _sha256_file(deterministic)
         track = replace(
             track,
@@ -454,9 +560,9 @@ def _validated_candidate(
         entries[fingerprint] = {
             "candidate_id": candidate.id,
             "status": "validated",
-            "path": str(track.path),
+            "path": _relative_artifact(request, track.path),
             "sha256": digest,
-            "track": _track_to_dict(track),
+            "track": _track_to_dict(request, track),
             "validated_at": _now(),
         }
         _write_download_ledger(request, ledger)
@@ -465,7 +571,11 @@ def _validated_candidate(
         entries[fingerprint] = {
             "candidate_id": candidate.id,
             "status": "rejected",
-            "path": str(downloaded.resolve()) if downloaded else None,
+            "path": (
+                _relative_artifact(request, downloaded)
+                if downloaded
+                else None
+            ),
             "reason": str(exc),
             "rejected_at": _now(),
         }
@@ -558,7 +668,10 @@ def _new_resolution(
     )
 
 
-def _resolution_to_record(resolution: BgmResolution) -> dict[str, Any]:
+def _resolution_to_record(
+    request: BgmResolutionRequest,
+    resolution: BgmResolution,
+) -> dict[str, Any]:
     return {
         "schema_version": 1,
         "status": "committed",
@@ -566,7 +679,11 @@ def _resolution_to_record(resolution: BgmResolution) -> dict[str, Any]:
         "request_fingerprint": resolution.request_fingerprint,
         "mode": resolution.mode,
         "source": resolution.source,
-        "track": _track_to_dict(resolution.track) if resolution.track else None,
+        "track": (
+            _track_to_dict(request, resolution.track)
+            if resolution.track
+            else None
+        ),
         "scores": [_score_to_dict(score) for score in resolution.scores],
         "warnings": list(resolution.warnings),
         "interaction": {
@@ -579,12 +696,34 @@ def _resolution_to_record(resolution: BgmResolution) -> dict[str, Any]:
     }
 
 
-def _resolution_from_record(value: dict[str, Any]) -> BgmResolution:
+def _resolution_from_record(
+    request: BgmResolutionRequest,
+    value: dict[str, Any],
+) -> BgmResolution:
     track_value = value.get("track")
-    track = _track_from_dict(track_value) if track_value else None
+    track = _track_from_dict(request, track_value) if track_value else None
     if track is not None:
-        if not track.path.is_file() or _sha256_file(track.path) != track.sha256:
+        if (
+            not track.path.is_file()
+            or _sha256_file(track.path) != track.sha256
+            or not track.metadata_path.is_file()
+            or _sha256_file(track.metadata_path) != track.metadata_sha256
+        ):
             raise RuntimeError("Committed BGM resolution track is missing or changed")
+        if value.get("source") in {"provider", "agent"}:
+            download_ledger = _load_download_ledger(request)
+            matching = [
+                entry
+                for entry in download_ledger["candidates"].values()
+                if entry.get("status") == "validated"
+                and entry.get("candidate_id") == track.id
+                and entry.get("path") == _relative_artifact(request, track.path)
+                and entry.get("sha256") == track.sha256
+            ]
+            if len(matching) != 1:
+                raise RuntimeError(
+                    "Committed BGM resolution does not match download ledger"
+                )
     interaction = value.get("interaction") or {}
     return BgmResolution(
         mode=str(value["mode"]),
@@ -608,7 +747,7 @@ def _resolution_from_record(value: dict[str, Any]) -> BgmResolution:
 def _load_committed_resolution(
     request: BgmResolutionRequest,
 ) -> BgmResolution | None:
-    value = _read_json(request.context.run_dir / _RESOLUTION_LEDGER)
+    value = _read_json(_resolution_ledger_path(request))
     if not value:
         return None
     if value.get("schema_version") != 1:
@@ -617,21 +756,21 @@ def _load_committed_resolution(
         return None
     if value.get("status") not in {"committed", "acknowledged"}:
         return None
-    return _resolution_from_record(value)
+    return _resolution_from_record(request, value)
 
 
 def _commit_resolution(
     request: BgmResolutionRequest,
     resolution: BgmResolution,
 ) -> BgmResolution:
-    path = request.context.run_dir / _RESOLUTION_LEDGER
+    path = _resolution_ledger_path(request)
     existing = _read_json(path)
     if (
         existing.get("request_fingerprint") == resolution.request_fingerprint
         and existing.get("status") in {"committed", "acknowledged"}
     ):
-        return _resolution_from_record(existing)
-    _atomic_json(path, _resolution_to_record(resolution))
+        return _resolution_from_record(request, existing)
+    _atomic_json(path, _resolution_to_record(request, resolution))
     return resolution
 
 
@@ -642,16 +781,12 @@ def _cleanup_downloads(
     ledger = _load_download_ledger(request)
     changed = False
     selected = selected_path.resolve() if selected_path else None
-    run_root = request.context.run_dir.resolve()
-    for entry in ledger["candidates"].values():
+    for fingerprint, entry in ledger["candidates"].items():
         raw_path = entry.get("path")
-        if not raw_path or entry.get("status") == "cleaned":
+        if not raw_path or entry.get("status") != "validated":
             continue
-        path = Path(raw_path).resolve()
-        try:
-            path.relative_to(run_root)
-        except ValueError:
-            continue
+        _validate_candidate_entry(request, fingerprint, entry)
+        path = _resolve_artifact(request, raw_path)
         if selected is not None and path == selected:
             continue
         path.unlink(missing_ok=True)
@@ -674,6 +809,51 @@ def _finalize_resolution(
     return committed
 
 
+def _copy_durable(source: Path, destination: Path) -> None:
+    if destination.is_file() and _sha256_file(destination) == _sha256_file(source):
+        return
+    temporary = destination.with_name(f".{destination.name}.part")
+    temporary.unlink(missing_ok=True)
+    try:
+        with source.open("rb") as input_stream, temporary.open("xb") as output:
+            shutil.copyfileobj(input_stream, output)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _materialize_selected_track(
+    request: BgmResolutionRequest,
+    track: BgmTrack,
+) -> BgmTrack:
+    try:
+        track.path.resolve().relative_to(request.download_dir)
+        track.metadata_path.resolve().relative_to(request.download_dir)
+        return track
+    except ValueError:
+        pass
+    request.download_dir.mkdir(parents=True, exist_ok=True)
+    prefix = f"selected-{_request_fingerprint(request)}-{track.sha256}"
+    audio_path = request.download_dir / f"{prefix}{track.path.suffix.casefold()}"
+    _copy_durable(track.path, audio_path)
+    if track.metadata_path.resolve() == track.path.resolve():
+        metadata_path = audio_path
+    else:
+        metadata_path = request.download_dir / (
+            f"{prefix}.metadata{track.metadata_path.suffix.casefold()}"
+        )
+        _copy_durable(track.metadata_path, metadata_path)
+    return replace(
+        track,
+        path=audio_path.resolve(),
+        metadata_path=metadata_path.resolve(),
+        sha256=_sha256_file(audio_path),
+        metadata_sha256=_sha256_file(metadata_path),
+    )
+
+
 def _selected_resolution(
     request: BgmResolutionRequest,
     track: BgmTrack,
@@ -681,6 +861,7 @@ def _selected_resolution(
     scores: tuple[CandidateScore, ...],
     warnings: list[str],
 ) -> BgmResolution:
+    track = _materialize_selected_track(request, track)
     if track.rights_status.strip().casefold() == "unknown":
         warnings.append(
             f"Selected BGM track {track.id} rights status is unknown"
@@ -721,7 +902,7 @@ def acknowledge_bgm_resolution(
     interaction_port: InteractionPort,
     resolution_id: str,
 ) -> bool:
-    path = request.context.run_dir / _RESOLUTION_LEDGER
+    path = _resolution_ledger_path(request)
     value = _read_json(path)
     if (
         value.get("resolution_id") != resolution_id
