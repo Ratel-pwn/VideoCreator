@@ -346,10 +346,18 @@ def _download_ledger_path(request: BgmResolutionRequest) -> Path:
     )
 
 
+def _request_candidate_dir(request: BgmResolutionRequest) -> Path:
+    return request.download_dir / f"request-{_request_fingerprint(request)}"
+
+
 def _resolution_ledger_path(request: BgmResolutionRequest) -> Path:
     return request.download_dir / (
         f"bgm-resolution-{_request_fingerprint(request)}.json"
     )
+
+
+def _current_resolution_path(request: BgmResolutionRequest) -> Path:
+    return request.download_dir / "bgm-current-resolution.json"
 
 
 def _load_download_ledger(request: BgmResolutionRequest) -> dict[str, Any]:
@@ -406,7 +414,10 @@ def _validate_candidate_entry(
     path_value = entry.get("path")
     if path_value is not None:
         path = _resolve_artifact(request, path_value)
-        if path.name != _candidate_relative_path(fingerprint, path.suffix):
+        if (
+            path.parent != _request_candidate_dir(request)
+            or path.name != _candidate_relative_path(fingerprint, path.suffix)
+        ):
             raise RuntimeError("Invalid BGM download ledger candidate path")
     if status != "validated":
         return
@@ -450,7 +461,10 @@ def _deterministic_candidate_path(
     suffix: str,
 ) -> Path:
     normalized_suffix = suffix.casefold() if suffix else ".audio"
-    return request.download_dir / f"candidate-{fingerprint}{normalized_suffix}"
+    return (
+        _request_candidate_dir(request)
+        / f"candidate-{fingerprint}{normalized_suffix}"
+    )
 
 
 def _validated_candidate(
@@ -473,11 +487,12 @@ def _validated_candidate(
             )
             return None
 
-    request.download_dir.mkdir(parents=True, exist_ok=True)
+    candidate_dir = _request_candidate_dir(request)
+    candidate_dir.mkdir(parents=True, exist_ok=True)
     discovered_paths = [
         path
         for path in sorted(
-            request.download_dir.glob(f"candidate-{fingerprint}.*")
+            candidate_dir.glob(f"candidate-{fingerprint}.*")
         )
         if path.suffix.casefold() in SUPPORTED_AUDIO_SUFFIXES
     ]
@@ -547,7 +562,7 @@ def _validated_candidate(
             allowed_hosts = None
         downloaded = download_candidate(
             candidate,
-            request.download_dir,
+            candidate_dir,
             max_download_bytes=max_download_bytes,
             allowed_hosts=allowed_hosts,
             output_name=f"candidate-{fingerprint}",
@@ -786,15 +801,63 @@ def _commit_resolution(
         existing.get("request_fingerprint") == resolution.request_fingerprint
         and existing.get("status") in {"committed", "acknowledged"}
     ):
-        return _resolution_from_record(request, existing)
+        committed = _resolution_from_record(request, existing)
+        _claim_resolution_authority(request, committed)
+        return committed
     _atomic_json(path, _resolution_to_record(request, resolution))
+    _atomic_json(
+        _current_resolution_path(request),
+        {
+            "schema_version": 1,
+            "request_fingerprint": resolution.request_fingerprint,
+            "resolution_id": resolution.resolution_id,
+            "committed_at": _now(),
+        },
+    )
     return resolution
+
+
+def _claim_resolution_authority(
+    request: BgmResolutionRequest,
+    resolution: BgmResolution,
+) -> bool:
+    path = _current_resolution_path(request)
+    current = _read_json(path)
+    if current:
+        return (
+            current.get("schema_version") == 1
+            and current.get("request_fingerprint")
+            == resolution.request_fingerprint
+            and current.get("resolution_id") == resolution.resolution_id
+        )
+    _atomic_json(
+        path,
+        {
+            "schema_version": 1,
+            "request_fingerprint": resolution.request_fingerprint,
+            "resolution_id": resolution.resolution_id,
+            "committed_at": _now(),
+        },
+    )
+    return True
+
+
+def _require_cleanup_authority(request: BgmResolutionRequest) -> None:
+    current = _read_json(_current_resolution_path(request))
+    if (
+        current.get("schema_version") != 1
+        or current.get("request_fingerprint") != _request_fingerprint(request)
+    ):
+        raise RuntimeError(
+            "Refusing stale cleanup for a non-authoritative BGM request"
+        )
 
 
 def _cleanup_downloads(
     request: BgmResolutionRequest,
     selected_path: Path | None,
 ) -> None:
+    _require_cleanup_authority(request)
     ledger = _load_download_ledger(request)
     selected = selected_path.resolve() if selected_path else None
     selected_relative = (
@@ -803,7 +866,7 @@ def _cleanup_downloads(
     cleanup = ledger.get("cleanup")
     if not isinstance(cleanup, dict) or cleanup.get("status") != "pending":
         paths = [
-            path.name
+            _relative_artifact(request, path)
             for path in _candidate_artifacts(request)
             if selected is None or path.resolve() != selected
         ]
@@ -838,7 +901,7 @@ def _cleanup_downloads(
 
 
 def _candidate_artifact_fingerprint(name: str) -> str | None:
-    match = _CANDIDATE_ARTIFACT.fullmatch(name)
+    match = _CANDIDATE_ARTIFACT.fullmatch(Path(name).name)
     if not match:
         return None
     suffix = match.group("suffix") or match.group("partial_suffix")
@@ -848,11 +911,12 @@ def _candidate_artifact_fingerprint(name: str) -> str | None:
 
 
 def _candidate_artifacts(request: BgmResolutionRequest) -> tuple[Path, ...]:
-    if not request.download_dir.is_dir():
+    candidate_dir = _request_candidate_dir(request)
+    if not candidate_dir.is_dir():
         return ()
     return tuple(
         path
-        for path in sorted(request.download_dir.iterdir())
+        for path in sorted(candidate_dir.iterdir())
         if path.is_file()
         and _candidate_artifact_fingerprint(path.name) is not None
     )
@@ -866,6 +930,8 @@ def _unlink_candidate_artifact(
     if _candidate_artifact_fingerprint(relative) is None:
         raise RuntimeError("Invalid BGM cleanup artifact")
     path = _resolve_artifact(request, relative)
+    if path.parent != _request_candidate_dir(request):
+        raise RuntimeError("BGM cleanup artifact belongs to another request")
     if selected is not None and path == selected:
         return
     path.unlink(missing_ok=True)
@@ -1022,6 +1088,7 @@ def resolve_bgm_for_run(
     """Resolve and durably commit one BGM decision without mixing or stage changes."""
     committed = _load_committed_resolution(request)
     if committed is not None:
+        _claim_resolution_authority(request, committed)
         _cleanup_downloads(
             request,
             committed.track.path

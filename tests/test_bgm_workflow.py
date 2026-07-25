@@ -617,12 +617,12 @@ def test_ledgers_use_relative_paths_inside_download_dir(tmp_path, monkeypatch):
     result = bgm_workflow.resolve_bgm_for_run(req, DurableInteractionPort())
 
     ledgers = list(req.download_dir.glob("bgm-*.json"))
-    assert len(ledgers) == 2
+    assert len(ledgers) == 3
     assert all(path.parent == req.download_dir for path in ledgers)
     for ledger_path in ledgers:
         serialized = ledger_path.read_text(encoding="utf-8")
         assert str(req.download_dir) not in serialized
-    assert result.track.path.parent == req.download_dir
+    assert result.track.path.parent == bgm_workflow._request_candidate_dir(req)
 
 
 @pytest.mark.parametrize("bad_path", ["../state.json", "C:/outside/state.json"])
@@ -835,13 +835,18 @@ def test_cleanup_removes_rejected_provisional_partial_and_orphan_candidates(
     rejected_fp = "a" * 64
     provisional_fp = "b" * 64
     orphan_fp = "c" * 64
-    req.download_dir.mkdir(parents=True, exist_ok=True)
-    rejected = req.download_dir / f"candidate-{rejected_fp}.mp3"
-    partial = req.download_dir / f".candidate-{provisional_fp}.mp3.part"
-    orphan = req.download_dir / f"candidate-{orphan_fp}.mp3"
+    owned = bgm_workflow._request_candidate_dir(req)
+    owned.mkdir(parents=True, exist_ok=True)
+    rejected = owned / f"candidate-{rejected_fp}.mp3"
+    partial = owned / f".candidate-{provisional_fp}.mp3.part"
+    orphan = owned / f"candidate-{orphan_fp}.mp3"
+    foreign_owned = req.download_dir / f"request-{'e' * 64}"
+    foreign_owned.mkdir(parents=True, exist_ok=True)
+    foreign_orphan = foreign_owned / f"candidate-{'f' * 64}.mp3"
     rejected.write_bytes(b"rejected")
     partial.write_bytes(b"partial")
     orphan.write_bytes(b"orphan")
+    foreign_orphan.write_bytes(b"foreign")
     bgm_workflow._write_download_ledger(
         req,
         {
@@ -851,7 +856,9 @@ def test_cleanup_removes_rejected_provisional_partial_and_orphan_candidates(
                 rejected_fp: {
                     "candidate_id": "rejected",
                     "status": "rejected",
-                    "path": rejected.name,
+                    "path": rejected.relative_to(
+                        req.download_dir
+                    ).as_posix(),
                     "reason": "probe failed",
                 },
                 provisional_fp: {
@@ -873,6 +880,7 @@ def test_cleanup_removes_rejected_provisional_partial_and_orphan_candidates(
     assert not rejected.exists()
     assert not partial.exists()
     assert not orphan.exists()
+    assert foreign_orphan.exists()
     ledger = bgm_workflow._load_download_ledger(req)
     assert {
         entry["status"] for entry in ledger["candidates"].values()
@@ -886,8 +894,9 @@ def test_cleanup_plan_resumes_after_unlink_failure(tmp_path, monkeypatch):
     local = track(tmp_path / "local", track_id="local")
     req = request(tmp_path, local_tracks=(local,))
     fingerprint = "d" * 64
-    req.download_dir.mkdir(parents=True, exist_ok=True)
-    stale = req.download_dir / f"candidate-{fingerprint}.mp3"
+    owned = bgm_workflow._request_candidate_dir(req)
+    owned.mkdir(parents=True, exist_ok=True)
+    stale = owned / f"candidate-{fingerprint}.mp3"
     stale.write_bytes(b"stale")
     bgm_workflow._write_download_ledger(
         req,
@@ -898,7 +907,9 @@ def test_cleanup_plan_resumes_after_unlink_failure(tmp_path, monkeypatch):
                 fingerprint: {
                     "candidate_id": "stale",
                     "status": "rejected",
-                    "path": stale.name,
+                    "path": stale.relative_to(
+                        req.download_dir
+                    ).as_posix(),
                     "reason": "probe failed",
                 },
             },
@@ -1020,3 +1031,103 @@ def test_defensive_source_url_redaction_removes_userinfo_and_signed_query():
     assert redacted == "https://example.test:8443/source"
     assert "SUPER-SECRET" not in redacted
     assert "SIGNED" not in redacted
+
+
+def test_stale_request_cleanup_cannot_delete_new_request_selected_media(
+    tmp_path,
+    monkeypatch,
+):
+    from videocreator import bgm_workflow
+
+    local = track(tmp_path / "local", track_id="local")
+    request_a = request(tmp_path, local_tracks=(local,))
+    fingerprint_a = bgm_workflow._request_fingerprint(request_a)
+    candidate_a = "a" * 64
+    owned_a = request_a.download_dir / f"request-{fingerprint_a}"
+    owned_a.mkdir(parents=True, exist_ok=True)
+    stale_a = owned_a / f"candidate-{candidate_a}.mp3"
+    stale_a.write_bytes(b"request-a-orphan")
+    bgm_workflow._write_download_ledger(
+        request_a,
+        {
+            "schema_version": 1,
+            "request_fingerprint": fingerprint_a,
+            "candidates": {
+                candidate_a: {
+                    "candidate_id": "request-a-stale",
+                    "status": "rejected",
+                    "path": stale_a.relative_to(
+                        request_a.download_dir
+                    ).as_posix(),
+                    "reason": "probe failed",
+                },
+            },
+        },
+    )
+    original_unlink = bgm_workflow._unlink_candidate_artifact
+    monkeypatch.setattr(
+        bgm_workflow,
+        "_unlink_candidate_artifact",
+        lambda *_args: (_ for _ in ()).throw(OSError("pause A cleanup")),
+    )
+    with pytest.raises(OSError, match="pause A cleanup"):
+        bgm_workflow.resolve_bgm_for_run(
+            request_a,
+            ConsoleInteractionPort(),
+        )
+    assert bgm_workflow._load_download_ledger(request_a)["cleanup"][
+        "status"
+    ] == "pending"
+
+    online = online_candidate("request-b-selected")
+    monkeypatch.setattr(
+        bgm_workflow,
+        "search_configured_providers",
+        lambda *_args, **_kwargs: [online],
+    )
+
+    def download(item, output_dir, **kwargs):
+        path = output_dir / f"{kwargs['output_name']}.mp3"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"request-b-media")
+        return path
+
+    monkeypatch.setattr(bgm_workflow, "download_candidate", download)
+    monkeypatch.setattr(bgm_workflow, "candidate_to_track", candidate_track)
+    monkeypatch.setattr(
+        bgm_workflow,
+        "_unlink_candidate_artifact",
+        original_unlink,
+    )
+    request_b = request(
+        tmp_path,
+        query=replace(query(), subjects=("history",)),
+    )
+    result_b = bgm_workflow.resolve_bgm_for_run(
+        request_b,
+        DurableInteractionPort(),
+    )
+    media_b = result_b.track.path
+    resolution_b = bgm_workflow._resolution_ledger_path(request_b)
+
+    assert media_b.parent == (
+        request_b.download_dir
+        / f"request-{result_b.request_fingerprint}"
+    )
+    assert media_b.exists()
+    assert resolution_b.exists()
+
+    with pytest.raises(RuntimeError, match="stale cleanup"):
+        bgm_workflow.resolve_bgm_for_run(
+            request_a,
+            ConsoleInteractionPort(),
+        )
+
+    assert media_b.exists()
+    assert resolution_b.exists()
+    replay_b = bgm_workflow.resolve_bgm_for_run(
+        request_b,
+        DurableInteractionPort(),
+    )
+    assert replay_b.resolution_id == result_b.resolution_id
+    assert replay_b.track.path == media_b
