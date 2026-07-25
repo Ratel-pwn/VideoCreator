@@ -101,6 +101,8 @@ def build_bgm_filter(
 ) -> str:
     if track_duration_ms <= 0 or narration_duration_ms <= 0:
         raise BgmMixError("audio durations must be positive")
+    if policy.fade_in_ms < 0 or policy.fade_out_ms < 0:
+        raise BgmMixError("BGM fades must be non-negative")
 
     settings = BgmMixSettings()
     narration_seconds = narration_duration_ms / 1000
@@ -364,7 +366,10 @@ def mix_bgm(
         warnings.append(f"BGM track {bgm.id} rights status is unknown")
 
     policy_payload = asdict(policy)
-    settings_payload = asdict(settings)
+    settings_payload = {
+        "settings": asdict(settings),
+        "ducking_presets": DUCKING,
+    }
     commands = (
         tuple(prepare_command),
         tuple(mix_command),

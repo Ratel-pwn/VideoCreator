@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -30,7 +31,10 @@ def _measurement_findings(
                 f"{settings.duration_tolerance_ms}ms",
             )
         )
-    if not settings.min_lufs <= measured_lufs <= settings.max_lufs:
+    if (
+        not math.isfinite(measured_lufs)
+        or not settings.min_lufs <= measured_lufs <= settings.max_lufs
+    ):
         findings.append(
             _finding(
                 "integrated_loudness_out_of_range",
@@ -38,7 +42,10 @@ def _measurement_findings(
                 f"{settings.min_lufs} to {settings.max_lufs} LUFS",
             )
         )
-    if true_peak_dbtp > settings.max_true_peak_dbtp:
+    if (
+        not math.isfinite(true_peak_dbtp)
+        or true_peak_dbtp > settings.max_true_peak_dbtp
+    ):
         findings.append(
             _finding(
                 "true_peak_too_high",
@@ -61,7 +68,13 @@ def _write_report(report: dict[str, Any], path: Path) -> dict[str, Any]:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
-        json.dumps(report, ensure_ascii=False, indent=2) + "\n",
+        json.dumps(
+            report,
+            ensure_ascii=False,
+            indent=2,
+            allow_nan=False,
+        )
+        + "\n",
         encoding="utf-8",
     )
     return report
@@ -231,6 +244,17 @@ def audit_bgm_render_audio(
         )
     else:
         render_audio = Path(render_audio)
+        declared_path = expected_render.get("path")
+        if (
+            not isinstance(declared_path, str)
+            or render_audio.resolve() != Path(declared_path).resolve()
+        ):
+            findings.append(
+                _finding(
+                    "artifact_path_mismatch",
+                    "Render audio path is not the authoritative audited path",
+                )
+            )
         if not render_audio.is_file():
             findings.append(
                 _finding("render_audio_missing", "Render audio does not exist")

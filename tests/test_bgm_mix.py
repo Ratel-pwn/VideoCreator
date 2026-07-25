@@ -79,6 +79,17 @@ def test_filter_omits_disabled_fades():
     assert "afade" not in value
 
 
+def test_filter_rejects_negative_fades():
+    from videocreator.bgm_mix import BgmMixError, build_bgm_filter
+
+    with pytest.raises(BgmMixError, match="non-negative"):
+        build_bgm_filter(
+            40_000,
+            35_000,
+            BgmPolicy(fade_in_ms=-1),
+        )
+
+
 def test_mix_rejects_short_non_loopable_track(tmp_path, monkeypatch):
     from videocreator.bgm_mix import BgmMixError, mix_bgm
 
@@ -158,6 +169,7 @@ def test_mix_uses_parameter_arrays_and_sidechain_graph(tmp_path, monkeypatch):
     assert result.measured_lufs == -16.2
     assert result.true_peak_dbtp == -1.7
     assert result.mix_duration_ms == 35_020
+    assert result.configuration_hash
     assert "rights status is unknown" in " ".join(result.warnings)
 
 

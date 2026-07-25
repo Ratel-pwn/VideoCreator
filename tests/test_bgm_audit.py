@@ -1,4 +1,5 @@
 import json
+import math
 from dataclasses import replace
 from pathlib import Path
 
@@ -146,6 +147,20 @@ def test_mix_report_and_audit_reject_bad_measurement(tmp_path):
     )
 
 
+def test_mix_audit_rejects_non_finite_true_peak(tmp_path):
+    from videocreator.bgm_audit import (
+        audit_bgm_render_audio,
+        write_bgm_mix_report,
+    )
+
+    result = make_result(tmp_path)
+    report = write_bgm_mix_report(result, tmp_path / "report.json")
+    report["measurement"]["true_peak_dbtp"] = math.nan
+    audit = audit_bgm_render_audio(result.mix_path, report)
+
+    assert "true_peak_too_high" in finding_codes(audit)
+
+
 def test_narration_only_report_binds_authoritative_audio(tmp_path, monkeypatch):
     from videocreator.bgm_audit import (
         audit_bgm_render_audio,
@@ -206,3 +221,20 @@ def test_unknown_rights_are_warning_only(tmp_path, monkeypatch):
 
     assert audit["status"] == "passed"
     assert "rights status is unknown" in " ".join(audit["warnings"])
+
+
+def test_audit_rejects_non_authoritative_audio_path(tmp_path):
+    from videocreator.bgm_audit import (
+        audit_bgm_render_audio,
+        write_bgm_mix_report,
+    )
+
+    result = make_result(tmp_path)
+    report = write_bgm_mix_report(result, tmp_path / "report.json")
+    copy = tmp_path / "copied-mix.wav"
+    copy.write_bytes(result.mix_path.read_bytes())
+
+    audit = audit_bgm_render_audio(copy, report)
+
+    assert audit["status"] == "failed"
+    assert "artifact_path_mismatch" in finding_codes(audit)
