@@ -142,7 +142,12 @@ def load_bgm_directory(root: Path, level: str) -> tuple[tuple[BgmTrack, ...], tu
         if path.is_file() and path.suffix.lower() in SUPPORTED_AUDIO_SUFFIXES
     ):
         try:
-            tracks.append(_load_track(audio_path, level))
+            track = _load_track(audio_path, level)
+            tracks.append(track)
+            if track.rights_status.strip().lower() == "unknown":
+                warnings.append(
+                    f"{level} BGM track {track.id} rights status is unknown"
+                )
         except (OSError, ValueError, subprocess.CalledProcessError) as exc:
             warnings.append(f"{level} BGM track {audio_path.name} is ineligible: {exc}")
     return tuple(tracks), tuple(warnings)

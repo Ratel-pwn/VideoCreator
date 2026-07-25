@@ -1,3 +1,4 @@
+import hashlib
 import json
 
 import pytest
@@ -32,7 +33,7 @@ def test_initialize_project_and_create_canonical_run(tmp_path):
     assert (project / "library" / "bgm").is_dir()
 
 
-def test_run_snapshots_bgm_level_and_track_hashes(tmp_path):
+def test_run_snapshots_bgm_audio_sidecar_hashes_and_provenance(tmp_path):
     template_root = tmp_path / "templates" / "demo"
     template_root.mkdir(parents=True)
     for name in ("prepare.md", "writing.md", "visual-planning.md"):
@@ -48,10 +49,11 @@ def test_run_snapshots_bgm_level_and_track_hashes(tmp_path):
     audio = project / "library" / "bgm" / "calm.mp3"
     metadata = audio.with_suffix(".bgm.json")
     audio.write_bytes(b"audio")
-    metadata.write_text("{}", encoding="utf-8")
+    metadata.write_text('{"source": "fixture"}', encoding="utf-8")
     track = BgmTrack(
-        "calm", audio, metadata, "project", "expected-hash", "Calm", None, None,
-        None, "unknown", (), (), "low", None, True, (), (), 0, True,
+        "calm", audio, metadata, "project", "expected-audio-hash", "Calm",
+        "Example Composer", "https://example.com/calm", "CC BY 4.0", "verified",
+        (), (), "low", None, True, (), (), 0, True,
     )
 
     run = create_run(project, "run-bgm", template, {
@@ -60,7 +62,20 @@ def test_run_snapshots_bgm_level_and_track_hashes(tmp_path):
 
     snapshot = json.loads((run.inputs / "library.snapshot.json").read_text(encoding="utf-8"))
     assert snapshot["bgm"]["level"] == "project"
-    assert snapshot["bgm"]["files"] == [{"path": str(audio), "sha256": "expected-hash"}]
+    assert snapshot["bgm"]["files"] == [{
+        "path": str(audio),
+        "sha256": "expected-audio-hash",
+        "metadata": {
+            "path": str(metadata),
+            "sha256": hashlib.sha256(metadata.read_bytes()).hexdigest(),
+        },
+        "provenance": {
+            "creator": "Example Composer",
+            "source_url": "https://example.com/calm",
+            "license": "CC BY 4.0",
+            "rights_status": "verified",
+        },
+    }]
 
 
 def test_initialize_project_never_overwrites(tmp_path):

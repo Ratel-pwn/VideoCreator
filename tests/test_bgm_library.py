@@ -1,4 +1,5 @@
 import json
+import subprocess
 from pathlib import Path
 
 from videocreator.media import MediaMetadata
@@ -77,14 +78,15 @@ def test_invalid_project_directory_does_not_mask_valid_template(tmp_path, monkey
     from videocreator.bgm_library import resolve_bgm_library
 
     repo, project, template = make_bgm_tree(tmp_path)
-    broken = project / "library/bgm/broken.mp3"
-    broken.parent.mkdir(parents=True)
+    broken = write_track(project / "library/bgm", "broken")
     broken.write_bytes(b"not audio")
     write_track(template.root / "library/bgm", "template-track")
+    probed = []
 
     def probe(path: Path) -> MediaMetadata:
+        probed.append(path)
         if path == broken:
-            raise RuntimeError("undecodable")
+            raise subprocess.CalledProcessError(1, ["ffprobe", str(path)])
         return MediaMetadata("audio", "mp3", None, None, 1_000)
 
     monkeypatch.setattr("videocreator.bgm_library.probe_media", probe)
@@ -93,6 +95,30 @@ def test_invalid_project_directory_does_not_mask_valid_template(tmp_path, monkey
 
     assert selected.level == "template"
     assert selected.warnings
+    assert broken in probed
+
+
+def test_unknown_rights_status_keeps_track_and_appends_warning(tmp_path, monkeypatch):
+    from videocreator.bgm_library import resolve_bgm_library
+
+    repo, project, template = make_bgm_tree(tmp_path)
+    write_track(
+        project / "library/bgm",
+        "unknown-rights",
+        rights_status="unknown",
+    )
+    monkeypatch.setattr(
+        "videocreator.bgm_library.probe_media",
+        lambda _: MediaMetadata("audio", "mp3", None, None, 1_000),
+    )
+
+    selected = resolve_bgm_library(repo, project, template)
+
+    assert [track.id for track in selected.tracks] == ["unknown-rights"]
+    assert any(
+        "unknown-rights" in warning and "rights status is unknown" in warning
+        for warning in selected.warnings
+    )
 
 
 def test_track_missing_required_sidecar_fields_is_ineligible(tmp_path, monkeypatch):
