@@ -1,6 +1,6 @@
 # VideoCreator
 
-VideoCreator is a local-first pipeline for topic preparation, reference-based writing, narration, aligned subtitles, visual planning, online asset collection, and Remotion final assembly.
+VideoCreator is a local-first pipeline for topic preparation, reference-based writing, narration, aligned subtitles, visual planning, online asset collection, automatic BGM, and Remotion final assembly.
 
 ## Templates
 
@@ -95,7 +95,7 @@ projects/<project>/                     # One long-lived production project
     ├── inputs/                         # Frozen template, project, source, and library snapshots
     ├── session/                        # Preparation and conversation records
     ├── writing/                        # Raw and approved scripts
-    ├── audio/                          # Generated and render narration
+    ├── audio/                          # Narration, BGM selection, audited mix, and final render audio
     ├── subtitles/                      # Aligned and render SRT files
     ├── visual/                         # Plan, pacing audit, requests, manifests, and asset audit
     ├── render/                         # Remotion input, report, log, and final.mp4
@@ -103,6 +103,28 @@ projects/<project>/                     # One long-lived production project
 ```
 
 Library selection is a complete override per resource type: populated project library, then populated template library, then populated global default. Files from levels are never merged, and empty directories do not override.
+
+## Automatic BGM
+
+The workflow runs `visual_assets -> bgm -> video_render`. The `bgm` stage starts only after the exact narration and subtitle hashes pass synchronization audit. It resolves one instrumental track in this order:
+
+1. A populated project library at `projects/<project>/library/bgm/`.
+2. A populated template library at `templates/<template>/library/bgm/`.
+3. The global default at `library/bgm/default/`.
+4. Configured core providers, followed by a durable Agent handoff when the current client supports it.
+5. Explicit narration-only degradation when no eligible track can be resolved.
+
+Each populated library level completely overrides lower levels; tracks are not merged across levels. Eligible candidates are selected deterministically from the approved script, topic, template policy, mood, energy, tempo, and avoidance tags.
+
+The stage freezes the chosen audio and sidecar, loops or crops the BGM to narration duration, applies fades and narration-driven ducking, and writes:
+
+- `audio/bgm-selection.json`: query, candidates, scores, selected track, source URL, attribution, license, rights status, and warnings.
+- `audio/bgm-mix-report.json`: input/output hashes, settings, duration, loudness, FFmpeg evidence, provenance, and gate findings.
+- `audio/final-mix.wav`: the sole render audio when BGM mixing succeeds.
+
+If the workflow degrades to narration only, the mix report records that mode and the original narration remains authoritative. Before writing `render/render-input.json`, the render gate revalidates the current narration, selection, sidecar, mix, policy, configuration, and run-local lineage. Remotion always receives exactly one `audioPath`; it never receives separate narration and BGM tracks. Source video audio remains muted.
+
+See [Adding And Resolving BGM](docs/bgm-library.md) for the sidecar contract, library priority, online fallback, and local configuration.
 
 ## Visual And Render Rules
 
