@@ -8,6 +8,7 @@ from videocreator.interactions import (
     ConsoleInteractionPort,
     DurableInteractionPort,
     InteractionRequired,
+    interaction_fingerprint,
 )
 
 
@@ -92,3 +93,73 @@ def test_typed_payload_is_persisted_unchanged_and_handoff_is_explicit(tmp_path: 
         .splitlines()[0]
     )
     assert event["payload"] == payload
+
+
+def test_changed_kind_or_payload_cannot_replay_stale_answer(tmp_path: Path):
+    ctx = Context(tmp_path)
+    port = DurableInteractionPort()
+    first_payload = {"schema_version": 1, "query": {"subjects": ["economics"]}}
+    second_payload = {"schema_version": 1, "query": {"subjects": ["biology"]}}
+
+    with pytest.raises(InteractionRequired) as raised:
+        port.ask(
+            ctx,
+            "bgm-online-candidates",
+            "Find BGM",
+            "bgm_candidates",
+            payload=first_payload,
+        )
+    first = raised.value.interaction
+    port.submit(
+        ctx,
+        first["id"],
+        "answer",
+        fingerprint=first["fingerprint"],
+    )
+    assert port.ask(
+        ctx,
+        "bgm-online-candidates",
+        "Find BGM",
+        "bgm_candidates",
+        payload=first_payload,
+    ) == "answer"
+
+    with pytest.raises(InteractionRequired) as changed:
+        port.ask(
+            ctx,
+            "bgm-online-candidates",
+            "Find BGM",
+            "bgm_candidates",
+            payload=second_payload,
+        )
+
+    assert changed.value.interaction["id"] != first["id"]
+    assert changed.value.interaction["fingerprint"] == interaction_fingerprint(
+        "bgm_candidates",
+        second_payload,
+    )
+    assert "response" not in changed.value.interaction
+    assert "submitted_interactions" not in ctx.state
+    assert "consumed_interactions" not in ctx.state
+
+
+def test_submit_rejects_mismatched_interaction_fingerprint(tmp_path: Path):
+    ctx = Context(tmp_path)
+    port = DurableInteractionPort()
+    payload = {"query": {"subjects": ["economics"]}}
+    with pytest.raises(InteractionRequired) as raised:
+        port.ask(
+            ctx,
+            "bgm-online-candidates",
+            "Find BGM",
+            "bgm_candidates",
+            payload=payload,
+        )
+
+    with pytest.raises(ValueError, match="fingerprint"):
+        port.submit(
+            ctx,
+            raised.value.interaction["id"],
+            "answer",
+            fingerprint="stale",
+        )

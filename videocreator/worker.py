@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import threading
-import time
 import uuid
 from collections.abc import Callable
 
@@ -45,8 +44,22 @@ class WorkflowWorker:
         try:
             run = self.service._run(job.project, job.run_id)
             ctx = workflow.resume_context(self.service.home, self.service.config_path, run)
-            ctx.interactions = DurableInteractionPort()
+            port = DurableInteractionPort()
+            ctx.interactions = port
             ctx.should_cancel = lambda: self.queue.is_cancel_requested(job.id)
+            for item in self.queue.pending_inputs(job.id):
+                try:
+                    port.submit(
+                        ctx,
+                        item.interaction_id,
+                        item.response,
+                        fingerprint=item.fingerprint,
+                    )
+                except ValueError:
+                    # The interaction changed after submission; retain no replayable
+                    # answer and let the workflow request the current payload.
+                    pass
+                self.queue.acknowledge_input(job.id, item.interaction_id)
             outcome = self.execute(ctx) if self.execute else workflow.execute_until_boundary(ctx)
             if outcome.status == "waiting_for_input":
                 self.queue.release_waiting(job.id, self.worker_id)
@@ -57,7 +70,16 @@ class WorkflowWorker:
             else:
                 self.queue.fail(job.id, self.worker_id, outcome.error or "Workflow failed")
         except Exception as exc:
-            self.queue.fail(job.id, self.worker_id, str(exc))
+            try:
+                self.queue.fail(job.id, self.worker_id, str(exc))
+            except RuntimeError:
+                current = self.queue.get(job.project, job.run_id)
+                if current is None or current.status not in {
+                    "cancelled",
+                    "completed",
+                    "failed",
+                }:
+                    raise
         finally:
             stopped.set()
             heartbeat.join(timeout=1)

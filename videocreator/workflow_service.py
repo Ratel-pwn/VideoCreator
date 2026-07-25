@@ -4,8 +4,8 @@ import json
 from pathlib import Path
 from typing import Any, Iterable
 
-from .interactions import DurableInteractionPort
-from .job_queue import JobQueue
+from .interactions import interaction_fingerprint
+from .job_queue import JobCancelledError, JobQueue
 from .project_layout import initialize_project
 from .runtime_config import McpRuntimeConfig
 from .templates import discover_templates
@@ -160,9 +160,14 @@ class WorkflowService:
         manifest = self._read_json(run / "manifest.json")
         job = self.queue.get(project, run_id)
         pending = state.get("pending_interaction")
+        answered_in_outbox = bool(
+            job
+            and pending
+            and self.queue.has_input(job.id, str(pending.get("id", "")))
+        )
         if state.get("status") == "cancelled" or (job and job.status == "cancelled"):
             status = "cancelled"
-        elif pending and "response" not in pending:
+        elif pending and "response" not in pending and not answered_in_outbox:
             status = "waiting_for_input"
         elif job and job.status in {"queued", "leased", "waiting", "completed", "failed", "cancelled"}:
             status = {"leased": "running", "waiting": "waiting_for_input"}.get(job.status, job.status)
@@ -191,24 +196,71 @@ class WorkflowService:
         interaction_id: str,
         response: str,
     ) -> dict[str, Any]:
-        import main as workflow
-
         run = self._run(project, run_id)
         state = self._read_json(run / "state.json")
         job = self.queue.get(project, run_id)
         if state.get("status") == "cancelled" or (job and job.status == "cancelled"):
+            try:
+                accepted = self.queue.retry_input(
+                    project,
+                    run_id,
+                    interaction_id,
+                    response,
+                )
+            except KeyError:
+                accepted = None
+            except ValueError as exc:
+                raise ServiceError("state_conflict", str(exc)) from exc
+            if accepted is False:
+                return {
+                    "project": project,
+                    "run_id": run_id,
+                    "status": "cancelled",
+                    "accepted": False,
+                }
             raise ServiceError(
                 "state_conflict",
                 "Cannot submit input to a cancelled workflow",
             )
-        ctx = workflow.resume_context(self.home, self.config_path, run)
-        port = DurableInteractionPort()
+        pending = state.get("pending_interaction")
+        if not pending or pending.get("id") != interaction_id:
+            try:
+                accepted = self.queue.retry_input(
+                    project,
+                    run_id,
+                    interaction_id,
+                    response,
+                )
+            except (KeyError, ValueError) as exc:
+                raise ServiceError("state_conflict", str(exc)) from exc
+            current = self.queue.get(project, run_id)
+            return {
+                "project": project,
+                "run_id": run_id,
+                "status": current.status,
+                "accepted": accepted,
+            }
+        fingerprint = pending.get("fingerprint") or interaction_fingerprint(
+            str(pending.get("kind", "text")),
+            pending.get("payload"),
+        )
         try:
-            accepted = port.submit(ctx, interaction_id, response)
-        except ValueError as exc:
+            accepted = self.queue.submit_input(
+                project,
+                run_id,
+                interaction_id,
+                fingerprint,
+                response,
+            )
+        except (JobCancelledError, KeyError, ValueError) as exc:
             raise ServiceError("state_conflict", str(exc)) from exc
-        job = self.queue.enqueue(project, run_id)
-        return {"project": project, "run_id": run_id, "status": job.status, "accepted": accepted}
+        current = self.queue.get(project, run_id)
+        return {
+            "project": project,
+            "run_id": run_id,
+            "status": current.status,
+            "accepted": accepted,
+        }
 
     def resume_workflow(self, project: str, run_id: str) -> dict[str, Any]:
         status = self.get_workflow_status(project, run_id)

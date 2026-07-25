@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import uuid
 from copy import deepcopy
@@ -11,6 +12,19 @@ from typing import Any, Protocol
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def interaction_fingerprint(
+    kind: str,
+    payload: dict[str, Any] | None,
+) -> str:
+    canonical = json.dumps(
+        {"kind": kind, "payload": payload},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 class InteractionContext(Protocol):
@@ -84,18 +98,65 @@ class DurableInteractionPort:
         choices: tuple[str, ...] = (),
         payload: dict[str, Any] | None = None,
     ) -> str:
+        expected_fingerprint = interaction_fingerprint(kind, payload)
         answers = ctx.state.setdefault("interaction_answers", {})
         if key in answers:
-            return str(answers[key])
+            fingerprints = ctx.state.get("interaction_answer_fingerprints", {})
+            if fingerprints.get(key) == expected_fingerprint:
+                return str(answers[key])
+            answers.pop(key, None)
+            fingerprints.pop(key, None)
+            consumed = ctx.state.get("consumed_interactions", {})
+            submitted = ctx.state.get("submitted_interactions", {})
+            interaction_id = consumed.pop(key, None)
+            if interaction_id:
+                submitted.pop(interaction_id, None)
+            if not answers:
+                ctx.state.pop("interaction_answers", None)
+            if not fingerprints:
+                ctx.state.pop("interaction_answer_fingerprints", None)
+            if not consumed:
+                ctx.state.pop("consumed_interactions", None)
+            if not submitted:
+                ctx.state.pop("submitted_interactions", None)
 
         pending = ctx.state.get("pending_interaction")
         if pending:
             if pending.get("key") != key:
                 raise InteractionRequired(pending)
+            stored_fingerprint = pending.get("fingerprint") or interaction_fingerprint(
+                str(pending.get("kind", "text")),
+                pending.get("payload"),
+            )
+            if stored_fingerprint != expected_fingerprint:
+                submitted = ctx.state.get("submitted_interactions", {})
+                submitted.pop(pending.get("id"), None)
+                if not submitted:
+                    ctx.state.pop("submitted_interactions", None)
+                ctx.state.pop("pending_interaction", None)
+                self._append(
+                    ctx,
+                    {
+                        "event": "superseded",
+                        "id": pending.get("id"),
+                        "key": key,
+                        "fingerprint": stored_fingerprint,
+                        "superseded_at": _now(),
+                    },
+                )
+                pending = None
+            else:
+                pending["fingerprint"] = stored_fingerprint
+        if pending:
             if "response" not in pending:
                 raise InteractionRequired(pending)
             response = str(pending["response"])
             answers[key] = response
+            answer_fingerprints = ctx.state.setdefault(
+                "interaction_answer_fingerprints",
+                {},
+            )
+            answer_fingerprints[key] = expected_fingerprint
             consumed = ctx.state.setdefault("consumed_interactions", {})
             consumed[key] = pending["id"]
             ctx.state.pop("pending_interaction", None)
@@ -108,6 +169,7 @@ class DurableInteractionPort:
             "kind": kind,
             "prompt": prompt,
             "choices": list(choices),
+            "fingerprint": expected_fingerprint,
             "created_at": _now(),
         }
         if payload is not None:
@@ -118,7 +180,14 @@ class DurableInteractionPort:
         self._append(ctx, {"event": "asked", **interaction})
         raise InteractionRequired(interaction)
 
-    def submit(self, ctx: InteractionContext, interaction_id: str, response: str) -> bool:
+    def submit(
+        self,
+        ctx: InteractionContext,
+        interaction_id: str,
+        response: str,
+        *,
+        fingerprint: str | None = None,
+    ) -> bool:
         pending = ctx.state.get("pending_interaction")
         submitted = ctx.state.setdefault("submitted_interactions", {})
         if interaction_id in submitted:
@@ -127,6 +196,13 @@ class DurableInteractionPort:
             return False
         if not pending or pending.get("id") != interaction_id:
             raise ValueError(f"Stale interaction: {interaction_id}")
+        stored_fingerprint = pending.get("fingerprint") or interaction_fingerprint(
+            str(pending.get("kind", "text")),
+            pending.get("payload"),
+        )
+        if fingerprint is not None and fingerprint != stored_fingerprint:
+            raise ValueError("Interaction fingerprint does not match")
+        pending["fingerprint"] = stored_fingerprint
         choices = pending.get("choices") or []
         if choices and response not in choices:
             raise ValueError(f"Response must be one of: {', '.join(choices)}")
@@ -148,10 +224,15 @@ class DurableInteractionPort:
 
     def clear(self, ctx: InteractionContext, *keys: str) -> None:
         answers = ctx.state.get("interaction_answers", {})
+        answer_fingerprints = ctx.state.get(
+            "interaction_answer_fingerprints",
+            {},
+        )
         consumed = ctx.state.get("consumed_interactions", {})
         submitted = ctx.state.get("submitted_interactions", {})
         for key in keys:
             answers.pop(key, None)
+            answer_fingerprints.pop(key, None)
             interaction_id = consumed.pop(key, None)
             if interaction_id:
                 submitted.pop(interaction_id, None)
@@ -161,6 +242,8 @@ class DurableInteractionPort:
             ctx.state.pop("pending_interaction", None)
         if not answers:
             ctx.state.pop("interaction_answers", None)
+        if not answer_fingerprints:
+            ctx.state.pop("interaction_answer_fingerprints", None)
         if not consumed:
             ctx.state.pop("consumed_interactions", None)
         if not submitted:

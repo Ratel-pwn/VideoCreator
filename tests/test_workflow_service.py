@@ -97,7 +97,9 @@ def test_bgm_candidate_interaction_round_trips_unchanged(tmp_path: Path):
     )
     assert submitted["accepted"] is True
     saved = json.loads(state_path.read_text(encoding="utf-8"))
-    assert saved["pending_interaction"]["response"] == response
+    assert "response" not in saved["pending_interaction"]
+    job = service.queue.get("demo", "run-1")
+    assert service.queue.pending_inputs(job.id)[0].response == response
     resumed = service.get_workflow_status("demo", "run-1")
     assert resumed["status"] == "queued"
     assert resumed["interaction"] is None
