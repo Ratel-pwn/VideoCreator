@@ -1,0 +1,22 @@
+{
+  "id": "infinite-game-manifesto",
+  "display_name": "无限游戏理念宣言",
+  "description": "面向理念传播的哲学科技宣言短片",
+  "version": 1,
+  "capabilities": [
+    "writing",
+    "tts",
+    "subtitles",
+    "visual_planning",
+    "asset_collection",
+    "final_assembly"
+  ],
+  "paths": {
+    "prepare": "prepare.md",
+    "writing": "writing.md",
+    "visual_planning": "visual-planning.md",
+    "pacing": "pacing.json",
+    "subtitle": "subtitle.json",
+    "composition": "composition.json"
+  }
+}

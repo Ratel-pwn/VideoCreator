@@ -27,6 +27,8 @@ vc chat "新项目" "本期讨论主题"
 vc status "新项目"
 vc runs "新项目"
 vc resume "新项目"
+vc audit subtitles "新项目" --run <run-id>
+vc repair subtitles "新项目" --run <run-id>
 ```
 
 `vc init` prompts for omitted values unless `--non-interactive` is set. `vc chat` always starts a new run; `vc resume` continues the newest unfinished run, or a specific run selected with `-r RUN_ID`. Set `VIDEO_CREATOR_HOME` or pass `--home PATH` when the command should use a different checkout. `--config FILE` selects another workflow configuration, and `--json` gives machine-readable `templates`, `status`, and `runs` output.
@@ -122,6 +124,14 @@ Render an already frozen input:
 ```powershell
 python scripts/render_video.py --project-root projects/<project> --input projects/<project>/runs/<run-id>/render/render-input.json --output projects/<project>/runs/<run-id>/render/final.mp4
 ```
+
+## Subtitle Synchronization Gate
+
+TTS retains ordered segment audio and metadata in `audio/tts-segments.json`. Whisper supplies timestamps while the approved narration remains the subtitle text source. Every alignment writes evidence to `subtitles/alignment-timing.json` and `subtitles/alignment-report.json`.
+
+Before Remotion rendering, VideoCreator requires `review/subtitle-sync-audit.json` to pass against the exact audio and SRT hashes. `vc audit subtitles` performs a read-only check. `vc repair subtitles` applies diagnosis-specific repairs, records attempts in `review/subtitle-sync-repairs.json`, and refuses to repeat the same action against unchanged inputs.
+
+Localized TTS repair can consume provider quota. It reuses the configured trained speaker ID, regenerates at most one affected segment, and never retrains or creates a voice.
 
 ## Configuration
 

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import sys
@@ -9,6 +10,17 @@ from pathlib import Path
 from typing import Any
 
 import whisper
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from videocreator.subtitle_alignment import (
+    AlignedBlock,
+    align_approved_text,
+    build_aligned_blocks,
+    recognized_chars_from_whisper,
+)
 
 VISIBLE_CHAR_RE = re.compile(r"[\u4e00-\u9fffA-Za-z0-9]")
 SENTENCE_END_RE = re.compile(r"(?<=[。！？!?；;])")
@@ -31,6 +43,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--audio-file", required=True, type=Path, help="Final audio file to transcribe for timestamps")
     parser.add_argument("--text-file", required=True, type=Path, help="Original UTF-8 text file used for synthesis")
     parser.add_argument("--output-srt", default=None, type=Path, help="Output SRT path. Defaults to <audio-file>.srt")
+    parser.add_argument("--output-timing-json", default=None, type=Path)
+    parser.add_argument("--output-report", default=None, type=Path)
     parser.add_argument("--model", default=None, help="Whisper model override")
     parser.add_argument("--language", default=None, help="Language override, e.g. zh/en")
     parser.add_argument("--device", default=None, help="auto/cpu/cuda")
@@ -187,6 +201,68 @@ def write_srt(path: Path, blocks: list[tuple[float, float, str]]) -> None:
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def build_alignment_artifacts(
+    original_text: str,
+    whisper_result: dict[str, Any],
+    *,
+    max_chars: int,
+) -> tuple[list[AlignedBlock], dict[str, Any]]:
+    chunks = split_original_text(original_text, max_chars)
+    recognized = recognized_chars_from_whisper(whisper_result)
+    alignment = align_approved_text(original_text, recognized)
+    blocks = build_aligned_blocks(chunks, alignment)
+    report = alignment.to_report()
+    report["blocks"] = [
+        {
+            "index": index,
+            "text": block.text,
+            "start_ms": block.start_ms,
+            "end_ms": block.end_ms,
+            "exact_coverage": round(block.exact_coverage, 6),
+            "timing_coverage": round(block.timing_coverage, 6),
+            "confidence": round(block.confidence, 6),
+            "source_start": block.source_start,
+            "source_end": block.source_end,
+            "boundary_drift_ms": 0,
+        }
+        for index, block in enumerate(blocks, start=1)
+    ]
+    report["recognized"] = [
+        {
+            "text": item.text,
+            "start_ms": item.start_ms,
+            "end_ms": item.end_ms,
+            "confidence": round(item.confidence, 6),
+        }
+        for item in recognized
+    ]
+    return blocks, report
+
+
+def write_aligned_srt(path: Path, blocks: list[AlignedBlock]) -> None:
+    lines: list[str] = []
+    for index, block in enumerate(blocks, start=1):
+        lines.extend([
+            str(index),
+            (
+                f"{format_srt_timestamp(block.start_ms / 1000)} --> "
+                f"{format_srt_timestamp(block.end_ms / 1000)}"
+            ),
+            block.text.strip(),
+            "",
+        ])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
 def main() -> int:
     cli = parse_args()
     try:
@@ -198,6 +274,12 @@ def main() -> int:
         temperature = cli.temperature if cli.temperature is not None else float(cfg.get("temperature", 0.0))
         original_text = cli.text_file.read_text(encoding="utf-8-sig")
         output_srt = cli.output_srt or cli.audio_file.with_suffix(".srt")
+        output_timing = cli.output_timing_json or output_srt.with_suffix(
+            ".timing.json"
+        )
+        output_report = cli.output_report or output_srt.with_suffix(
+            ".alignment-report.json"
+        )
     except Exception as exc:
         print(f"Subtitle alignment setup failed: {exc}", file=sys.stderr)
         return 2
@@ -218,14 +300,37 @@ def main() -> int:
         print(f"Whisper transcription failed: {exc}", file=sys.stderr)
         return 1
 
-    chunks = split_original_text(original_text, cli.max_chars)
-    total_end = 0.0
-    segments = result.get("segments") or []
-    if segments:
-        total_end = float(segments[-1].get("end", 0.0) or 0.0)
-    units = expand_word_units(result)
-    blocks = build_subtitle_blocks(chunks, units, total_end)
-    write_srt(output_srt, blocks)
+    blocks, report = build_alignment_artifacts(
+        original_text,
+        result,
+        max_chars=cli.max_chars,
+    )
+    write_aligned_srt(output_srt, blocks)
+    timing_payload = {
+        "schema_version": 1,
+        "blocks": report["blocks"],
+        "recognized": report["recognized"],
+    }
+    output_timing.write_text(
+        json.dumps(timing_payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    report.update({
+        "schema_version": 1,
+        "status": "generated",
+        "audio_path": str(cli.audio_file),
+        "audio_sha256": sha256_file(cli.audio_file),
+        "approved_text_path": str(cli.text_file),
+        "approved_text_sha256": sha256_file(cli.text_file),
+        "srt_path": str(output_srt),
+        "srt_sha256": sha256_file(output_srt),
+        "timing_path": str(output_timing),
+        "timing_sha256": sha256_file(output_timing),
+    })
+    output_report.write_text(
+        json.dumps(report, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
     print(f"Subtitle aligned: {output_srt} ({len(blocks)} blocks)")
     return 0
 

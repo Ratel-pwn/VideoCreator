@@ -83,6 +83,9 @@ All reports identify the exact source files by SHA-256.
 Whisper supplies recognized words, timestamps, and confidence values. The
 aligner normalizes both the approved narration and recognized text into
 comparable characters while preserving a mapping back to the original text.
+Normalization removes non-visible punctuation, folds Latin case, and converts
+Traditional Chinese recognition output to Simplified Chinese before computing
+exact coverage or character error rate.
 
 The aligner performs monotonic sequence alignment between recognized characters
 and approved characters. Exact matches establish timing anchors. Small

@@ -90,6 +90,17 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--json", action="store_true")
     logs = mcp_sub.add_parser("logs")
     logs.add_argument("--lines", type=int, default=100)
+
+    for command, help_text in (
+        ("audit", "审查项目产物"),
+        ("repair", "自动修复项目产物"),
+    ):
+        command_parser = subcommands.add_parser(command, help=help_text)
+        targets = command_parser.add_subparsers(dest="target", required=True)
+        subtitles = targets.add_parser("subtitles", help="审查或修复字幕同步")
+        subtitles.add_argument("project", metavar="PROJECT", help="项目名称")
+        subtitles.add_argument("-r", "--run", dest="run_id", help="指定 run ID")
+        subtitles.add_argument("--json", action="store_true", help="使用 JSON 输出")
     return parser
 
 
@@ -293,6 +304,26 @@ def run_cli(
         workflow.import_chat(context)
         workflow.execute_from_current_stage(context)
         return 0
+    if args.command in {"audit", "repair"}:
+        import main as workflow
+
+        config = _load_config(config_path)
+        project = _project_root(_projects_root(home, config), args.project)
+        selected = select_run(project, args.run_id)
+        context = workflow.resume_context(home, config_path, selected.path)
+        result = workflow.audit_subtitles_for_context(
+            context,
+            allow_repair=args.command == "repair",
+        )
+        if args.global_json or args.json:
+            print(json.dumps(result, ensure_ascii=False, indent=2), file=stdout)
+        else:
+            print(
+                f"{result['status']}: "
+                f"{context.run_dir / 'review' / 'subtitle-sync-audit.json'}",
+                file=stdout,
+            )
+        return 0 if result["status"] == "passed" else 1
     if args.command in {"resume", "status", "runs"}:
         config = _load_config(config_path)
         project = _project_root(_projects_root(home, config), args.project)

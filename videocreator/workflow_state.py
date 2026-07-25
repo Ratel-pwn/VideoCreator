@@ -6,6 +6,7 @@ STAGES = (
     "draft_confirm",
     "tts",
     "tts_confirm",
+    "subtitle_sync",
     "visual_plan",
     "visual_plan_confirm",
     "visual_assets",

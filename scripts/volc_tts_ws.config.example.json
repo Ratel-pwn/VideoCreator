@@ -14,5 +14,7 @@
   "disable_markdown_filter": false,
   "uid": "chaos-museum",
   "speaker_id": "YOUR_SPEAKER_ID",
-  "clone_speaker_id": "YOUR_CLONE_SPEAKER_ID"
+  "clone_speaker_id": "YOUR_CLONE_SPEAKER_ID",
+  "voice_source_sha256": "",
+  "voice_source_speaker_id": ""
 }

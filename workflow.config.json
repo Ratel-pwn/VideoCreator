@@ -37,12 +37,24 @@
   },
   "tts": {
     "script": "scripts/volc_tts_ws.py",
+    "clone_script": "scripts/volc_clone_voice.py",
+    "voice_source_mode": "existing_speaker",
     "config": "scripts/volc_tts_ws.config.json",
     "output_format": "mp3"
   },
   "subtitle": {
     "script": "scripts/align_subtitles_with_whisper.py",
     "config": "scripts/whisper_batch_transcribe.config.json"
+  },
+  "subtitle_sync": {
+    "enabled": true,
+    "min_exact_match_coverage": 0.92,
+    "max_character_error_rate": 0.18,
+    "min_timing_coverage": 0.98,
+    "max_boundary_drift_ms": 700,
+    "max_unresolved_span_ms": 2000,
+    "min_block_confidence": 0.35,
+    "max_tts_regeneration_per_segment": 1
   },
   "projects": {
     "root": "projects"

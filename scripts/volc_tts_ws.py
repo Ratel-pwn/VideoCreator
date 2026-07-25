@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
+import subprocess
 import sys
+import tempfile
 import uuid
 from pathlib import Path
 from typing import Any
@@ -44,6 +47,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--subtitle-output", type=Path, default=None, help="Optional SRT output path.")
     parser.add_argument("--uid", default=None, help="Optional user uid for request context.")
     parser.add_argument("--no-subtitle", action="store_true", help="Disable subtitle generation in request.")
+    parser.add_argument("--segment-manifest", type=Path, default=None, help="Retain TTS chunks and write their manifest.")
+    parser.add_argument("--repair-segment", default=None, help="Regenerate one segment from an existing manifest.")
     return parser.parse_args()
 
 
@@ -160,6 +165,8 @@ def coalesce_config(cli: argparse.Namespace, cfg: dict[str, Any]) -> dict[str, A
         "speech_rate": int(cfg.get("speech_rate", 0)),
         "loudness_rate": int(cfg.get("loudness_rate", 0)),
         "disable_markdown_filter": bool(cfg.get("disable_markdown_filter", False)),
+        "segment_manifest": cli.segment_manifest,
+        "repair_segment": cli.repair_segment,
     }
 
 
@@ -336,19 +343,160 @@ def synthesize_chunk(settings: dict[str, Any], text: str) -> tuple[bytes, list[t
     return b"".join(audio_chunks), subtitle_blocks
 
 
+def write_audio_chunks(
+    chunks: list[bytes],
+    output: Path,
+    *,
+    audio_format: str,
+    runner: Any = subprocess.run,
+) -> int:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    if len(chunks) == 1:
+        output.write_bytes(chunks[0])
+        return len(chunks[0])
+
+    with tempfile.TemporaryDirectory(prefix="volc-tts-") as temp_dir_value:
+        temp_dir = Path(temp_dir_value)
+        concat_lines: list[str] = []
+        for index, data in enumerate(chunks, start=1):
+            chunk_path = temp_dir / f"chunk-{index:04d}.{audio_format}"
+            chunk_path.write_bytes(data)
+            escaped_path = chunk_path.resolve().as_posix().replace("'", "'\\''")
+            concat_lines.append(f"file '{escaped_path}'")
+        concat_file = temp_dir / "concat.txt"
+        concat_file.write_text("\n".join(concat_lines) + "\n", encoding="utf-8")
+        runner(
+            [
+                "ffmpeg",
+                "-y",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                str(concat_file),
+                "-vn",
+                str(output),
+            ],
+            check=True,
+            capture_output=True,
+        )
+    return output.stat().st_size
+
+
+def sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def write_tts_segment_manifest(
+    path: Path,
+    *,
+    segments: list[dict[str, Any]],
+    output: Path,
+    speaker_fingerprint: str,
+) -> dict[str, Any]:
+    payload = {
+        "schema_version": 1,
+        "output_path": str(output),
+        "output_sha256": sha256_file(output),
+        "speaker_fingerprint": speaker_fingerprint,
+        "segments": segments,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return payload
+
+
+def _segment_audio_path(manifest_path: Path, segment_id: str, audio_format: str) -> Path:
+    return manifest_path.parent / "segments" / f"{segment_id}.{audio_format}"
+
+
+def repair_tts_segment(
+    settings: dict[str, Any],
+    segment_id: str,
+    *,
+    max_attempts: int = 1,
+) -> tuple[int, list[tuple[float, float, str]], int]:
+    manifest_path = Path(settings["segment_manifest"])
+    manifest = load_config(manifest_path)
+    segments = manifest.get("segments") or []
+    target = next((item for item in segments if item.get("id") == segment_id), None)
+    if target is None:
+        raise ValueError(f"TTS segment not found: {segment_id}")
+    attempts = int(target.get("generation_attempts", 0))
+    if attempts >= max_attempts:
+        raise ValueError(f"TTS segment regeneration limit reached: {segment_id}")
+
+    audio_data, subtitle_blocks = synthesize_chunk(settings, str(target["text"]))
+    if not audio_data:
+        raise RuntimeError(f"TTS segment returned no audio: {segment_id}")
+    segment_path = Path(target["audio_path"])
+    segment_path.parent.mkdir(parents=True, exist_ok=True)
+    segment_path.write_bytes(audio_data)
+    target["audio_sha256"] = sha256_bytes(audio_data)
+    target["generation_attempts"] = attempts + 1
+
+    ordered_audio = [Path(item["audio_path"]).read_bytes() for item in segments]
+    output = Path(settings["output"])
+    audio_size = write_audio_chunks(
+        ordered_audio,
+        output,
+        audio_format=settings["format"],
+    )
+    write_tts_segment_manifest(
+        manifest_path,
+        segments=segments,
+        output=output,
+        speaker_fingerprint=manifest.get("speaker_fingerprint", ""),
+    )
+    return audio_size, subtitle_blocks, len(segments)
+
+
 def synthesize(settings: dict[str, Any]) -> tuple[int, list[tuple[float, float, str]], int]:
+    if settings.get("repair_segment"):
+        return repair_tts_segment(settings, str(settings["repair_segment"]))
+
     chunks = split_text(settings["text"])
     if not chunks:
         raise RuntimeError("no text chunks to synthesize")
 
     all_audio: list[bytes] = []
     all_subtitles: list[tuple[float, float, str]] = []
+    segment_records: list[dict[str, Any]] = []
     offset = 0.0
     for index, chunk in enumerate(chunks, start=1):
         audio_data, subtitle_blocks = synthesize_chunk(settings, chunk)
         if not audio_data:
             raise RuntimeError(f"chunk {index} returned no audio")
         all_audio.append(audio_data)
+        manifest_path = settings.get("segment_manifest")
+        if manifest_path:
+            segment_id = f"segment-{index:04d}"
+            segment_path = _segment_audio_path(
+                Path(manifest_path), segment_id, settings["format"]
+            )
+            segment_path.parent.mkdir(parents=True, exist_ok=True)
+            segment_path.write_bytes(audio_data)
+            segment_records.append({
+                "id": segment_id,
+                "ordinal": index,
+                "text": chunk,
+                "text_sha256": sha256_bytes(chunk.encode("utf-8")),
+                "audio_path": str(segment_path),
+                "audio_sha256": sha256_bytes(audio_data),
+                "generation_attempts": 0,
+            })
         adjusted_blocks: list[tuple[float, float, str]] = []
         max_end = 0.0
         for start, end, text in subtitle_blocks:
@@ -362,10 +510,22 @@ def synthesize(settings: dict[str, Any]) -> tuple[int, list[tuple[float, float, 
             estimated = max(1.0, len(chunk) / 4.5)
             offset += estimated
 
-    audio_data = b"".join(all_audio)
-    settings["output"].parent.mkdir(parents=True, exist_ok=True)
-    settings["output"].write_bytes(audio_data)
-    return len(audio_data), all_subtitles, len(chunks)
+    audio_size = write_audio_chunks(
+        all_audio,
+        settings["output"],
+        audio_format=settings["format"],
+    )
+    if settings.get("segment_manifest"):
+        speaker_fingerprint = sha256_bytes(
+            str(settings.get("speaker_id", "")).encode("utf-8")
+        )
+        write_tts_segment_manifest(
+            Path(settings["segment_manifest"]),
+            segments=segment_records,
+            output=settings["output"],
+            speaker_fingerprint=speaker_fingerprint,
+        )
+    return audio_size, all_subtitles, len(chunks)
 
 
 def main() -> int:
