@@ -254,3 +254,40 @@ def test_cancel_preserves_completed_and_failed_jobs(
     assert after.status == terminal
     assert after.error == before.error
     assert after.cancel_requested is False
+
+
+def test_upgrade_failed_cancel_requested_row_can_explicitly_resume(
+    tmp_path: Path,
+):
+    database = tmp_path / "queue.sqlite3"
+    queue = JobQueue(database)
+    queue.enqueue("project", "run-1")
+    claimed = queue.claim("worker", lease_seconds=60)
+    queue.fail(claimed.id, "worker", "legacy failure")
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """
+            UPDATE jobs SET cancel_requested = 1
+            WHERE project = 'project' AND run_id = 'run-1'
+            """
+        )
+
+    resumed = JobQueue(database).resume_failed("project", "run-1")
+
+    assert resumed.status == "queued"
+    assert resumed.cancel_requested is False
+    assert resumed.error is None
+
+
+@pytest.mark.parametrize("terminal", ["completed", "cancelled"])
+def test_explicit_failed_resume_refuses_other_terminal_states(
+    tmp_path: Path,
+    terminal: str,
+):
+    queue = JobQueue(tmp_path / "queue.sqlite3")
+    queue.enqueue("project", "run-1")
+    claimed = queue.claim("worker", lease_seconds=60)
+    queue.complete(claimed.id, "worker", status=terminal)
+
+    with pytest.raises(ValueError, match="failed"):
+        queue.resume_failed("project", "run-1")

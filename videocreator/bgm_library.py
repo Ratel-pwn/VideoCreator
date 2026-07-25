@@ -6,6 +6,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from .media import probe_media
 from .templates import TemplateDefinition
@@ -71,6 +72,18 @@ def _optional_string(value: Any, field: str) -> str | None:
     return value or None
 
 
+def _source_url(value: Any) -> str | None:
+    normalized = _optional_string(value, "source_url")
+    if normalized is None:
+        return None
+    parsed = urlsplit(normalized)
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("source_url must use http or https")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("source_url must not contain userinfo")
+    return normalized
+
+
 def _load_track(audio_path: Path, level: str) -> BgmTrack:
     metadata_path = audio_path.with_suffix(".bgm.json")
     if not metadata_path.is_file():
@@ -118,7 +131,7 @@ def _load_track(audio_path: Path, level: str) -> BgmTrack:
         sha256=_sha256(audio_path),
         title=raw["title"],
         creator=_optional_string(raw.get("creator"), "creator"),
-        source_url=_optional_string(raw.get("source_url"), "source_url"),
+        source_url=_source_url(raw.get("source_url")),
         license=_optional_string(raw.get("license"), "license"),
         rights_status=str(raw.get("rights_status", "unknown")) or "unknown",
         subjects=_as_string_tuple(raw["subjects"], "subjects"),

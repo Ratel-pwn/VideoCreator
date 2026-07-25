@@ -272,7 +272,10 @@ class WorkflowService:
         state["status"] = "ready"
         state.pop("last_error", None)
         atomic_write_json(run / "state.json", state)
-        job = self.queue.enqueue(project, run_id)
+        try:
+            job = self.queue.resume_failed(project, run_id)
+        except (KeyError, ValueError) as exc:
+            raise ServiceError("state_conflict", str(exc)) from exc
         return {"project": project, "run_id": run_id, "status": job.status}
 
     def cancel_workflow(self, project: str, run_id: str) -> dict[str, Any]:

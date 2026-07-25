@@ -1,5 +1,6 @@
 import hashlib
 import json
+import shutil
 from dataclasses import replace
 from pathlib import Path
 
@@ -16,8 +17,15 @@ from videocreator.interactions import (
 
 
 class Context:
-    def __init__(self, root: Path):
-        self.run_id = "run-1"
+    def __init__(
+        self,
+        root: Path,
+        *,
+        project_name: str = "demo",
+        run_id: str = "run-1",
+    ):
+        self.project_name = project_name
+        self.run_id = run_id
         self.run_dir = root
         self.state = {"current_stage": "bgm", "status": "running"}
 
@@ -815,3 +823,200 @@ def test_resolution_ledger_requires_metadata_path_and_hash_agreement(
 
     with pytest.raises(RuntimeError, match="ledger|missing or changed"):
         bgm_workflow.resolve_bgm_for_run(req, ConsoleInteractionPort())
+
+
+def test_cleanup_removes_rejected_provisional_partial_and_orphan_candidates(
+    tmp_path,
+):
+    from videocreator import bgm_workflow
+
+    local = track(tmp_path / "local", track_id="local")
+    req = request(tmp_path, local_tracks=(local,))
+    rejected_fp = "a" * 64
+    provisional_fp = "b" * 64
+    orphan_fp = "c" * 64
+    req.download_dir.mkdir(parents=True, exist_ok=True)
+    rejected = req.download_dir / f"candidate-{rejected_fp}.mp3"
+    partial = req.download_dir / f".candidate-{provisional_fp}.mp3.part"
+    orphan = req.download_dir / f"candidate-{orphan_fp}.mp3"
+    rejected.write_bytes(b"rejected")
+    partial.write_bytes(b"partial")
+    orphan.write_bytes(b"orphan")
+    bgm_workflow._write_download_ledger(
+        req,
+        {
+            "schema_version": 1,
+            "request_fingerprint": bgm_workflow._request_fingerprint(req),
+            "candidates": {
+                rejected_fp: {
+                    "candidate_id": "rejected",
+                    "status": "rejected",
+                    "path": rejected.name,
+                    "reason": "probe failed",
+                },
+                provisional_fp: {
+                    "candidate_id": "provisional",
+                    "status": "provisional",
+                    "path": None,
+                    "path_stem": f"candidate-{provisional_fp}",
+                },
+            },
+        },
+    )
+
+    result = bgm_workflow.resolve_bgm_for_run(
+        req,
+        ConsoleInteractionPort(),
+    )
+
+    assert result.track.path.exists()
+    assert not rejected.exists()
+    assert not partial.exists()
+    assert not orphan.exists()
+    ledger = bgm_workflow._load_download_ledger(req)
+    assert {
+        entry["status"] for entry in ledger["candidates"].values()
+    } == {"cleaned"}
+    assert ledger["cleanup"]["status"] == "completed"
+
+
+def test_cleanup_plan_resumes_after_unlink_failure(tmp_path, monkeypatch):
+    from videocreator import bgm_workflow
+
+    local = track(tmp_path / "local", track_id="local")
+    req = request(tmp_path, local_tracks=(local,))
+    fingerprint = "d" * 64
+    req.download_dir.mkdir(parents=True, exist_ok=True)
+    stale = req.download_dir / f"candidate-{fingerprint}.mp3"
+    stale.write_bytes(b"stale")
+    bgm_workflow._write_download_ledger(
+        req,
+        {
+            "schema_version": 1,
+            "request_fingerprint": bgm_workflow._request_fingerprint(req),
+            "candidates": {
+                fingerprint: {
+                    "candidate_id": "stale",
+                    "status": "rejected",
+                    "path": stale.name,
+                    "reason": "probe failed",
+                },
+            },
+        },
+    )
+    original_unlink = bgm_workflow._unlink_candidate_artifact
+    monkeypatch.setattr(
+        bgm_workflow,
+        "_unlink_candidate_artifact",
+        lambda *_args: (_ for _ in ()).throw(OSError("crash during cleanup")),
+    )
+
+    with pytest.raises(OSError, match="crash during cleanup"):
+        bgm_workflow.resolve_bgm_for_run(req, ConsoleInteractionPort())
+    pending = bgm_workflow._load_download_ledger(req)
+    assert pending["cleanup"]["status"] == "pending"
+    assert stale.exists()
+
+    monkeypatch.setattr(
+        bgm_workflow,
+        "_unlink_candidate_artifact",
+        original_unlink,
+    )
+    resumed = bgm_workflow.resolve_bgm_for_run(req, ConsoleInteractionPort())
+
+    assert resumed.track.path.exists()
+    assert not stale.exists()
+    assert bgm_workflow._load_download_ledger(req)["cleanup"]["status"] == "completed"
+
+
+def test_copied_complete_bundle_does_not_replay_in_another_run(
+    tmp_path,
+    monkeypatch,
+):
+    from videocreator import bgm_workflow
+
+    candidate = online_candidate()
+    provider_calls = 0
+
+    def search(*_args, **_kwargs):
+        nonlocal provider_calls
+        provider_calls += 1
+        return [candidate]
+
+    def download(item, output_dir, **kwargs):
+        path = output_dir / f"{kwargs['output_name']}.mp3"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"audio")
+        return path
+
+    monkeypatch.setattr(bgm_workflow, "search_configured_providers", search)
+    monkeypatch.setattr(bgm_workflow, "download_candidate", download)
+    monkeypatch.setattr(bgm_workflow, "candidate_to_track", candidate_track)
+    first_root = tmp_path / "projects/demo/runs/run-1"
+    first_req = request(
+        first_root,
+        context=Context(first_root, project_name="demo", run_id="run-1"),
+    )
+    first = bgm_workflow.resolve_bgm_for_run(
+        first_req,
+        DurableInteractionPort(),
+    )
+
+    second_root = tmp_path / "projects/demo/runs/run-2"
+    second_download = second_root / "visual/bgm"
+    shutil.copytree(first_req.download_dir, second_download)
+    second_req = request(
+        second_root,
+        context=Context(second_root, project_name="demo", run_id="run-2"),
+        download_dir=second_download,
+    )
+    second = bgm_workflow.resolve_bgm_for_run(
+        second_req,
+        DurableInteractionPort(),
+    )
+
+    assert first.request_fingerprint != second.request_fingerprint
+    assert provider_calls == 2
+
+
+def test_local_media_directory_is_fsynced_before_resolution_commit(
+    tmp_path,
+    monkeypatch,
+):
+    from videocreator import bgm_workflow
+
+    req = request(
+        tmp_path,
+        local_tracks=(track(tmp_path / "local", track_id="local"),),
+    )
+    events = []
+    original_commit = bgm_workflow._commit_resolution
+    monkeypatch.setattr(
+        bgm_workflow,
+        "fsync_directory",
+        lambda _path: events.append("media_fsync"),
+    )
+
+    def commit(request_value, resolution):
+        assert events == ["media_fsync"]
+        events.append("resolution_commit")
+        return original_commit(request_value, resolution)
+
+    monkeypatch.setattr(bgm_workflow, "_commit_resolution", commit)
+
+    bgm_workflow.resolve_bgm_for_run(req, ConsoleInteractionPort())
+
+    assert events == ["media_fsync", "resolution_commit"]
+
+
+def test_defensive_source_url_redaction_removes_userinfo_and_signed_query():
+    from videocreator.bgm_workflow import _redact_url
+
+    redacted = _redact_url(
+        "https://user:SUPER-SECRET@example.test:8443/source"
+        "?X-Amz-Signature=SIGNED"
+    )
+
+    assert redacted == "https://example.test:8443/source"
+    assert "SUPER-SECRET" not in redacted
+    assert "SIGNED" not in redacted

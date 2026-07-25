@@ -6,6 +6,7 @@ import http.client
 import ipaddress
 import json
 import math
+import os
 import re
 import socket
 import ssl
@@ -18,6 +19,7 @@ from typing import Any, Callable, Iterable, Protocol
 from urllib.parse import quote, urlencode, urljoin, urlsplit, urlunsplit
 
 from .bgm_library import BgmTrack, SUPPORTED_AUDIO_SUFFIXES
+from .durable_io import fsync_directory
 from .bgm_selection import BgmQuery
 from .media import MediaMetadata, parse_ffprobe_json
 
@@ -752,6 +754,8 @@ def download_candidate(
                         raise BgmSearchError("download exceeds maximum size")
                     digest.update(chunk)
                     handle.write(chunk)
+                handle.flush()
+                os.fsync(handle.fileno())
             if total == 0:
                 raise BgmSearchError("download is empty")
             _reject_obvious_non_audio_signature(temporary_path)
@@ -759,7 +763,8 @@ def download_candidate(
                 temporary_path.read_bytes()
             ).hexdigest():
                 raise BgmSearchError("download hash verification failed")
-            temporary_path.replace(output_path)
+            os.replace(temporary_path, output_path)
+            fsync_directory(root)
             return output_path
 
         downloaded_path = _request_with_redirects(

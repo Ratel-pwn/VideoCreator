@@ -180,3 +180,26 @@ def test_track_missing_required_sidecar_fields_is_ineligible(tmp_path, monkeypat
 
     assert selected.level == "none"
     assert any("title" in warning for warning in selected.warnings)
+
+
+def test_local_track_source_url_rejects_userinfo_without_leaking_secret(
+    tmp_path,
+    monkeypatch,
+):
+    from videocreator.bgm_library import load_bgm_directory
+
+    write_track(
+        tmp_path,
+        "secret-url",
+        source_url="https://user:SUPER-SECRET@example.test/source",
+    )
+    monkeypatch.setattr(
+        "videocreator.bgm_library.probe_media",
+        lambda _: MediaMetadata("audio", "mp3", None, None, 1_000),
+    )
+
+    tracks, warnings = load_bgm_directory(tmp_path, "project")
+
+    assert tracks == ()
+    assert any("userinfo" in warning for warning in warnings)
+    assert "SUPER-SECRET" not in "\n".join(warnings)

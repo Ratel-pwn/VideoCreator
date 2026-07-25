@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
@@ -11,7 +12,7 @@ from typing import Any, Iterable
 from urllib.parse import urlsplit, urlunsplit
 
 from .bgm_library import BgmTrack, SUPPORTED_AUDIO_SUFFIXES
-from .durable_io import atomic_write_json
+from .durable_io import atomic_write_json, fsync_directory
 from .bgm_policy import BgmPolicy
 from .bgm_search import (
     DEFAULT_MAX_DOWNLOAD_BYTES,
@@ -45,6 +46,11 @@ _SENSITIVE_CONFIG_TERMS = (
     "token",
     "api_key",
     "apikey",
+)
+_CANDIDATE_ARTIFACT = re.compile(
+    r"^(?:candidate-(?P<final>[0-9a-f]{64})(?P<suffix>\.[a-z0-9]+)"
+    r"|\.(?:candidate)-(?P<partial>[0-9a-f]{64})"
+    r"(?P<partial_suffix>\.[a-z0-9]+)\.part)$"
 )
 
 
@@ -137,6 +143,8 @@ class BgmResolution:
 def _request_fingerprint(request: BgmResolutionRequest) -> str:
     return _canonical_hash(
         {
+            "project_name": request.context.project_name,
+            "run_id": request.context.run_id,
             "query": asdict(request.query),
             "policy": asdict(request.policy),
             "local_tracks": [
@@ -168,7 +176,16 @@ def _redact_url(value: str | None) -> str | None:
     if not value:
         return value
     parsed = urlsplit(value)
-    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+    hostname = parsed.hostname
+    if not hostname:
+        return None
+    host = f"[{hostname}]" if ":" in hostname else hostname
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    authority = f"{host}:{port}" if port is not None else host
+    return urlunsplit((parsed.scheme, authority, parsed.path, "", ""))
 
 
 def _relative_artifact(request: BgmResolutionRequest, path: Path) -> str:
@@ -779,22 +796,79 @@ def _cleanup_downloads(
     selected_path: Path | None,
 ) -> None:
     ledger = _load_download_ledger(request)
-    changed = False
     selected = selected_path.resolve() if selected_path else None
-    for fingerprint, entry in ledger["candidates"].items():
-        raw_path = entry.get("path")
-        if not raw_path or entry.get("status") != "validated":
-            continue
-        _validate_candidate_entry(request, fingerprint, entry)
-        path = _resolve_artifact(request, raw_path)
-        if selected is not None and path == selected:
-            continue
-        path.unlink(missing_ok=True)
-        entry["status"] = "cleaned"
-        entry["cleaned_at"] = _now()
-        changed = True
-    if changed:
+    selected_relative = (
+        _relative_artifact(request, selected) if selected is not None else None
+    )
+    cleanup = ledger.get("cleanup")
+    if not isinstance(cleanup, dict) or cleanup.get("status") != "pending":
+        paths = [
+            path.name
+            for path in _candidate_artifacts(request)
+            if selected is None or path.resolve() != selected
+        ]
+        cleanup = {
+            "status": "pending",
+            "paths": paths,
+            "selected": selected_relative,
+            "planned_at": _now(),
+        }
+        ledger["cleanup"] = cleanup
         _write_download_ledger(request, ledger)
+
+    paths = cleanup.get("paths")
+    if not isinstance(paths, list) or not all(
+        isinstance(path, str) for path in paths
+    ):
+        raise RuntimeError("Invalid BGM cleanup ledger")
+    for relative in paths:
+        _unlink_candidate_artifact(request, relative, selected)
+
+    for entry in ledger["candidates"].values():
+        raw_path = entry.get("path")
+        is_selected = (
+            selected_relative is not None and raw_path == selected_relative
+        )
+        if not is_selected:
+            entry["status"] = "cleaned"
+            entry["cleaned_at"] = _now()
+    cleanup["status"] = "completed"
+    cleanup["completed_at"] = _now()
+    _write_download_ledger(request, ledger)
+
+
+def _candidate_artifact_fingerprint(name: str) -> str | None:
+    match = _CANDIDATE_ARTIFACT.fullmatch(name)
+    if not match:
+        return None
+    suffix = match.group("suffix") or match.group("partial_suffix")
+    if suffix.casefold() not in SUPPORTED_AUDIO_SUFFIXES:
+        return None
+    return match.group("final") or match.group("partial")
+
+
+def _candidate_artifacts(request: BgmResolutionRequest) -> tuple[Path, ...]:
+    if not request.download_dir.is_dir():
+        return ()
+    return tuple(
+        path
+        for path in sorted(request.download_dir.iterdir())
+        if path.is_file()
+        and _candidate_artifact_fingerprint(path.name) is not None
+    )
+
+
+def _unlink_candidate_artifact(
+    request: BgmResolutionRequest,
+    relative: str,
+    selected: Path | None,
+) -> None:
+    if _candidate_artifact_fingerprint(relative) is None:
+        raise RuntimeError("Invalid BGM cleanup artifact")
+    path = _resolve_artifact(request, relative)
+    if selected is not None and path == selected:
+        return
+    path.unlink(missing_ok=True)
 
 
 def _finalize_resolution(
@@ -820,6 +894,7 @@ def _copy_durable(source: Path, destination: Path) -> None:
             output.flush()
             os.fsync(output.fileno())
         os.replace(temporary, destination)
+        fsync_directory(destination.parent)
     finally:
         temporary.unlink(missing_ok=True)
 

@@ -18,12 +18,12 @@ def atomic_write_json(path: Path, value: Any) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, target)
-        _fsync_directory(target.parent)
+        fsync_directory(target.parent)
     finally:
         temporary.unlink(missing_ok=True)
 
 
-def _fsync_directory(directory: Path) -> None:
+def fsync_directory(directory: Path) -> None:
     flags = os.O_RDONLY
     if hasattr(os, "O_DIRECTORY"):
         flags |= os.O_DIRECTORY

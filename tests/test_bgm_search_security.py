@@ -540,3 +540,42 @@ def test_download_can_use_deterministic_candidate_filename(tmp_path):
 
     assert path.name == f"candidate-{'a' * 64}.mp3"
     assert not list(tmp_path.glob("bgm-*"))
+
+
+def test_download_fsyncs_file_before_replace_and_parent_after(
+    tmp_path,
+    monkeypatch,
+):
+    from videocreator import bgm_search
+
+    events = []
+    original_replace = bgm_search.os.replace
+
+    monkeypatch.setattr(
+        bgm_search.os,
+        "fsync",
+        lambda _fd: events.append("file_fsync"),
+    )
+
+    def replace(source, destination):
+        events.append("replace")
+        original_replace(source, destination)
+
+    monkeypatch.setattr(bgm_search.os, "replace", replace)
+    monkeypatch.setattr(
+        bgm_search,
+        "fsync_directory",
+        lambda _path: events.append("dir_fsync"),
+        raising=False,
+    )
+
+    path = download_candidate(
+        candidate(),
+        tmp_path,
+        opener=RecordingOpener(FakeResponse(b"ID3audio")),
+        resolver=public_resolver,
+        output_name="candidate-" + "b" * 64,
+    )
+
+    assert path.is_file()
+    assert events == ["file_fsync", "replace", "dir_fsync"]

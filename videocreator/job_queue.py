@@ -148,6 +148,43 @@ class JobQueue:
             connection.commit()
         return self._job(row)
 
+    def resume_failed(
+        self,
+        project: str,
+        run_id: str,
+        action: str = "advance",
+    ) -> Job:
+        stamp = self.now().isoformat()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM jobs WHERE project = ? AND run_id = ?",
+                (project, run_id),
+            ).fetchone()
+            if not row:
+                connection.rollback()
+                raise KeyError(f"Job not found: {project}/{run_id}")
+            if row["status"] != "failed":
+                connection.rollback()
+                raise ValueError(
+                    f"Job can only resume from failed, not {row['status']}"
+                )
+            connection.execute(
+                """
+                UPDATE jobs SET action = ?, status = 'queued', worker_id = NULL,
+                    lease_until = NULL, cancel_requested = 0, error = NULL,
+                    updated_at = ?
+                WHERE id = ? AND status = 'failed'
+                """,
+                (action, stamp, row["id"]),
+            )
+            updated = connection.execute(
+                "SELECT * FROM jobs WHERE id = ?",
+                (row["id"],),
+            ).fetchone()
+            connection.commit()
+        return self._job(updated)
+
     def claim(self, worker_id: str, lease_seconds: int) -> Job | None:
         now = self.now()
         stamp = now.isoformat()

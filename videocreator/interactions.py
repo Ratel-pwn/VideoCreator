@@ -29,6 +29,7 @@ def interaction_fingerprint(
 
 class InteractionContext(Protocol):
     run_id: str
+    project_name: str
     run_dir: Path
     state: dict[str, Any]
 

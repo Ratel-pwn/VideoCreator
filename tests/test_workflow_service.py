@@ -1,4 +1,5 @@
 import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -196,3 +197,27 @@ def test_service_cancel_preserves_terminal_job_and_run_state(
     current = service.queue.get("demo", "run-1")
     assert current.status == terminal
     assert current.error == (None if terminal == "completed" else "original failure")
+
+
+def test_service_resumes_legacy_failed_job_with_cancel_requested(
+    tmp_path: Path,
+):
+    service = build_service(tmp_path)
+    service.initialize_project("demo", "chaos-museum")
+    service.start_workflow("demo", "A topic", run_id="run-1")
+    job = service.queue.claim("worker", 60)
+    service.queue.fail(job.id, "worker", "legacy failure")
+    with sqlite3.connect(service.queue.database_path) as connection:
+        connection.execute(
+            """
+            UPDATE jobs SET cancel_requested = 1
+            WHERE project = 'demo' AND run_id = 'run-1'
+            """
+        )
+
+    resumed = service.resume_workflow("demo", "run-1")
+
+    assert resumed["status"] == "queued"
+    current = service.queue.get("demo", "run-1")
+    assert current.cancel_requested is False
+    assert current.error is None
