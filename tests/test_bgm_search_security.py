@@ -1,4 +1,6 @@
+import io
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -68,6 +70,28 @@ class RecordingOpener:
             "timeout": timeout,
         })
         return self.responses.pop(0)
+
+
+class FakeProcess:
+    def __init__(
+        self,
+        stdout: bytes,
+        stderr: bytes = b"",
+        *,
+        returncode: int = 0,
+    ):
+        self.stdout = io.BytesIO(stdout)
+        self.stderr = io.BytesIO(stderr)
+        self.returncode = returncode
+        self.killed = False
+
+    def wait(self, timeout=None):
+        del timeout
+        return self.returncode
+
+    def kill(self):
+        self.killed = True
+        self.returncode = -9
 
 
 def public_resolver(host: str, port: int) -> tuple[str, ...]:
@@ -219,31 +243,147 @@ def test_candidate_promotion_rejects_archive_signature_before_probe(tmp_path):
 def test_default_media_probe_bounds_probe_size_analysis_time_and_runtime(
     tmp_path, monkeypatch
 ):
-    path = tmp_path / "candidate.mp3"
-    path.write_bytes(b"ID3audio")
+    path = tmp_path / "disguised-playlist.mp3"
+    path.write_bytes(b"#EXTM3U\nhttps://private.example.test/audio.ts\n")
     calls = []
+    payload = {
+        "streams": [{
+            "codec_type": "audio",
+            "codec_name": "mp3",
+            "duration": "1.0",
+        }],
+        "format": {"duration": "1.0"},
+    }
+    stdout = json.dumps(payload).encode()
 
     def runner(command, **kwargs):
         calls.append((command, kwargs))
-        payload = {
-            "streams": [{
-                "codec_type": "audio",
-                "codec_name": "mp3",
-                "duration": "1.0",
-            }],
-            "format": {"duration": "1.0"},
-        }
-        return type("Completed", (), {"stdout": json.dumps(payload).encode()})()
+        return type("Completed", (), {"stdout": stdout})()
+
+    def popen(command, **kwargs):
+        calls.append((command, kwargs))
+        return FakeProcess(stdout)
 
     monkeypatch.setattr("videocreator.bgm_search.subprocess.run", runner)
+    monkeypatch.setattr("videocreator.bgm_search.subprocess.Popen", popen)
 
     track = candidate_to_track(candidate(), path)
 
     command, kwargs = calls[0]
+    assert command[command.index("-protocol_whitelist") + 1] == "file"
+    assert command[command.index("-f") + 1] == "mp3"
+    assert command.index("-f") < command.index("-i")
+    assert "-show_entries" in command
     assert command[command.index("-probesize") + 1] == "5000000"
     assert command[command.index("-analyzeduration") + 1] == "5000000"
-    assert kwargs["timeout"] == 15
+    assert kwargs["stdin"] is subprocess.DEVNULL
     assert track.path == path
+
+
+@pytest.mark.parametrize("stream_name", ["stdout", "stderr"])
+def test_media_probe_terminates_while_output_exceeds_limit(
+    tmp_path, monkeypatch, stream_name
+):
+    path = tmp_path / "candidate.mp3"
+    path.write_bytes(b"ID3audio")
+    processes = []
+
+    def runner(*_args, **_kwargs):
+        return type(
+            "Completed",
+            (),
+            {"stdout": b"x" * (1024 * 1024 + 1)},
+        )()
+
+    def popen(*_args, **_kwargs):
+        oversized = b"x" * (1024 * 1024 + 1)
+        process = FakeProcess(
+            oversized if stream_name == "stdout" else b"",
+            oversized if stream_name == "stderr" else b"",
+        )
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr("videocreator.bgm_search.subprocess.run", runner)
+    monkeypatch.setattr("videocreator.bgm_search.subprocess.Popen", popen)
+
+    with pytest.raises(BgmSearchError, match="output exceeds"):
+        candidate_to_track(candidate(), path)
+
+    assert processes
+    assert processes[0].killed
+
+
+def test_pinned_https_opener_brackets_ipv6_host_and_preserves_sni(monkeypatch):
+    from videocreator import bgm_search
+
+    ipv6 = "2606:4700:4700::1111"
+    sockets = []
+    contexts = []
+    connections = []
+
+    class FakeSocket:
+        def close(self):
+            return None
+
+    class FakeContext:
+        def wrap_socket(self, value, *, server_hostname):
+            self.server_hostname = server_hostname
+            return value
+
+    class FakeRawResponse:
+        status = 200
+        headers = {}
+
+        def read(self, _size=-1):
+            return b""
+
+        def close(self):
+            return None
+
+    class FakeConnection:
+        def __init__(self, host, *, port, timeout):
+            self.host = host
+            self.port = port
+            self.timeout = timeout
+            self.sock = None
+            self.request_headers = None
+            connections.append(self)
+
+        def request(self, _method, _target, *, headers):
+            self.request_headers = headers
+
+        def getresponse(self):
+            return FakeRawResponse()
+
+        def close(self):
+            return None
+
+    def connect(address, *, timeout):
+        sockets.append((address, timeout))
+        return FakeSocket()
+
+    def create_context():
+        context = FakeContext()
+        contexts.append(context)
+        return context
+
+    monkeypatch.setattr(bgm_search.socket, "create_connection", connect)
+    monkeypatch.setattr(bgm_search.ssl, "create_default_context", create_context)
+    monkeypatch.setattr(bgm_search.http.client, "HTTPConnection", FakeConnection)
+
+    response = bgm_search._default_pinned_opener(
+        f"https://[{ipv6}]:8443/audio.mp3",
+        resolved_ip=ipv6,
+        server_hostname=ipv6,
+        timeout=30,
+    )
+    with response:
+        pass
+
+    assert sockets == [((ipv6, 8443), 30)]
+    assert contexts[0].server_hostname == ipv6
+    assert connections[0].request_headers["Host"] == f"[{ipv6}]:8443"
 
 
 @pytest.mark.parametrize("payload", [b"[]", b'{"query": []}'])

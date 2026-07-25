@@ -10,6 +10,7 @@ import re
 import socket
 import ssl
 import subprocess
+import threading
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,7 +29,18 @@ MAX_AGENT_CANDIDATES = 20
 MAX_AGENT_RESPONSE_BYTES = 200_000
 _MAX_REDIRECTS = 5
 _REDIRECT_STATUSES = {301, 302, 303, 307, 308}
+_MAX_PROBE_OUTPUT_BYTES = 1024 * 1024
+_PROBE_OUTPUT_CHUNK_BYTES = 64 * 1024
+_PROBE_TIMEOUT_SECONDS = 15
 _ALLOWED_RIGHTS_STATUS = {"unknown", "cleared", "public_domain"}
+_AUDIO_DEMUXERS = {
+    ".aac": "aac",
+    ".flac": "flac",
+    ".m4a": "mov",
+    ".mp3": "mp3",
+    ".ogg": "ogg",
+    ".wav": "wav",
+}
 _CONTENT_TYPE_SUFFIXES = {
     "audio/aac": ".aac",
     "audio/flac": ".flac",
@@ -213,10 +225,13 @@ def _default_pinned_opener(
         connection.sock = raw_socket
         target = urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
         default_port = 443 if parsed.scheme.lower() == "https" else 80
+        try:
+            is_ipv6 = ipaddress.ip_address(server_hostname).version == 6
+        except ValueError:
+            is_ipv6 = False
+        header_host = f"[{server_hostname}]" if is_ipv6 else server_hostname
         host_header = (
-            server_hostname
-            if port == default_port
-            else f"{server_hostname}:{port}"
+            header_host if port == default_port else f"{header_host}:{port}"
         )
         connection.request(
             "GET",
@@ -789,34 +804,143 @@ def _reject_non_finite_json_constant() -> None:
     raise BgmSearchError("agent numeric fields must be finite")
 
 
+def _run_bounded_process(
+    command: list[str],
+    *,
+    max_output_bytes: int = _MAX_PROBE_OUTPUT_BYTES,
+    timeout_seconds: int = _PROBE_TIMEOUT_SECONDS,
+    popen: Callable[..., Any] | None = None,
+) -> tuple[bytes, bytes]:
+    process_factory = popen or subprocess.Popen
+    try:
+        process = process_factory(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except OSError as exc:
+        raise BgmSearchError("candidate media probe failed") from exc
+
+    if process.stdout is None or process.stderr is None:
+        process.kill()
+        raise BgmSearchError("candidate media probe pipes are unavailable")
+
+    output: dict[str, list[bytes]] = {"stdout": [], "stderr": []}
+    output_size = 0
+    output_lock = threading.Lock()
+    exceeded = threading.Event()
+    reader_errors: list[Exception] = []
+
+    def terminate() -> None:
+        try:
+            process.kill()
+        except OSError:
+            pass
+
+    def drain(name: str, stream: Any) -> None:
+        nonlocal output_size
+        try:
+            while not exceeded.is_set():
+                chunk = stream.read(_PROBE_OUTPUT_CHUNK_BYTES)
+                if not chunk:
+                    return
+                if not isinstance(chunk, bytes):
+                    raise BgmSearchError(
+                        "candidate media probe output must be bytes"
+                    )
+                with output_lock:
+                    if output_size + len(chunk) > max_output_bytes:
+                        exceeded.set()
+                        terminate()
+                        return
+                    output_size += len(chunk)
+                    output[name].append(chunk)
+        except Exception as exc:
+            reader_errors.append(exc)
+            exceeded.set()
+            terminate()
+
+    readers = [
+        threading.Thread(
+            target=drain,
+            args=("stdout", process.stdout),
+            daemon=True,
+        ),
+        threading.Thread(
+            target=drain,
+            args=("stderr", process.stderr),
+            daemon=True,
+        ),
+    ]
+    for reader in readers:
+        reader.start()
+
+    timed_out = False
+    try:
+        process.wait(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        terminate()
+        process.wait()
+    finally:
+        for reader in readers:
+            reader.join(timeout=1)
+        if any(reader.is_alive() for reader in readers):
+            terminate()
+            raise BgmSearchError("candidate media probe pipes did not close")
+
+    if timed_out:
+        raise BgmSearchError("candidate media probe timed out")
+    if exceeded.is_set():
+        raise BgmSearchError("candidate media probe output exceeds maximum size")
+    if reader_errors:
+        error = reader_errors[0]
+        if isinstance(error, BgmSearchError):
+            raise error
+        raise BgmSearchError("candidate media probe output failed") from error
+    stdout = b"".join(output["stdout"])
+    stderr = b"".join(output["stderr"])
+    if process.returncode != 0:
+        detail = stderr.decode("utf-8", errors="replace").strip()
+        message = "candidate media probe failed"
+        if detail:
+            message += f": {detail[:500]}"
+        raise BgmSearchError(message)
+    return stdout, stderr
+
+
 def _bounded_probe_media(path: Path) -> MediaMetadata:
     try:
-        completed = subprocess.run(
-            [
-                "ffprobe",
-                "-v",
-                "error",
-                "-probesize",
-                "5000000",
-                "-analyzeduration",
-                "5000000",
-                "-show_streams",
-                "-show_format",
-                "-of",
-                "json",
-                str(path),
-            ],
-            check=True,
-            capture_output=True,
-            timeout=15,
-        )
-    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-        raise BgmSearchError("candidate media probe failed") from exc
-    if len(completed.stdout) > 1024 * 1024:
-        raise BgmSearchError("candidate media probe output exceeds maximum size")
+        demuxer = _AUDIO_DEMUXERS[path.suffix.lower()]
+    except KeyError as exc:
+        raise BgmSearchError(
+            "candidate media probe has unsupported audio suffix"
+        ) from exc
+    stdout, _ = _run_bounded_process(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-protocol_whitelist",
+            "file",
+            "-probesize",
+            "5000000",
+            "-analyzeduration",
+            "5000000",
+            "-f",
+            demuxer,
+            "-i",
+            str(path),
+            "-show_entries",
+            "stream=codec_type,codec_name,duration:format=duration",
+            "-of",
+            "json",
+        ],
+    )
     try:
         payload = json.loads(
-            completed.stdout.decode("utf-8"),
+            stdout.decode("utf-8"),
             parse_constant=lambda _: _reject_non_finite_json_constant(),
         )
     except (UnicodeDecodeError, json.JSONDecodeError, BgmSearchError) as exc:
