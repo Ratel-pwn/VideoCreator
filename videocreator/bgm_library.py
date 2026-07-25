@@ -38,6 +38,7 @@ class BgmTrack:
     avoid_for: tuple[str, ...]
     preferred_start_ms: int
     loopable: bool
+    metadata_sha256: str = ""
 
 
 @dataclass(frozen=True)
@@ -129,6 +130,7 @@ def _load_track(audio_path: Path, level: str) -> BgmTrack:
         avoid_for=_as_string_tuple(raw.get("avoid_for", []), "avoid_for"),
         preferred_start_ms=preferred_start_raw,
         loopable=loopable,
+        metadata_sha256=_sha256(metadata_path),
     )
 
 

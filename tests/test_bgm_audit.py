@@ -1,4 +1,5 @@
 import json
+import hashlib
 import math
 from dataclasses import replace
 from pathlib import Path
@@ -47,6 +48,7 @@ def make_result(tmp_path: Path):
         avoid_for=(),
         preferred_start_ms=0,
         loopable=True,
+        metadata_sha256=hashlib.sha256(metadata.read_bytes()).hexdigest(),
     )
     return BgmMixResult(
         narration_path=narration,
@@ -184,6 +186,34 @@ def test_narration_only_report_binds_authoritative_audio(tmp_path, monkeypatch):
     assert report["outputs"]["render_audio"]["path"] == str(narration)
     assert report["warnings"] == ["No eligible BGM candidate"]
     assert audit["status"] == "passed"
+
+
+def test_narration_only_audit_rejects_render_audio_other_than_narration(
+    tmp_path, monkeypatch
+):
+    from videocreator.bgm_audit import (
+        audit_bgm_render_audio,
+        write_narration_only_report,
+    )
+    from videocreator.media import MediaMetadata
+
+    narration = tmp_path / "narration.wav"
+    narration.write_bytes(b"same-audio")
+    copied = tmp_path / "copied.wav"
+    copied.write_bytes(narration.read_bytes())
+    monkeypatch.setattr(
+        "videocreator.bgm_audit.probe_media",
+        lambda _path: MediaMetadata("audio", "pcm", None, None, 5000),
+    )
+    report = write_narration_only_report(
+        narration, tmp_path / "report.json", []
+    )
+    report["outputs"]["render_audio"]["path"] = str(copied)
+
+    audit = audit_bgm_render_audio(copied, report)
+
+    assert audit["status"] == "failed"
+    assert "narration_only_not_narration" in finding_codes(audit)
 
 
 def test_audit_rejects_mutated_bgm_metadata(tmp_path):

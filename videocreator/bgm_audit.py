@@ -113,7 +113,7 @@ def write_bgm_mix_report(
                     result.bgm_duration_ms,
                 ),
                 "metadata_path": str(result.bgm.metadata_path),
-                "metadata_sha256": sha256_file(result.bgm.metadata_path),
+                "metadata_sha256": result.bgm.metadata_sha256,
                 "id": result.bgm.id,
                 "title": result.bgm.title,
                 "level": result.bgm.level,
@@ -185,8 +185,8 @@ def write_narration_only_report(
         "schema_version": 1,
         "mode": "narration_only",
         "status": "passed",
-        "inputs": {"narration": artifact},
-        "outputs": {"render_audio": artifact},
+        "inputs": {"narration": dict(artifact)},
+        "outputs": {"render_audio": dict(artifact)},
         "warnings": list(warnings),
         "findings": [],
     }
@@ -235,6 +235,38 @@ def audit_bgm_render_audio(
         )
 
     expected_render = _get_artifact(payload, "outputs", "render_audio")
+    narration_artifact = _get_artifact(payload, "inputs", "narration")
+    if mode == "narration_only":
+        narration_path = (
+            narration_artifact.get("path")
+            if narration_artifact is not None
+            else None
+        )
+        render_path = (
+            expected_render.get("path") if expected_render is not None else None
+        )
+        narration_hash = (
+            narration_artifact.get("sha256")
+            if narration_artifact is not None
+            else None
+        )
+        render_hash = (
+            expected_render.get("sha256")
+            if expected_render is not None
+            else None
+        )
+        same_path = (
+            isinstance(narration_path, str)
+            and isinstance(render_path, str)
+            and Path(narration_path).resolve() == Path(render_path).resolve()
+        )
+        if not same_path or narration_hash != render_hash:
+            findings.append(
+                _finding(
+                    "narration_only_not_narration",
+                    "Narration-only render audio must be the audited narration stem",
+                )
+            )
     if expected_render is None:
         findings.append(
             _finding(

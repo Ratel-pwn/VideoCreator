@@ -1,3 +1,4 @@
+import hashlib
 import json
 import subprocess
 from pathlib import Path
@@ -72,6 +73,23 @@ def test_project_valid_track_completely_overrides_template_and_global(tmp_path, 
 
     assert selected.level == "project"
     assert [track.id for track in selected.tracks] == ["project-track"]
+
+
+def test_loaded_track_freezes_sidecar_hash(tmp_path, monkeypatch):
+    from videocreator.bgm_library import load_bgm_directory
+
+    audio = write_track(tmp_path, "frozen")
+    metadata = audio.with_suffix(".bgm.json")
+    monkeypatch.setattr(
+        "videocreator.bgm_library.probe_media",
+        lambda _: MediaMetadata("audio", "mp3", None, None, 1_000),
+    )
+
+    tracks, _warnings = load_bgm_directory(tmp_path, "project")
+
+    assert tracks[0].metadata_sha256 == hashlib.sha256(
+        metadata.read_bytes()
+    ).hexdigest()
 
 
 def test_invalid_project_directory_does_not_mask_valid_template(tmp_path, monkeypatch):

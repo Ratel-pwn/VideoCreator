@@ -1,6 +1,7 @@
 import shutil
 import subprocess
 import re
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -70,7 +71,7 @@ def make_track(path: Path, *, loopable: bool = True) -> BgmTrack:
         path=path,
         metadata_path=metadata,
         level="project",
-        sha256="",
+        sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
         title="Integration",
         creator=None,
         source_url=None,
@@ -85,6 +86,7 @@ def make_track(path: Path, *, loopable: bool = True) -> BgmTrack:
         avoid_for=(),
         preferred_start_ms=0,
         loopable=loopable,
+        metadata_sha256=hashlib.sha256(metadata.read_bytes()).hexdigest(),
     )
 
 
@@ -111,8 +113,9 @@ def test_real_ffmpeg_mix_crops_or_loops_and_decodes(
     assert abs(result.mix_duration_ms - result.narration_duration_ms) <= 100
     assert prepared.is_file()
     assert final_mix.is_file()
-    graph = " ".join(" ".join(command) for command in result.command_parameters)
-    assert ("acrossfade" in graph) is expects_loop
+    assert (
+        result.bgm_duration_ms < result.narration_duration_ms
+    ) is expects_loop
     subprocess.run(
         ["ffmpeg", "-v", "error", "-i", str(final_mix), "-f", "null", "-"],
         check=True,

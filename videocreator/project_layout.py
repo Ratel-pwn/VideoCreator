@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,14 +12,6 @@ from .templates import LibrarySelection, TemplateDefinition, snapshot_template
 def _write_json(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 @dataclass(frozen=True)
@@ -70,7 +61,7 @@ def _snapshot_library_item(item: LibrarySelection | BgmLibrarySelection) -> dict
                     "sha256": track.sha256,
                     "metadata": {
                         "path": str(track.metadata_path),
-                        "sha256": _sha256(track.metadata_path),
+                        "sha256": track.metadata_sha256,
                     },
                     "provenance": {
                         "creator": track.creator,

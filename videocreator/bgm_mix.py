@@ -3,7 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import subprocess
+import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -106,8 +108,15 @@ def build_bgm_filter(
 
     settings = BgmMixSettings()
     narration_seconds = narration_duration_ms / 1000
-    fade_in_ms = min(policy.fade_in_ms, narration_duration_ms)
-    fade_out_ms = min(policy.fade_out_ms, narration_duration_ms)
+    requested_fade_ms = policy.fade_in_ms + policy.fade_out_ms
+    if requested_fade_ms > narration_duration_ms:
+        fade_in_ms = round(
+            narration_duration_ms * policy.fade_in_ms / requested_fade_ms
+        )
+        fade_out_ms = narration_duration_ms - fade_in_ms
+    else:
+        fade_in_ms = policy.fade_in_ms
+        fade_out_ms = policy.fade_out_ms
     fade_out_start_ms = max(0, narration_duration_ms - fade_out_ms)
     tail_parts = [
         f"atrim=duration={_number(narration_seconds)}",
@@ -172,6 +181,31 @@ def _run(
         raise BgmMixError(f"FFmpeg command failed{suffix}") from exc
 
 
+def _write_filter_script(root: Path, filter_graph: str) -> Path:
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        newline="\n",
+        prefix=".bgm-filter-",
+        suffix=".fffilter",
+        dir=root,
+        delete=False,
+    ) as handle:
+        handle.write(filter_graph)
+        handle.write("\n")
+        return Path(handle.name)
+
+
+def _temporary_sibling(output: Path) -> Path:
+    descriptor, value = tempfile.mkstemp(
+        prefix=f".{output.stem}.tmp-",
+        suffix=output.suffix,
+        dir=output.parent,
+    )
+    os.close(descriptor)
+    return Path(value)
+
+
 def _parse_loudnorm(stderr: str) -> tuple[float, float]:
     decoder = json.JSONDecoder()
     candidates: list[dict[str, Any]] = []
@@ -207,6 +241,17 @@ def _validate_audio(path: Path, label: str) -> int:
     if metadata.kind != "audio" or metadata.duration_ms <= 0:
         raise BgmMixError(f"{label} is not decodable audio")
     return metadata.duration_ms
+
+
+def _verify_selected_track(bgm: BgmTrack) -> None:
+    if not bgm.path.is_file() or sha256_file(bgm.path) != bgm.sha256:
+        raise BgmMixError("selected BGM audio hash mismatch")
+    if (
+        not bgm.metadata_sha256
+        or not bgm.metadata_path.is_file()
+        or sha256_file(bgm.metadata_path) != bgm.metadata_sha256
+    ):
+        raise BgmMixError("selected BGM metadata hash mismatch")
 
 
 def _mix_graph(policy: BgmPolicy, settings: BgmMixSettings) -> str:
@@ -250,150 +295,197 @@ def mix_bgm(
     narration = Path(narration)
     prepared_output = Path(prepared_output)
     mix_output = Path(mix_output)
-    narration_duration_ms = _validate_audio(narration, "narration")
-    bgm_duration_ms = _validate_audio(bgm.path, "BGM source")
-
-    preferred_start_ms = (
-        bgm.preferred_start_ms
-        if 0 <= bgm.preferred_start_ms < bgm_duration_ms
-        else 0
-    )
-    available_bgm_duration_ms = bgm_duration_ms - preferred_start_ms
-    if (
-        available_bgm_duration_ms < narration_duration_ms
-        and not bgm.loopable
-    ):
-        raise BgmMixError("track is too short and is not loopable")
-
+    source_paths = {narration.resolve(), bgm.path.resolve(), bgm.metadata_path.resolve()}
+    output_paths = {prepared_output.resolve(), mix_output.resolve()}
+    if len(output_paths) != 2 or source_paths & output_paths:
+        raise BgmMixError("BGM outputs must be distinct from inputs and each other")
     prepared_output.parent.mkdir(parents=True, exist_ok=True)
     mix_output.parent.mkdir(parents=True, exist_ok=True)
-    preparation_filter = build_bgm_filter(
-        available_bgm_duration_ms,
-        narration_duration_ms,
-        policy,
-    )
-    prepare_command = [
-        "ffmpeg",
-        "-y",
-        "-ss",
-        f"{preferred_start_ms / 1000:.3f}",
-        "-i",
-        str(bgm.path),
-        "-filter_complex",
-        preparation_filter,
-        "-map",
-        "[bgmout]",
-        "-ar",
-        str(settings.sample_rate),
-        "-ac",
-        "2",
-        "-c:a",
-        settings.output_codec,
-        str(prepared_output),
-    ]
-    _run(runner, prepare_command)
-    prepared_duration_ms = _validate_audio(prepared_output, "prepared BGM")
-    if abs(prepared_duration_ms - narration_duration_ms) > settings.duration_tolerance_ms:
-        raise BgmMixError(
-            "prepared BGM duration differs from narration duration: "
-            f"{prepared_duration_ms}ms vs {narration_duration_ms}ms"
+    prepared_output.unlink(missing_ok=True)
+    mix_output.unlink(missing_ok=True)
+    prepared_temporary: Path | None = None
+    mix_temporary: Path | None = None
+    filter_script: Path | None = None
+    published = False
+    try:
+        _verify_selected_track(bgm)
+        narration_duration_ms = _validate_audio(narration, "narration")
+        bgm_duration_ms = _validate_audio(bgm.path, "BGM source")
+
+        preferred_start_ms = (
+            bgm.preferred_start_ms
+            if 0 <= bgm.preferred_start_ms < bgm_duration_ms
+            else 0
+        )
+        available_bgm_duration_ms = bgm_duration_ms - preferred_start_ms
+        if (
+            available_bgm_duration_ms < narration_duration_ms
+            and not bgm.loopable
+        ):
+            raise BgmMixError("track is too short and is not loopable")
+
+        prepared_temporary = _temporary_sibling(prepared_output)
+        mix_temporary = _temporary_sibling(mix_output)
+        preparation_filter = build_bgm_filter(
+            available_bgm_duration_ms,
+            narration_duration_ms,
+            policy,
+        )
+        filter_script = _write_filter_script(
+            prepared_output.parent,
+            preparation_filter,
+        )
+        prepare_command = [
+            "ffmpeg",
+            "-y",
+            "-ss",
+            f"{preferred_start_ms / 1000:.3f}",
+            "-i",
+            str(bgm.path),
+            "-filter_complex_script",
+            str(filter_script),
+            "-map",
+            "[bgmout]",
+            "-ar",
+            str(settings.sample_rate),
+            "-ac",
+            "2",
+            "-c:a",
+            settings.output_codec,
+            str(prepared_temporary),
+        ]
+        _run(runner, prepare_command)
+        prepared_duration_ms = _validate_audio(
+            prepared_temporary,
+            "prepared BGM",
+        )
+        if (
+            abs(prepared_duration_ms - narration_duration_ms)
+            > settings.duration_tolerance_ms
+        ):
+            raise BgmMixError(
+                "prepared BGM duration differs from narration duration: "
+                f"{prepared_duration_ms}ms vs {narration_duration_ms}ms"
+            )
+
+        graph = _mix_graph(policy, settings)
+        mix_command = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(narration),
+            "-i",
+            str(prepared_temporary),
+            "-filter_complex",
+            graph,
+            "-map",
+            "[mixout]",
+            "-t",
+            f"{narration_duration_ms / 1000:.3f}",
+            "-ar",
+            str(settings.sample_rate),
+            "-ac",
+            "2",
+            "-c:a",
+            settings.output_codec,
+            str(mix_temporary),
+        ]
+        _run(runner, mix_command)
+        mix_duration_ms = _validate_audio(mix_temporary, "final mix")
+        if (
+            abs(mix_duration_ms - narration_duration_ms)
+            > settings.duration_tolerance_ms
+        ):
+            raise BgmMixError(
+                "final mix duration differs from narration duration: "
+                f"{mix_duration_ms}ms vs {narration_duration_ms}ms"
+            )
+
+        version_command = ["ffmpeg", "-version"]
+        version = _run(runner, version_command)
+        ffmpeg_version = str(getattr(version, "stdout", "")).splitlines()
+        ffmpeg_version_line = (
+            ffmpeg_version[0].strip() if ffmpeg_version else "unknown"
         )
 
-    graph = _mix_graph(policy, settings)
-    mix_command = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        str(narration),
-        "-i",
-        str(prepared_output),
-        "-filter_complex",
-        graph,
-        "-map",
-        "[mixout]",
-        "-t",
-        f"{narration_duration_ms / 1000:.3f}",
-        "-ar",
-        str(settings.sample_rate),
-        "-ac",
-        "2",
-        "-c:a",
-        settings.output_codec,
-        str(mix_output),
-    ]
-    _run(runner, mix_command)
-    mix_duration_ms = _validate_audio(mix_output, "final mix")
-    if abs(mix_duration_ms - narration_duration_ms) > settings.duration_tolerance_ms:
-        raise BgmMixError(
-            "final mix duration differs from narration duration: "
-            f"{mix_duration_ms}ms vs {narration_duration_ms}ms"
+        analysis_command = [
+            "ffmpeg",
+            "-hide_banner",
+            "-nostats",
+            "-i",
+            str(mix_temporary),
+            "-af",
+            f"loudnorm=I={_number(settings.target_lufs)}:"
+            f"LRA={_number(settings.loudness_range)}:"
+            f"TP={_number(settings.target_true_peak_dbtp)}:print_format=json",
+            "-f",
+            "null",
+            "-",
+        ]
+        analysis = _run(runner, analysis_command)
+        measured_lufs, true_peak_dbtp = _parse_loudnorm(
+            str(getattr(analysis, "stderr", ""))
         )
+        if not settings.min_lufs <= measured_lufs <= settings.max_lufs:
+            raise BgmMixError(
+                "measured loudness is outside the allowed range: "
+                f"{measured_lufs} LUFS"
+            )
+        if true_peak_dbtp > settings.max_true_peak_dbtp:
+            raise BgmMixError(
+                "measured true peak exceeds the allowed maximum: "
+                f"{true_peak_dbtp} dBTP"
+            )
 
-    version_command = ["ffmpeg", "-version"]
-    version = _run(runner, version_command)
-    ffmpeg_version = str(getattr(version, "stdout", "")).splitlines()
-    ffmpeg_version_line = ffmpeg_version[0].strip() if ffmpeg_version else "unknown"
+        warnings: list[str] = []
+        if bgm.rights_status.strip().lower() == "unknown":
+            warnings.append(f"BGM track {bgm.id} rights status is unknown")
 
-    analysis_command = [
-        "ffmpeg",
-        "-hide_banner",
-        "-nostats",
-        "-i",
-        str(mix_output),
-        "-af",
-        f"loudnorm=I={_number(settings.target_lufs)}:"
-        f"LRA={_number(settings.loudness_range)}:"
-        f"TP={_number(settings.target_true_peak_dbtp)}:print_format=json",
-        "-f",
-        "null",
-        "-",
-    ]
-    analysis = _run(runner, analysis_command)
-    measured_lufs, true_peak_dbtp = _parse_loudnorm(
-        str(getattr(analysis, "stderr", ""))
-    )
-    if not settings.min_lufs <= measured_lufs <= settings.max_lufs:
-        raise BgmMixError(
-            f"measured loudness is outside the allowed range: {measured_lufs} LUFS"
+        policy_payload = asdict(policy)
+        settings_payload = {
+            "settings": asdict(settings),
+            "ducking_presets": DUCKING,
+        }
+        commands = (
+            tuple(prepare_command),
+            tuple(mix_command),
+            tuple(analysis_command),
         )
-    if true_peak_dbtp > settings.max_true_peak_dbtp:
-        raise BgmMixError(
-            f"measured true peak exceeds the allowed maximum: {true_peak_dbtp} dBTP"
+        prepared_bgm_sha256 = sha256_file(prepared_temporary)
+        mix_sha256 = sha256_file(mix_temporary)
+        result = BgmMixResult(
+            narration_path=narration,
+            bgm=bgm,
+            prepared_bgm_path=prepared_output,
+            mix_path=mix_output,
+            narration_sha256=sha256_file(narration),
+            bgm_sha256=bgm.sha256,
+            prepared_bgm_sha256=prepared_bgm_sha256,
+            mix_sha256=mix_sha256,
+            narration_duration_ms=narration_duration_ms,
+            bgm_duration_ms=bgm_duration_ms,
+            prepared_bgm_duration_ms=prepared_duration_ms,
+            mix_duration_ms=mix_duration_ms,
+            measured_lufs=measured_lufs,
+            true_peak_dbtp=true_peak_dbtp,
+            policy_hash=_stable_hash(policy_payload),
+            configuration_hash=_stable_hash(settings_payload),
+            ffmpeg_version=ffmpeg_version_line,
+            command_parameters=commands,
+            settings=settings,
+            warnings=tuple(warnings),
         )
-
-    warnings: list[str] = []
-    if bgm.rights_status.strip().lower() == "unknown":
-        warnings.append(f"BGM track {bgm.id} rights status is unknown")
-
-    policy_payload = asdict(policy)
-    settings_payload = {
-        "settings": asdict(settings),
-        "ducking_presets": DUCKING,
-    }
-    commands = (
-        tuple(prepare_command),
-        tuple(mix_command),
-        tuple(analysis_command),
-    )
-    return BgmMixResult(
-        narration_path=narration,
-        bgm=bgm,
-        prepared_bgm_path=prepared_output,
-        mix_path=mix_output,
-        narration_sha256=sha256_file(narration),
-        bgm_sha256=sha256_file(bgm.path),
-        prepared_bgm_sha256=sha256_file(prepared_output),
-        mix_sha256=sha256_file(mix_output),
-        narration_duration_ms=narration_duration_ms,
-        bgm_duration_ms=bgm_duration_ms,
-        prepared_bgm_duration_ms=prepared_duration_ms,
-        mix_duration_ms=mix_duration_ms,
-        measured_lufs=measured_lufs,
-        true_peak_dbtp=true_peak_dbtp,
-        policy_hash=_stable_hash(policy_payload),
-        configuration_hash=_stable_hash(settings_payload),
-        ffmpeg_version=ffmpeg_version_line,
-        command_parameters=commands,
-        settings=settings,
-        warnings=tuple(warnings),
-    )
+        os.replace(prepared_temporary, prepared_output)
+        os.replace(mix_temporary, mix_output)
+        published = True
+        return result
+    finally:
+        if filter_script is not None:
+            filter_script.unlink(missing_ok=True)
+        if prepared_temporary is not None:
+            prepared_temporary.unlink(missing_ok=True)
+        if mix_temporary is not None:
+            mix_temporary.unlink(missing_ok=True)
+        if not published:
+            prepared_output.unlink(missing_ok=True)
+            mix_output.unlink(missing_ok=True)

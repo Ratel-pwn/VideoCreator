@@ -11,6 +11,7 @@ def track(track_id: str, **overrides) -> BgmTrack:
         "metadata_path": Path(f"{track_id}.bgm.json"),
         "level": "project",
         "sha256": "a" * 64,
+        "metadata_sha256": "b" * 64,
         "title": track_id,
         "creator": None,
         "source_url": None,
