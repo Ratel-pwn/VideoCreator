@@ -146,4 +146,3 @@ class WorkflowOutcome:
     status: str
     interaction: dict[str, Any] | None = None
     error: str | None = None
-

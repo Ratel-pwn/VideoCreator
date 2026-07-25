@@ -56,4 +56,3 @@ def test_cancellation_is_visible_to_worker_and_terminal_after_completion(tmp_pat
     queue.complete(claimed.id, "worker", status="cancelled")
 
     assert queue.get("project", "run-1").status == "cancelled"
-

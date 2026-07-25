@@ -217,4 +217,3 @@ class JobQueue:
                 (stamp, stamp),
             )
         return cursor.rowcount
-

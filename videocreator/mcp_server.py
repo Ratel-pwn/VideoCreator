@@ -93,4 +93,3 @@ def create_mcp_server(service: WorkflowService) -> FastMCP:
         return invoke(service.get_workflow_result, project, run_id, include_text or [])
 
     return server
-

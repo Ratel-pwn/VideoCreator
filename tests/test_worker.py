@@ -38,4 +38,3 @@ def test_worker_completes_or_records_failure(tmp_path: Path):
     assert failed.run_once()
     assert service.queue.get("demo", "run-1").status == "failed"
     assert service.queue.get("demo", "run-1").error == "boom"
-

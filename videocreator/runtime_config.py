@@ -71,4 +71,3 @@ class McpRuntimeConfig:
             allowed_hosts=tuple(str(value) for value in raw.get("allowed_hosts", ["127.0.0.1", "localhost"])),
             auth=AuthConfig(mode=mode, bearer_token_env=token_env, token=token),
         )
-

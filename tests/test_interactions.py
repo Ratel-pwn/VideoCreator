@@ -57,4 +57,3 @@ def test_answers_can_be_replayed_then_cleared_for_a_repeated_stage(tmp_path: Pat
     with pytest.raises(InteractionRequired) as repeated:
         port.ask(ctx, "approval", "Approve?", "confirmation", ("y", "n"))
     assert repeated.value.interaction["id"] != raised.value.interaction["id"]
-
