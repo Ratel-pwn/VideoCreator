@@ -21,6 +21,7 @@ Thumbs.db
 
 # Runtime outputs
 projects/**
+.runtime/
 
 library/**
 !library/style/

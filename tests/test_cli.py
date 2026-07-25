@@ -66,6 +66,17 @@ def test_templates_support_text_and_json_output():
     assert [item["id"] for item in values] == ["ai-daily", "chaos-museum", "product-intro", "science-explainer"]
 
 
+def test_mcp_status_dispatches_to_runtime(monkeypatch):
+    output = io.StringIO()
+    monkeypatch.setattr(
+        "videocreator.mcp_runtime.service_status",
+        lambda runtime: {"status": "running", "url": "http://127.0.0.1:8765/mcp"},
+    )
+
+    assert run_cli(["--home", str(REPO), "mcp", "status", "--json"], stdout=output) == 0
+    assert json.loads(output.getvalue())["status"] == "running"
+
+
 def test_init_supports_short_scriptable_arguments(tmp_path):
     config = config_for_projects(tmp_path)
     output = io.StringIO()
