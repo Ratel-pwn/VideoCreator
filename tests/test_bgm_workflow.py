@@ -1232,7 +1232,7 @@ def test_prior_root_candidate_layout_migrates_and_resumes_same_request(
     assert resumed.resolution_id == original.resolution_id
     assert resumed.track.path.parent == bgm_workflow._request_candidate_dir(req)
     assert resumed.track.path.exists()
-    assert not legacy_path.exists()
+    assert legacy_path.exists()
     rewritten_download = json.loads(
         download_ledger_path.read_text(encoding="utf-8")
     )
@@ -1251,5 +1251,193 @@ def test_prior_root_candidate_layout_migrates_and_resumes_same_request(
         "path"
     ].startswith(f"request-{resumed.request_fingerprint}/")
     assert rewritten_resolution["track"]["path"].startswith(
+        f"request-{resumed.request_fingerprint}/"
+    )
+
+
+def test_shared_legacy_flat_candidate_is_replicated_for_two_requests(
+    tmp_path,
+    monkeypatch,
+):
+    from videocreator import bgm_workflow
+
+    candidate = online_candidate("shared-legacy")
+
+    def download(item, output_dir, **kwargs):
+        path = output_dir / f"{kwargs['output_name']}.mp3"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"shared-legacy-media")
+        return path
+
+    monkeypatch.setattr(
+        bgm_workflow,
+        "search_configured_providers",
+        lambda *_args, **_kwargs: [candidate],
+    )
+    monkeypatch.setattr(bgm_workflow, "download_candidate", download)
+    monkeypatch.setattr(bgm_workflow, "candidate_to_track", candidate_track)
+    request_a = request(tmp_path)
+    result_a = bgm_workflow.resolve_bgm_for_run(
+        request_a,
+        DurableInteractionPort(),
+    )
+    owned_a_original = result_a.track.path
+    legacy_source = request_a.download_dir / owned_a_original.name
+    owned_a_original.replace(legacy_source)
+
+    download_a_path = bgm_workflow._download_ledger_path(request_a)
+    download_a = json.loads(download_a_path.read_text(encoding="utf-8"))
+    selected_a = next(
+        entry
+        for entry in download_a["candidates"].values()
+        if entry.get("candidate_id") == result_a.track.id
+    )
+    selected_a["path"] = legacy_source.name
+    selected_a["track"]["path"] = legacy_source.name
+    selected_a["track"]["metadata_path"] = legacy_source.name
+    cleanup_a = download_a.get("cleanup", {})
+    cleanup_a["paths"] = [
+        Path(path).name for path in cleanup_a.get("paths", [])
+    ]
+    if isinstance(cleanup_a.get("selected"), str):
+        cleanup_a["selected"] = Path(cleanup_a["selected"]).name
+    download_a_path.write_text(json.dumps(download_a), encoding="utf-8")
+    resolution_a_path = bgm_workflow._resolution_ledger_path(request_a)
+    resolution_a = json.loads(
+        resolution_a_path.read_text(encoding="utf-8")
+    )
+    resolution_a["track"]["path"] = legacy_source.name
+    resolution_a["track"]["metadata_path"] = legacy_source.name
+    resolution_a_path.write_text(json.dumps(resolution_a), encoding="utf-8")
+
+    request_b = request(
+        tmp_path,
+        query=replace(query(), subjects=("history",)),
+    )
+    fingerprint_b = bgm_workflow._request_fingerprint(request_b)
+    download_b = json.loads(json.dumps(download_a))
+    download_b["request_fingerprint"] = fingerprint_b
+    bgm_workflow._download_ledger_path(request_b).write_text(
+        json.dumps(download_b),
+        encoding="utf-8",
+    )
+    resolution_b = json.loads(json.dumps(resolution_a))
+    resolution_b["request_fingerprint"] = fingerprint_b
+    resolution_b["resolution_id"] = bgm_workflow._resolution_id(
+        fingerprint_b,
+        "bgm",
+        "provider",
+        result_a.track,
+    )
+    bgm_workflow._resolution_ledger_path(request_b).write_text(
+        json.dumps(resolution_b),
+        encoding="utf-8",
+    )
+
+    migrated_a = bgm_workflow.resolve_bgm_for_run(
+        request_a,
+        DurableInteractionPort(),
+    )
+    assert legacy_source.exists()
+    migrated_b = bgm_workflow.resolve_bgm_for_run(
+        request_b,
+        DurableInteractionPort(),
+    )
+
+    assert legacy_source.exists()
+    assert migrated_a.track.path.exists()
+    assert migrated_b.track.path.exists()
+    assert migrated_a.track.path != migrated_b.track.path
+    assert migrated_a.track.path.parent == (
+        bgm_workflow._request_candidate_dir(request_a)
+    )
+    assert migrated_b.track.path.parent == (
+        bgm_workflow._request_candidate_dir(request_b)
+    )
+    assert migrated_a.track.sha256 == migrated_b.track.sha256
+
+
+def test_legacy_migration_retry_fsyncs_existing_destination_before_ledger(
+    tmp_path,
+    monkeypatch,
+):
+    from videocreator import bgm_workflow
+
+    candidate = online_candidate("legacy-fsync-retry")
+
+    def download(item, output_dir, **kwargs):
+        path = output_dir / f"{kwargs['output_name']}.mp3"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"legacy-fsync-media")
+        return path
+
+    monkeypatch.setattr(
+        bgm_workflow,
+        "search_configured_providers",
+        lambda *_args, **_kwargs: [candidate],
+    )
+    monkeypatch.setattr(bgm_workflow, "download_candidate", download)
+    monkeypatch.setattr(bgm_workflow, "candidate_to_track", candidate_track)
+    req = request(tmp_path)
+    original = bgm_workflow.resolve_bgm_for_run(
+        req,
+        DurableInteractionPort(),
+    )
+    destination = original.track.path
+    legacy_source = req.download_dir / destination.name
+    destination.replace(legacy_source)
+    download_path = bgm_workflow._download_ledger_path(req)
+    download_ledger = json.loads(download_path.read_text(encoding="utf-8"))
+    selected = next(
+        entry
+        for entry in download_ledger["candidates"].values()
+        if entry.get("candidate_id") == original.track.id
+    )
+    selected["path"] = legacy_source.name
+    selected["track"]["path"] = legacy_source.name
+    selected["track"]["metadata_path"] = legacy_source.name
+    download_path.write_text(json.dumps(download_ledger), encoding="utf-8")
+    resolution_path = bgm_workflow._resolution_ledger_path(req)
+    resolution = json.loads(resolution_path.read_text(encoding="utf-8"))
+    resolution["track"]["path"] = legacy_source.name
+    resolution["track"]["metadata_path"] = legacy_source.name
+    resolution_path.write_text(json.dumps(resolution), encoding="utf-8")
+
+    monkeypatch.setattr(
+        bgm_workflow,
+        "fsync_directory",
+        lambda _path: (_ for _ in ()).throw(
+            OSError("crash after replace before directory fsync")
+        ),
+    )
+    with pytest.raises(OSError, match="crash after replace"):
+        bgm_workflow.resolve_bgm_for_run(
+            req,
+            DurableInteractionPort(),
+        )
+    assert destination.exists()
+    assert json.loads(download_path.read_text(encoding="utf-8"))[
+        "candidates"
+    ][bgm_workflow.candidate_fingerprint(candidate)]["path"] == (
+        legacy_source.name
+    )
+
+    fsynced = []
+    monkeypatch.setattr(
+        bgm_workflow,
+        "fsync_directory",
+        lambda path: fsynced.append(Path(path).resolve()),
+    )
+    resumed = bgm_workflow.resolve_bgm_for_run(
+        req,
+        DurableInteractionPort(),
+    )
+
+    assert bgm_workflow._request_candidate_dir(req) in fsynced
+    assert resumed.track.path == destination
+    assert legacy_source.exists()
+    assert json.loads(download_path.read_text(encoding="utf-8"))[
+        "candidates"
+    ][bgm_workflow.candidate_fingerprint(candidate)]["path"].startswith(
         f"request-{resumed.request_fingerprint}/"
     )

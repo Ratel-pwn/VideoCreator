@@ -519,16 +519,15 @@ def _verify_legacy_candidate_entry(
 def _move_legacy_candidate(source: Path, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     if destination.is_file():
-        if source.is_file() and _sha256_file(source) != _sha256_file(destination):
-            raise RuntimeError("Conflicting legacy BGM candidate migration")
-        source.unlink(missing_ok=True)
+        if source.is_file():
+            _copy_durable(source, destination)
+        else:
+            fsync_directory(destination.parent)
         return
     if not source.is_file():
         # Cleaned/rejected tombstones may outlive their deterministic file.
         return
-    os.replace(source, destination)
-    fsync_directory(destination.parent)
-    fsync_directory(source.parent)
+    _copy_durable(source, destination)
 
 
 def _migrate_legacy_cleanup_path(
@@ -1149,7 +1148,11 @@ def _finalize_resolution(
 
 
 def _copy_durable(source: Path, destination: Path) -> None:
-    if destination.is_file() and _sha256_file(destination) == _sha256_file(source):
+    source_digest = _sha256_file(source)
+    if destination.is_file():
+        if _sha256_file(destination) != source_digest:
+            raise RuntimeError("Conflicting durable copy destination")
+        fsync_directory(destination.parent)
         return
     temporary = destination.with_name(f".{destination.name}.part")
     temporary.unlink(missing_ok=True)
