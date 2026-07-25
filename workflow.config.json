@@ -56,6 +56,17 @@
     "min_block_confidence": 0.35,
     "max_tts_regeneration_per_segment": 1
   },
+  "bgm": {
+    "enabled": true,
+    "search_config": "config/bgm-search.local.json",
+    "final_lufs": -16.0,
+    "lufs_tolerance": 2.0,
+    "true_peak_dbtp": -1.5,
+    "max_duration_delta_ms": 100,
+    "crossfade_ms": 1500,
+    "max_agent_candidates": 20,
+    "max_agent_response_bytes": 200000
+  },
   "projects": {
     "root": "projects"
   },

@@ -11,6 +11,7 @@ STAGES = (
     "visual_plan_confirm",
     "visual_assets",
     "visual_assets_confirm",
+    "bgm",
     "video_render",
     "video_render_confirm",
     "done",

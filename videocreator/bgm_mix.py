@@ -84,6 +84,19 @@ def _stable_hash(value: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def bgm_policy_hash(policy: BgmPolicy) -> str:
+    return _stable_hash(asdict(policy))
+
+
+def mix_configuration_hash(settings: BgmMixSettings) -> str:
+    return _stable_hash(
+        {
+            "settings": asdict(settings),
+            "ducking_presets": DUCKING,
+        }
+    )
+
+
 def _number(value: float) -> str:
     return f"{value:.3f}".rstrip("0").rstrip(".")
 
@@ -100,13 +113,14 @@ def build_bgm_filter(
     track_duration_ms: int,
     narration_duration_ms: int,
     policy: BgmPolicy,
+    settings: BgmMixSettings | None = None,
 ) -> str:
     if track_duration_ms <= 0 or narration_duration_ms <= 0:
         raise BgmMixError("audio durations must be positive")
     if policy.fade_in_ms < 0 or policy.fade_out_ms < 0:
         raise BgmMixError("BGM fades must be non-negative")
 
-    settings = BgmMixSettings()
+    settings = settings or BgmMixSettings()
     narration_seconds = narration_duration_ms / 1000
     requested_fade_ms = policy.fade_in_ms + policy.fade_out_ms
     if requested_fade_ms > narration_duration_ms:
@@ -290,8 +304,10 @@ def mix_bgm(
     mix_output: Path,
     policy: BgmPolicy,
     runner: Callable[..., Any],
+    *,
+    settings: BgmMixSettings | None = None,
 ) -> BgmMixResult:
-    settings = BgmMixSettings()
+    settings = settings or BgmMixSettings()
     narration = Path(narration)
     prepared_output = Path(prepared_output)
     mix_output = Path(mix_output)
@@ -330,6 +346,7 @@ def mix_bgm(
             available_bgm_duration_ms,
             narration_duration_ms,
             policy,
+            settings,
         )
         filter_script = _write_filter_script(
             prepared_output.parent,
@@ -441,11 +458,6 @@ def mix_bgm(
         if bgm.rights_status.strip().lower() == "unknown":
             warnings.append(f"BGM track {bgm.id} rights status is unknown")
 
-        policy_payload = asdict(policy)
-        settings_payload = {
-            "settings": asdict(settings),
-            "ducking_presets": DUCKING,
-        }
         commands = (
             tuple(prepare_command),
             tuple(mix_command),
@@ -468,8 +480,8 @@ def mix_bgm(
             mix_duration_ms=mix_duration_ms,
             measured_lufs=measured_lufs,
             true_peak_dbtp=true_peak_dbtp,
-            policy_hash=_stable_hash(policy_payload),
-            configuration_hash=_stable_hash(settings_payload),
+            policy_hash=bgm_policy_hash(policy),
+            configuration_hash=mix_configuration_hash(settings),
             ffmpeg_version=ffmpeg_version_line,
             command_parameters=commands,
             settings=settings,

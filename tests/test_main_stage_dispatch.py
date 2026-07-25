@@ -14,8 +14,14 @@ def test_main_dispatch_covers_every_declared_stage():
     assert handlers["visual_plan"].__name__ == "run_visual_plan"
     assert handlers["subtitle_sync"].__name__ == "run_subtitle_sync"
     assert handlers["visual_assets"].__name__ == "run_visual_assets"
+    assert handlers["bgm"].__name__ == "run_bgm"
     assert handlers["video_render"].__name__ == "run_video_render"
     assert "not installed" not in inspect.getsource(handlers["video_render"])
+
+
+def test_bgm_stage_is_between_visual_assets_and_render():
+    assert STAGES.index("visual_assets_confirm") < STAGES.index("bgm")
+    assert STAGES.index("bgm") < STAGES.index("video_render")
 
 
 def test_execute_boundary_honors_cancellation_before_next_stage(monkeypatch):

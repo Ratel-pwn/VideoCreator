@@ -1,6 +1,29 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
+
+from .bgm_audit import audit_bgm_render_audio
+
+
+def ensure_bgm_mix_gate(
+    render_audio: Path,
+    report_path: Path,
+) -> dict[str, Any]:
+    result = audit_bgm_render_audio(Path(render_audio), Path(report_path))
+    if result["status"] != "passed":
+        codes = ", ".join(
+            sorted(
+                {
+                    str(finding.get("code", "unknown"))
+                    for finding in result.get("findings", ())
+                }
+            )
+        )
+        raise RuntimeError(
+            f"BGM render audio audit failed ({codes}): {report_path}"
+        )
+    return result
 
 
 def ms_to_frame(milliseconds: int, fps: int) -> int:

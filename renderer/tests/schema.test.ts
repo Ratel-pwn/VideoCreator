@@ -37,6 +37,27 @@ describe('render input', () => {
     });
 
     expect(value.captions).toEqual([]);
+    expect(Object.keys(value).filter((key) => key.toLowerCase().includes('audio'))).toEqual([
+      'audioPath',
+    ]);
+  });
+
+  it('keeps one authoritative audio path for a final BGM mix', () => {
+    const value = renderInputSchema.parse({
+      videoId: 'fixture-bgm',
+      width: 1920,
+      height: 1080,
+      fps: 25,
+      durationInFrames: 25,
+      audioPath: 'audio/final-mix.wav',
+      subtitlePath: 'subtitles/voice.srt',
+      backgroundColor: '#080b0f',
+      scenes: [scene],
+    });
+
+    expect(value.audioPath).toBe('audio/final-mix.wav');
+    expect('bgmPath' in value).toBe(false);
+    expect('narrationPath' in value).toBe(false);
   });
 
   it('accepts a complete editorial frame contract', () => {

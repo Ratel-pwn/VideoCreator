@@ -4,20 +4,45 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
+import shutil
 import subprocess
 import sys
 import urllib.error
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
 from videocreator.asset_manifest import audit_asset_manifest
+from videocreator.bgm_audit import (
+    write_bgm_mix_report,
+    write_narration_only_report,
+)
 from videocreator.durable_io import atomic_write_json
-from videocreator.bgm_library import resolve_bgm_library
+from videocreator.bgm_library import (
+    BgmLibrarySelection,
+    BgmTrack,
+    resolve_bgm_library,
+)
+from videocreator.bgm_mix import (
+    BgmMixResult,
+    BgmMixSettings,
+    bgm_policy_hash,
+    mix_bgm,
+    mix_configuration_hash,
+)
+from videocreator.bgm_policy import BgmPolicy, load_bgm_policy
+from videocreator.bgm_selection import build_bgm_query
+from videocreator.bgm_workflow import (
+    BgmResolution,
+    BgmResolutionRequest,
+    acknowledge_bgm_resolution,
+    resolve_bgm_for_run,
+)
 from videocreator.interactions import (
     ConsoleInteractionPort,
     InteractionPort,
@@ -25,11 +50,14 @@ from videocreator.interactions import (
     WorkflowOutcome,
 )
 from videocreator.media import (
-    clean_audio_and_srt,
-    detect_trailing_silence,
     probe_media,
 )
-from videocreator.render_contract import build_render_input, normalize_scenes, normalize_v2_scenes
+from videocreator.render_contract import (
+    build_render_input,
+    ensure_bgm_mix_gate,
+    normalize_scenes,
+    normalize_v2_scenes,
+)
 from videocreator.subtitle_sync import (
     SyncThresholds,
     audit_subtitle_sync,
@@ -59,6 +87,7 @@ STAGE_VISUAL_PLAN = "visual_plan"
 STAGE_VISUAL_PLAN_CONFIRM = "visual_plan_confirm"
 STAGE_VISUAL_ASSETS = "visual_assets"
 STAGE_VISUAL_ASSETS_CONFIRM = "visual_assets_confirm"
+STAGE_BGM = "bgm"
 STAGE_VIDEO_RENDER = "video_render"
 STAGE_VIDEO_RENDER_CONFIRM = "video_render_confirm"
 STAGE_DONE = "done"
@@ -73,6 +102,11 @@ FINAL_ARTIFACT_KEYS = {
     "voice_subtitle": False,
     "visual_plan": True,
     "asset_manifest": True,
+    "bgm_source": False,
+    "bgm_selection": True,
+    "bgm_prepared": False,
+    "final_mix": False,
+    "bgm_mix_report": True,
     "render_input": True,
     "voice_audio_cleaned": True,
     "voice_subtitle_cleaned": True,
@@ -1107,27 +1141,651 @@ def run_visual_assets(ctx: WorkflowContext) -> None:
 def confirm_visual_assets(ctx: WorkflowContext) -> None:
     print(f"????????{ctx.manifest['artifacts']['asset_manifest']}")
     if not ctx.config["confirm"].get("assets", True):
-        ctx.set_stage(STAGE_VIDEO_RENDER, status="ready")
+        ctx.set_stage(STAGE_BGM, status="ready")
         return
     decision = ask_confirmation(ctx, "visual-assets-approval", "视觉素材是否可用")
     if decision == "y":
         ctx.interactions.clear(ctx, "visual-assets-approval")
-        ctx.set_stage(STAGE_VIDEO_RENDER, status="ready")
+        ctx.set_stage(STAGE_BGM, status="ready")
         return
     if decision == "q":
         raise SystemExit(0)
     ctx.interactions.clear(ctx, "visual-assets-approval")
     print("??? visual-plan.json??????????????????")
     ctx.set_stage(STAGE_VISUAL_ASSETS, status="ready")
+
+
+def ensure_current_subtitle_sync_audit(
+    ctx: WorkflowContext,
+) -> dict[str, Any]:
+    result = audit_subtitles_for_context(ctx, allow_repair=False)
+    if result.get("status") != "passed":
+        codes = ", ".join(
+            sorted(
+                {
+                    str(item.get("code", "unknown"))
+                    for item in result.get("findings", ())
+                }
+            )
+        )
+        raise RuntimeError(
+            "BGM stage requires a passing narration/subtitle audit "
+            f"({codes})"
+        )
+    return result
+
+
+def _effective_bgm_policy(ctx: WorkflowContext) -> BgmPolicy:
+    if ctx.template is None:
+        raise RuntimeError("BGM stage requires a selected template")
+    policy = load_bgm_policy(ctx.template)
+    enabled = bool(ctx.config.get("bgm", {}).get("enabled", True))
+    return replace(policy, enabled=policy.enabled and enabled)
+
+
+def _stable_payload_hash(value: Any) -> str:
+    payload = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _workflow_bgm_config_hash(ctx: WorkflowContext) -> str:
+    return _stable_payload_hash(ctx.config.get("bgm", {}))
+
+
+def _effective_bgm_policy_hash(ctx: WorkflowContext) -> str:
+    return _stable_payload_hash(asdict(_effective_bgm_policy(ctx)))
+
+
+def bgm_mix_settings_for_context(ctx: WorkflowContext) -> BgmMixSettings:
+    config = ctx.config.get("bgm", {})
+    target_lufs = float(config.get("final_lufs", -16.0))
+    tolerance = float(config.get("lufs_tolerance", 2.0))
+    true_peak = float(config.get("true_peak_dbtp", -1.5))
+    duration_tolerance = int(config.get("max_duration_delta_ms", 100))
+    crossfade = int(config.get("crossfade_ms", 1500))
+    if not all(
+        math.isfinite(value)
+        for value in (target_lufs, tolerance, true_peak)
+    ):
+        raise ValueError("BGM loudness settings must be finite")
+    if tolerance < 0:
+        raise ValueError("BGM LUFS tolerance must be non-negative")
+    if duration_tolerance < 0:
+        raise ValueError("BGM duration tolerance must be non-negative")
+    if crossfade <= 0:
+        raise ValueError("BGM crossfade must be positive")
+    return BgmMixSettings(
+        crossfade_ms=crossfade,
+        target_lufs=target_lufs,
+        target_true_peak_dbtp=true_peak,
+        min_lufs=target_lufs - tolerance,
+        max_lufs=target_lufs + tolerance,
+        max_true_peak_dbtp=true_peak,
+        duration_tolerance_ms=duration_tolerance,
+    )
+
+
+def _load_bgm_search_config(ctx: WorkflowContext) -> dict[str, Any]:
+    value = str(
+        ctx.config.get("bgm", {}).get(
+            "search_config",
+            "config/bgm-search.local.json",
+        )
+    )
+    configured = resolve_path(ctx.repo_root, value)
+    candidates = [configured]
+    if configured.name.endswith(".local.json"):
+        candidates.append(
+            configured.with_name(
+                configured.name.removesuffix(".local.json") + ".example.json"
+            )
+        )
+    candidates.append(ctx.repo_root / "config" / "bgm-search.example.json")
+    for candidate in candidates:
+        if candidate.is_file():
+            payload = load_json(candidate)
+            if not isinstance(payload, dict):
+                raise RuntimeError(f"Invalid BGM search config: {candidate}")
+            return payload
+    return {}
+
+
+def ensure_bgm_library_snapshot(
+    ctx: WorkflowContext,
+    library: BgmLibrarySelection,
+) -> None:
+    snapshot_path = ctx.run_dir / "inputs" / "library.snapshot.json"
+    snapshot = load_json(snapshot_path) if snapshot_path.is_file() else {}
+    expected = snapshot.get("bgm")
+    if not isinstance(expected, dict):
+        if library.tracks:
+            raise RuntimeError("bgm_library_snapshot_mismatch")
+        return
+    if expected.get("level") != library.level:
+        raise RuntimeError("bgm_library_snapshot_mismatch")
+
+    def normalized_path(value: Any) -> str:
+        return str(Path(str(value)).resolve()).casefold()
+
+    expected_files = []
+    for item in expected.get("files", ()):
+        if not isinstance(item, dict):
+            raise RuntimeError("bgm_library_snapshot_mismatch")
+        metadata = item.get("metadata")
+        if not isinstance(metadata, dict):
+            raise RuntimeError("bgm_library_snapshot_mismatch")
+        expected_files.append(
+            (
+                normalized_path(item.get("path")),
+                item.get("sha256"),
+                normalized_path(metadata.get("path")),
+                metadata.get("sha256"),
+            )
+        )
+    actual_files = [
+        (
+            normalized_path(track.path),
+            track.sha256,
+            normalized_path(track.metadata_path),
+            track.metadata_sha256,
+        )
+        for track in library.tracks
+    ]
+    if sorted(expected_files) != sorted(actual_files):
+        raise RuntimeError("bgm_library_snapshot_mismatch")
+
+
+def _bgm_request_for_context(
+    ctx: WorkflowContext,
+) -> tuple[BgmResolutionRequest, tuple[str, ...]]:
+    if ctx.template is None:
+        raise RuntimeError("BGM stage requires a selected template")
+    artifacts = ctx.manifest.get("artifacts", {})
+    approved_path = artifacts.get("draft_approved")
+    approved_text = (
+        read_text(Path(approved_path))
+        if approved_path and Path(approved_path).is_file()
+        else ""
+    )
+    policy = _effective_bgm_policy(ctx)
+    library = resolve_bgm_library(
+        ctx.repo_root,
+        ctx.project_root,
+        ctx.template,
+    )
+    ensure_bgm_library_snapshot(ctx, library)
+    query = build_bgm_query(
+        str(ctx.project_config.get("title", "")),
+        ctx.topic,
+        approved_text,
+        ctx.template.id,
+        policy,
+    )
+    request = BgmResolutionRequest(
+        context=ctx,
+        local_tracks=library.tracks,
+        query=query,
+        policy=policy,
+        provider_config=_load_bgm_search_config(ctx),
+        download_dir=ctx.run_dir / "audio" / "bgm-downloads",
+    )
+    return request, library.warnings
+
+
+def resolve_bgm_for_context(ctx: WorkflowContext) -> BgmResolution:
+    request, library_warnings = _bgm_request_for_context(ctx)
+    setattr(ctx, "_bgm_resolution_request", request)
+    setattr(ctx, "_bgm_library_warnings", library_warnings)
+    resolution = resolve_bgm_for_run(request, ctx.interactions)
+    warnings = tuple(
+        dict.fromkeys((*library_warnings, *resolution.warnings))
+    )
+    return replace(resolution, warnings=warnings)
+
+
+def acknowledge_bgm_for_context(
+    ctx: WorkflowContext,
+    resolution: BgmResolution,
+) -> None:
+    request = getattr(ctx, "_bgm_resolution_request", None)
+    if not isinstance(request, BgmResolutionRequest):
+        request, _warnings = _bgm_request_for_context(ctx)
+    acknowledge_bgm_resolution(
+        request,
+        ctx.interactions,
+        resolution.resolution_id,
+    )
+
+
+def _copy_frozen_file(source: Path, destination: Path, expected_hash: str) -> None:
+    if not source.is_file() or sha256_file(source) != expected_hash:
+        raise RuntimeError(f"BGM source changed before freezing: {source}")
+    if destination.is_file() and sha256_file(destination) == expected_hash:
+        return
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.part")
+    temporary.unlink(missing_ok=True)
+    try:
+        shutil.copyfile(source, temporary)
+        if sha256_file(temporary) != expected_hash:
+            raise RuntimeError("Frozen BGM copy hash mismatch")
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def freeze_bgm_source(ctx: WorkflowContext, track: BgmTrack) -> BgmTrack:
+    suffix = track.path.suffix.casefold()
+    if not suffix:
+        raise RuntimeError("Selected BGM source has no file extension")
+    audio_path = ctx.run_dir / "audio" / f"bgm.source{suffix}"
+    _copy_frozen_file(track.path, audio_path, track.sha256)
+    if track.metadata_path.resolve() == track.path.resolve():
+        metadata_path = audio_path
+        metadata_hash = track.sha256
+    else:
+        metadata_path = ctx.run_dir / "audio" / "bgm.source.bgm.json"
+        _copy_frozen_file(
+            track.metadata_path,
+            metadata_path,
+            track.metadata_sha256,
+        )
+        metadata_hash = track.metadata_sha256
+    return replace(
+        track,
+        path=audio_path,
+        metadata_path=metadata_path,
+        sha256=sha256_file(audio_path),
+        metadata_sha256=metadata_hash,
+    )
+
+
+def _bgm_selection_payload(
+    ctx: WorkflowContext,
+    resolution: BgmResolution,
+    track: BgmTrack | None,
+) -> dict[str, Any]:
+    request = getattr(ctx, "_bgm_resolution_request", None)
+    library_warnings = getattr(ctx, "_bgm_library_warnings", ())
+    if not isinstance(request, BgmResolutionRequest):
+        request, library_warnings = _bgm_request_for_context(ctx)
+    return {
+        "schema_version": 1,
+        "resolution_id": resolution.resolution_id,
+        "request_fingerprint": resolution.request_fingerprint,
+        "mode": resolution.mode,
+        "source": resolution.source,
+        "workflow_config_sha256": _workflow_bgm_config_hash(ctx),
+        "effective_policy_sha256": _effective_bgm_policy_hash(ctx),
+        "query": asdict(request.query),
+        "policy": asdict(request.policy),
+        "track": (
+            {
+                "id": track.id,
+                "title": track.title,
+                "path": str(track.path),
+                "sha256": track.sha256,
+                "metadata_path": str(track.metadata_path),
+                "metadata_sha256": track.metadata_sha256,
+                "level": track.level,
+                "creator": track.creator,
+                "source_url": track.source_url,
+                "license": track.license,
+                "rights_status": track.rights_status,
+            }
+            if track is not None
+            else None
+        ),
+        "scores": [asdict(score) for score in resolution.scores],
+        "warnings": list(
+            dict.fromkeys((*library_warnings, *resolution.warnings))
+        ),
+    }
+
+
+def _write_bgm_selection(
+    ctx: WorkflowContext,
+    resolution: BgmResolution,
+    track: BgmTrack | None,
+) -> Path:
+    path = ctx.run_dir / "audio" / "bgm-selection.json"
+    save_json(path, _bgm_selection_payload(ctx, resolution, track))
+    ctx.register_artifact("bgm_selection", path)
+    return path
+
+
+def register_bgm_artifacts(
+    ctx: WorkflowContext,
+    result: BgmMixResult,
+) -> None:
+    ctx.register_artifact("bgm_source", result.bgm.path)
+    if result.bgm.metadata_path != result.bgm.path:
+        ctx.register_artifact("bgm_source_metadata", result.bgm.metadata_path)
+    ctx.register_artifact("bgm_prepared", result.prepared_bgm_path)
+    ctx.register_artifact("final_mix", result.mix_path)
+
+
+def _bind_bgm_report_to_workflow(
+    ctx: WorkflowContext,
+    resolution: BgmResolution,
+    report_path: Path,
+) -> dict[str, Any]:
+    selection_path = Path(ctx.manifest["artifacts"]["bgm_selection"])
+    report = load_json(report_path)
+    if report.get("mode") == "bgm":
+        if report.get("configuration_sha256") != mix_configuration_hash(
+            bgm_mix_settings_for_context(ctx)
+        ):
+            raise RuntimeError("bgm_mix_configuration_mismatch")
+        if report.get("policy_sha256") != bgm_policy_hash(
+            _effective_bgm_policy(ctx)
+        ):
+            raise RuntimeError("bgm_mix_policy_mismatch")
+    report["workflow"] = {
+        "resolution_id": resolution.resolution_id,
+        "request_fingerprint": resolution.request_fingerprint,
+        "workflow_config_sha256": _workflow_bgm_config_hash(ctx),
+        "effective_policy_sha256": _effective_bgm_policy_hash(ctx),
+        "selection_sha256": sha256_file(selection_path),
+    }
+    save_json(report_path, report)
+    return report
+
+
+def _record_bgm_lineage(
+    ctx: WorkflowContext,
+    resolution: BgmResolution,
+    render_audio: Path,
+    report_path: Path,
+) -> None:
+    ctx.manifest.setdefault("lineage", {})["bgm"] = {
+        "resolution_id": resolution.resolution_id,
+        "request_fingerprint": resolution.request_fingerprint,
+        "mode": resolution.mode,
+        "source": resolution.source,
+        "narration": ctx.manifest["artifacts"]["voice_audio"],
+        "subtitle_sync_audit": ctx.manifest["artifacts"].get(
+            "subtitle_sync_audit"
+        ),
+        "selection": ctx.manifest["artifacts"]["bgm_selection"],
+        "render_audio": str(render_audio),
+        "render_audio_sha256": sha256_file(render_audio),
+        "mix_report": str(report_path),
+        "mix_report_sha256": sha256_file(report_path),
+    }
+    ctx.save_manifest()
+
+
+def _reuse_current_bgm_outputs(
+    ctx: WorkflowContext,
+    resolution: BgmResolution,
+    report_path: Path,
+) -> bool:
+    selection_path = ctx.run_dir / "audio" / "bgm-selection.json"
+    if not selection_path.is_file() or not report_path.is_file():
+        return False
+    selection = load_json(selection_path)
+    expected_config = _workflow_bgm_config_hash(ctx)
+    expected_policy = _effective_bgm_policy_hash(ctx)
+    if (
+        selection.get("resolution_id") != resolution.resolution_id
+        or selection.get("request_fingerprint")
+        != resolution.request_fingerprint
+        or selection.get("workflow_config_sha256") != expected_config
+        or selection.get("effective_policy_sha256") != expected_policy
+    ):
+        return False
+    report = load_json(report_path)
+    workflow = report.get("workflow")
+    if not isinstance(workflow, dict):
+        return False
+    if (
+        workflow.get("resolution_id") != resolution.resolution_id
+        or workflow.get("request_fingerprint")
+        != resolution.request_fingerprint
+        or workflow.get("workflow_config_sha256") != expected_config
+        or workflow.get("effective_policy_sha256") != expected_policy
+        or workflow.get("selection_sha256") != sha256_file(selection_path)
+    ):
+        return False
+
+    ctx.register_artifact("bgm_selection", selection_path)
+    ctx.register_artifact("bgm_mix_report", report_path)
+    if resolution.mode == "narration_only":
+        render_audio = Path(ctx.manifest["artifacts"]["voice_audio"])
+    elif resolution.mode == "bgm":
+        track = selection.get("track")
+        if not isinstance(track, dict) or not isinstance(track.get("path"), str):
+            return False
+        source_path = Path(track["path"])
+        prepared_path = ctx.run_dir / "audio" / "bgm.prepared.wav"
+        render_audio = ctx.run_dir / "audio" / "final-mix.wav"
+        ctx.register_artifact("bgm_source", source_path)
+        metadata_path = track.get("metadata_path")
+        if (
+            isinstance(metadata_path, str)
+            and Path(metadata_path) != source_path
+        ):
+            ctx.register_artifact(
+                "bgm_source_metadata",
+                Path(metadata_path),
+            )
+        ctx.register_artifact("bgm_prepared", prepared_path)
+        ctx.register_artifact("final_mix", render_audio)
+    else:
+        return False
+
+    ensure_bgm_mix_gate(render_audio, report_path)
+    if isinstance(ctx.manifest.get("lineage", {}).get("bgm"), dict):
+        _ensure_context_bgm_lineage(
+            ctx,
+            report,
+            report_path,
+            render_audio,
+        )
+    _record_bgm_lineage(
+        ctx,
+        resolution,
+        render_audio,
+        report_path,
+    )
+    acknowledge_bgm_for_context(ctx, resolution)
+    ctx.set_stage(STAGE_VIDEO_RENDER, status="ready")
+    return True
+
+
+def _clear_selected_bgm_artifacts(ctx: WorkflowContext) -> None:
+    artifacts = ctx.manifest.setdefault("artifacts", {})
+    for key in (
+        "bgm_source",
+        "bgm_source_metadata",
+        "bgm_prepared",
+        "final_mix",
+    ):
+        artifacts.pop(key, None)
+    ctx.save_manifest()
+
+
+def run_bgm(ctx: WorkflowContext) -> None:
+    ctx.set_stage(STAGE_BGM)
+    ensure_current_subtitle_sync_audit(ctx)
+    artifacts = ctx.manifest.get("artifacts", {})
+    narration_value = artifacts.get("voice_audio")
+    if not narration_value:
+        raise RuntimeError("BGM stage is missing voice_audio")
+    narration = Path(narration_value)
+    resolution = resolve_bgm_for_context(ctx)
+    report_path = ctx.run_dir / "audio" / "bgm-mix-report.json"
+    if _reuse_current_bgm_outputs(ctx, resolution, report_path):
+        return
+
+    if resolution.mode == "narration_only":
+        _clear_selected_bgm_artifacts(ctx)
+        _write_bgm_selection(ctx, resolution, None)
+        write_narration_only_report(
+            narration,
+            report_path,
+            resolution.warnings,
+        )
+        _bind_bgm_report_to_workflow(ctx, resolution, report_path)
+        ensure_bgm_mix_gate(narration, report_path)
+        ctx.register_artifact("bgm_mix_report", report_path)
+        _record_bgm_lineage(
+            ctx,
+            resolution,
+            narration,
+            report_path,
+        )
+        acknowledge_bgm_for_context(ctx, resolution)
+        ctx.set_stage(STAGE_VIDEO_RENDER, status="ready")
+        return
+
+    if resolution.mode != "bgm" or resolution.track is None:
+        raise RuntimeError(f"Unsupported BGM resolution mode: {resolution.mode}")
+    frozen_track = freeze_bgm_source(ctx, resolution.track)
+    _write_bgm_selection(ctx, resolution, frozen_track)
+    prepared_path = ctx.run_dir / "audio" / "bgm.prepared.wav"
+    mix_path = ctx.run_dir / "audio" / "final-mix.wav"
+    result = mix_bgm(
+        narration,
+        frozen_track,
+        prepared_path,
+        mix_path,
+        _effective_bgm_policy(ctx),
+        subprocess.run,
+        settings=bgm_mix_settings_for_context(ctx),
+    )
+    write_bgm_mix_report(result, report_path)
+    _bind_bgm_report_to_workflow(ctx, resolution, report_path)
+    ensure_bgm_mix_gate(mix_path, report_path)
+    register_bgm_artifacts(ctx, result)
+    ctx.register_artifact("bgm_mix_report", report_path)
+    _record_bgm_lineage(
+        ctx,
+        resolution,
+        mix_path,
+        report_path,
+    )
+    acknowledge_bgm_for_context(ctx, resolution)
+    ctx.set_stage(STAGE_VIDEO_RENDER, status="ready")
+
+
+def _ensure_context_bgm_lineage(
+    ctx: WorkflowContext,
+    report: dict[str, Any],
+    report_path: Path,
+    render_audio: Path,
+) -> None:
+    artifacts = ctx.manifest.get("artifacts", {})
+    selection_value = artifacts.get("bgm_selection")
+    if not selection_value:
+        raise RuntimeError("missing_bgm_selection")
+    selection_path = Path(selection_value)
+    if not selection_path.is_file():
+        raise RuntimeError("missing_bgm_selection")
+    selection = load_json(selection_path)
+    workflow = report.get("workflow")
+    if not isinstance(workflow, dict):
+        raise RuntimeError("missing_bgm_workflow_binding")
+    expected_config = _workflow_bgm_config_hash(ctx)
+    expected_policy = _effective_bgm_policy_hash(ctx)
+    if (
+        selection.get("workflow_config_sha256") != expected_config
+        or workflow.get("workflow_config_sha256") != expected_config
+    ):
+        raise RuntimeError("workflow_config_mismatch")
+    if (
+        selection.get("effective_policy_sha256") != expected_policy
+        or workflow.get("effective_policy_sha256") != expected_policy
+    ):
+        raise RuntimeError("bgm_policy_mismatch")
+    if (
+        workflow.get("resolution_id") != selection.get("resolution_id")
+        or workflow.get("request_fingerprint")
+        != selection.get("request_fingerprint")
+        or workflow.get("selection_sha256") != sha256_file(selection_path)
+    ):
+        raise RuntimeError("bgm_selection_report_mismatch")
+
+    if report.get("mode") == "bgm":
+        raw_settings = report.get("settings")
+        if not isinstance(raw_settings, dict):
+            raise RuntimeError("missing_bgm_mix_settings")
+        expected_settings = asdict(bgm_mix_settings_for_context(ctx))
+        for key, expected in expected_settings.items():
+            if raw_settings.get(key) != expected:
+                raise RuntimeError("bgm_mix_configuration_mismatch")
+        if report.get("configuration_sha256") != mix_configuration_hash(
+            bgm_mix_settings_for_context(ctx)
+        ):
+            raise RuntimeError("bgm_mix_configuration_mismatch")
+        if report.get("policy_sha256") != bgm_policy_hash(
+            _effective_bgm_policy(ctx)
+        ):
+            raise RuntimeError("bgm_mix_policy_mismatch")
+
+    lineage = ctx.manifest.get("lineage", {}).get("bgm")
+    if not isinstance(lineage, dict):
+        raise RuntimeError("missing_bgm_manifest_lineage")
+    if (
+        lineage.get("resolution_id") != workflow.get("resolution_id")
+        or lineage.get("request_fingerprint")
+        != workflow.get("request_fingerprint")
+        or lineage.get("mix_report_sha256") != sha256_file(report_path)
+        or lineage.get("render_audio_sha256") != sha256_file(render_audio)
+    ):
+        raise RuntimeError("bgm_manifest_lineage_mismatch")
+
+
+def resolve_context_render_audio(ctx: WorkflowContext) -> Path:
+    artifacts = ctx.manifest.get("artifacts", {})
+    report_value = artifacts.get("bgm_mix_report")
+    if not report_value:
+        raise RuntimeError("Video render is missing bgm_mix_report")
+    report_path = Path(report_value)
+    report = load_json(report_path)
+    mode = report.get("mode")
+    if mode == "bgm":
+        audio_value = artifacts.get("final_mix")
+        if not audio_value:
+            raise RuntimeError("BGM report requires final_mix")
+    elif mode == "narration_only":
+        audio_value = artifacts.get("voice_audio")
+        if not audio_value:
+            raise RuntimeError("Narration-only report requires voice_audio")
+    else:
+        raise RuntimeError(f"Invalid BGM report mode: {mode}")
+    render_audio = Path(audio_value)
+    ensure_bgm_mix_gate(render_audio, report_path)
+    _ensure_context_bgm_lineage(
+        ctx,
+        report,
+        report_path,
+        render_audio,
+    )
+    return render_audio
+
+
 def run_video_render(ctx: WorkflowContext) -> None:
     ctx.set_stage(STAGE_VIDEO_RENDER)
     artifacts = ctx.manifest.get("artifacts", {})
-    required = ("voice_audio", "voice_subtitle", "visual_plan", "asset_manifest")
+    required = (
+        "voice_audio",
+        "voice_subtitle",
+        "visual_plan",
+        "asset_manifest",
+        "bgm_mix_report",
+    )
     missing = [key for key in required if not artifacts.get(key)]
     if missing:
         raise RuntimeError(f"Video render is missing artifacts: {', '.join(missing)}")
 
-    audio_path = Path(artifacts["voice_audio"])
+    narration_path = Path(artifacts["voice_audio"])
     subtitle_path = Path(artifacts["voice_subtitle"])
     visual_plan_path = Path(artifacts["visual_plan"])
     asset_manifest_path = Path(artifacts["asset_manifest"])
@@ -1144,7 +1802,7 @@ def run_video_render(ctx: WorkflowContext) -> None:
         if not alignment_report:
             raise RuntimeError("Subtitle synchronization alignment report is missing")
         sync_result = ensure_subtitle_sync_gate(
-            audio_path,
+            narration_path,
             subtitle_path,
             Path(alignment_report),
             sync_audit_path,
@@ -1154,26 +1812,14 @@ def run_video_render(ctx: WorkflowContext) -> None:
             else None,
         )
 
-    duration_ms = probe_media(audio_path).duration_ms
-    spoken_end_ms = detect_trailing_silence(
-        audio_path, total_duration_ms=duration_ms
-    )
-    if spoken_end_ms is not None and duration_ms - spoken_end_ms >= 1_000:
-        render_audio, render_subtitle = clean_audio_and_srt(
-            audio_path,
-            subtitle_path,
-            ctx.run_dir / "audio",
-            subtitle_output_dir=ctx.run_dir / "subtitles",
-            spoken_end_ms=spoken_end_ms,
-        )
-    else:
-        spoken_end_ms = duration_ms
-        render_audio, render_subtitle = audio_path, subtitle_path
+    render_audio = resolve_context_render_audio(ctx)
+    render_subtitle = subtitle_path
+    spoken_end_ms = probe_media(render_audio).duration_ms
 
     if sync_result is not None:
         bind_render_inputs_to_sync_audit(
             sync_result,
-            audio_path=render_audio,
+            audio_path=narration_path,
             subtitle_path=render_subtitle,
             audit_output_path=sync_audit_path,
         )
@@ -1327,6 +1973,7 @@ def build_stage_handlers() -> dict[str, Any]:
         STAGE_VISUAL_PLAN_CONFIRM: confirm_visual_plan,
         STAGE_VISUAL_ASSETS: run_visual_assets,
         STAGE_VISUAL_ASSETS_CONFIRM: confirm_visual_assets,
+        STAGE_BGM: run_bgm,
         STAGE_VIDEO_RENDER: run_video_render,
         STAGE_VIDEO_RENDER_CONFIRM: confirm_video_render,
         STAGE_DONE: finish_workflow,

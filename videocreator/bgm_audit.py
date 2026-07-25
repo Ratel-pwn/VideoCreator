@@ -141,6 +141,11 @@ def write_bgm_mix_report(
             "target_lufs": result.settings.target_lufs,
             "loudness_range": result.settings.loudness_range,
             "target_true_peak_dbtp": result.settings.target_true_peak_dbtp,
+            "min_lufs": result.settings.min_lufs,
+            "max_lufs": result.settings.max_lufs,
+            "max_true_peak_dbtp": result.settings.max_true_peak_dbtp,
+            "duration_tolerance_ms": result.settings.duration_tolerance_ms,
+            "output_codec": result.settings.output_codec,
         },
         "measurement": {
             "integrated_lufs": result.measured_lufs,
@@ -428,7 +433,29 @@ def audit_bgm_render_audio(
             )
         else:
             try:
-                settings = BgmMixSettings()
+                raw_settings = payload.get("settings")
+                if not isinstance(raw_settings, dict):
+                    raise ValueError("missing settings")
+                settings = BgmMixSettings(
+                    sample_rate=int(raw_settings["sample_rate"]),
+                    channel_layout=str(raw_settings["channel_layout"]),
+                    crossfade_ms=int(raw_settings["crossfade_ms"]),
+                    bgm_gain_db=float(raw_settings["bgm_gain_db"]),
+                    target_lufs=float(raw_settings["target_lufs"]),
+                    loudness_range=float(raw_settings["loudness_range"]),
+                    target_true_peak_dbtp=float(
+                        raw_settings["target_true_peak_dbtp"]
+                    ),
+                    min_lufs=float(raw_settings["min_lufs"]),
+                    max_lufs=float(raw_settings["max_lufs"]),
+                    max_true_peak_dbtp=float(
+                        raw_settings["max_true_peak_dbtp"]
+                    ),
+                    duration_tolerance_ms=int(
+                        raw_settings["duration_tolerance_ms"]
+                    ),
+                    output_codec=str(raw_settings["output_codec"]),
+                )
                 findings.extend(
                     _measurement_findings(
                         narration_duration_ms=int(narration["duration_ms"]),

@@ -20,7 +20,9 @@ This skill manages the high-level sequence only.
 - visual_plan_confirm
 - visual_assets
 - visual_assets_confirm
-- video_stub
+- bgm
+- video_render
+- video_render_confirm
 - done
 
 ## Rules
@@ -32,8 +34,9 @@ This skill manages the high-level sequence only.
 - At `subtitle_sync`, audit the exact narration and SRT hashes. Apply only diagnosis-specific bounded repairs, and block the workflow if the resulting audit does not pass.
 - At `visual_plan`, use the template visual, pacing, and subtitle declarations and write run `visual/` artifacts.
 - At `visual_assets`, resolve reusable project `media/` and write manifests under run `visual/`.
+- At `bgm`, require a passing narration/subtitle audit, resolve local then online candidates, and write an audited final mix or an explicit narration-only fallback.
 - At `video_render`, freeze `render/render-input.json` and assemble `render/final.mp4` with Remotion.
-- Before `video_render`, require a fresh passing `review/subtitle-sync-audit.json`; never render stale or unaudited narration/subtitle pairs.
+- Before `video_render`, require fresh passing subtitle-sync and BGM audio reports; pass exactly one hash-verified authoritative audio path to Remotion.
 - Localized TTS repair may reuse the configured trained speaker ID, but must never retrain or create a voice.
 - Stop for confirmation at any stage whose config flag is true.
 - Scenario strategy belongs only to declarative templates.

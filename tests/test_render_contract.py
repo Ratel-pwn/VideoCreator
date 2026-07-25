@@ -1,6 +1,15 @@
+import hashlib
+import json
+from pathlib import Path
+
 import pytest
 
-from videocreator.render_contract import build_render_input, normalize_scenes, normalize_v2_scenes
+from videocreator.render_contract import (
+    build_render_input,
+    ensure_bgm_mix_gate,
+    normalize_scenes,
+    normalize_v2_scenes,
+)
 
 
 def test_normalize_scenes_absorbs_gaps_and_ends_at_audio_boundary():
@@ -63,6 +72,67 @@ def test_build_render_input_uses_last_scene_as_duration():
     assert value["fps"] == 25
     assert value["durationInFrames"] == 55
     assert value["audioPath"] == "audio/voice.cleaned.mp3"
+    assert set(value).isdisjoint({"bgmPath", "narrationPath"})
+
+
+def test_bgm_mix_gate_rejects_stale_authoritative_audio(tmp_path):
+    narration = tmp_path / "voice.wav"
+    bgm = tmp_path / "bgm.wav"
+    metadata = tmp_path / "bgm.bgm.json"
+    prepared = tmp_path / "bgm.prepared.wav"
+    final_mix = tmp_path / "final-mix.wav"
+    for path, content in (
+        (narration, b"voice"),
+        (bgm, b"bgm"),
+        (metadata, b"{}"),
+        (prepared, b"prepared"),
+        (final_mix, b"mix"),
+    ):
+        path.write_bytes(content)
+
+    def artifact(path: Path) -> dict:
+        return {
+            "path": str(path),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "duration_ms": 1000,
+        }
+
+    report = {
+        "schema_version": 1,
+        "mode": "bgm",
+        "status": "passed",
+        "inputs": {
+            "narration": artifact(narration),
+            "bgm": {
+                **artifact(bgm),
+                "metadata_path": str(metadata),
+                "metadata_sha256": hashlib.sha256(
+                    metadata.read_bytes()
+                ).hexdigest(),
+                "level": "project",
+            },
+        },
+        "outputs": {
+            "prepared_bgm": artifact(prepared),
+            "render_audio": artifact(final_mix),
+        },
+        "policy_sha256": "policy",
+        "configuration_sha256": "configuration",
+        "measurement": {
+            "integrated_lufs": -16.0,
+            "true_peak_dbtp": -1.5,
+        },
+        "ffmpeg": {"version": "ffmpeg fixture", "commands": []},
+        "provenance": {"rights_status": "cleared"},
+        "warnings": [],
+        "findings": [],
+    }
+    report_path = tmp_path / "bgm-mix-report.json"
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    final_mix.write_bytes(b"changed")
+
+    with pytest.raises(RuntimeError, match="artifact_hash_mismatch"):
+        ensure_bgm_mix_gate(final_mix, report_path)
 
 
 def test_build_render_input_maps_project_presentation_to_frame():
