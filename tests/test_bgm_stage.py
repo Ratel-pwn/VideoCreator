@@ -210,6 +210,19 @@ def test_selected_bgm_stage_registers_full_lineage(context, monkeypatch):
         value = {
             "mode": "bgm",
             "status": "passed",
+            "inputs": {
+                "narration": {
+                    "path": context.manifest["artifacts"]["voice_audio"],
+                    "sha256": main.sha256_file(
+                        Path(context.manifest["artifacts"]["voice_audio"])
+                    ),
+                },
+                "bgm": {"path": str(source)},
+            },
+            "outputs": {
+                "prepared_bgm": {"path": str(prepared)},
+                "render_audio": {"path": str(final_mix)},
+            },
             "settings": vars(settings),
             "policy_sha256": bgm_policy_hash(
                 main._effective_bgm_policy(context)
@@ -336,6 +349,91 @@ def test_bgm_stage_rejects_library_changed_after_run_snapshot(context):
         main.ensure_bgm_library_snapshot(context, library)
 
 
+def test_disabled_bgm_bypasses_library_resolution_and_snapshot(context, monkeypatch):
+    context.config["bgm"]["enabled"] = False
+    monkeypatch.setattr(
+        main,
+        "resolve_bgm_library",
+        lambda *_args: pytest.fail("disabled BGM must not resolve libraries"),
+    )
+    monkeypatch.setattr(
+        main,
+        "ensure_bgm_library_snapshot",
+        lambda *_args: pytest.fail("disabled BGM must not verify snapshots"),
+    )
+
+    resolved = main.resolve_bgm_for_context(context)
+
+    assert resolved.mode == "narration_only"
+    assert any("disabled" in warning.lower() for warning in resolved.warnings)
+
+
+def test_bgm_policy_is_loaded_from_immutable_run_snapshot(context):
+    template_root = context.template.root
+    template_root.mkdir(parents=True)
+    policy_path = template_root / "bgm.json"
+    original = {"enabled": True, "preferred_moods": ["reflective"]}
+    policy_path.write_text(json.dumps(original), encoding="utf-8")
+    context.template = SimpleNamespace(
+        id="demo",
+        root=template_root,
+        paths={"bgm": policy_path},
+    )
+    inputs = context.run_dir / "inputs"
+    inputs.mkdir()
+    snapshot = {
+        "id": "demo",
+        "files": {"bgm.json": main.sha256_file(policy_path)},
+        "bgm_policy": {
+            "source_path": "bgm.json",
+            "source_sha256": main.sha256_file(policy_path),
+            "content": original,
+            "content_sha256": main._stable_payload_hash(original),
+        },
+    }
+    (inputs / "template.snapshot.json").write_text(
+        json.dumps(snapshot),
+        encoding="utf-8",
+    )
+    policy_path.write_text(
+        json.dumps({"enabled": True, "preferred_moods": ["urgent"]}),
+        encoding="utf-8",
+    )
+
+    assert main._effective_bgm_policy(context).preferred_moods == ("reflective",)
+
+
+def test_legacy_run_freezes_bgm_policy_once(context):
+    template_root = context.template.root
+    template_root.mkdir(parents=True)
+    policy_path = template_root / "bgm.json"
+    policy_path.write_text(
+        json.dumps({"enabled": True, "preferred_moods": ["reflective"]}),
+        encoding="utf-8",
+    )
+    context.template = SimpleNamespace(
+        id="demo",
+        root=template_root,
+        paths={"bgm": policy_path},
+    )
+    inputs = context.run_dir / "inputs"
+    inputs.mkdir()
+    snapshot_path = inputs / "template.snapshot.json"
+    snapshot_path.write_text(json.dumps({"id": "demo", "files": {}}), encoding="utf-8")
+
+    first = main._effective_bgm_policy(context)
+    policy_path.write_text(
+        json.dumps({"enabled": True, "preferred_moods": ["urgent"]}),
+        encoding="utf-8",
+    )
+    second = main._effective_bgm_policy(context)
+
+    assert first.preferred_moods == ("reflective",)
+    assert second == first
+    frozen = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    assert frozen["bgm_policy"]["content"]["preferred_moods"] == ["reflective"]
+
+
 def test_narration_only_report_selects_original_narration(
     context,
     monkeypatch,
@@ -366,6 +464,56 @@ def test_narration_only_report_selects_original_narration(
 
     context.config["bgm"]["final_lufs"] = -14.0
     with pytest.raises(RuntimeError, match="workflow_config_mismatch"):
+        main.resolve_context_render_audio(context)
+
+
+def test_render_gate_rejects_sibling_run_selection_path(context, monkeypatch):
+    from videocreator.bgm_audit import write_narration_only_report
+
+    narration = Path(context.manifest["artifacts"]["voice_audio"])
+    report_path = context.run_dir / "audio" / "bgm-mix-report.json"
+    monkeypatch.setattr(
+        "videocreator.bgm_audit.probe_media",
+        lambda _path: MediaMetadata("audio", "mp3", None, None, 1000),
+    )
+    write_narration_only_report(narration, report_path, [])
+    fallback = resolution("narration_only")
+    selection_path = main._write_bgm_selection(context, fallback, None)
+    main._bind_bgm_report_to_workflow(context, fallback, report_path)
+    context.manifest["artifacts"]["bgm_mix_report"] = str(report_path)
+    main._record_bgm_lineage(context, fallback, narration, report_path)
+    sibling = context.project_root / "runs" / "run-002" / "audio"
+    sibling.mkdir(parents=True)
+    sibling_selection = sibling / "bgm-selection.json"
+    sibling_selection.write_bytes(selection_path.read_bytes())
+    context.manifest["artifacts"]["bgm_selection"] = str(sibling_selection)
+    context.manifest["lineage"]["bgm"]["selection"] = str(sibling_selection)
+
+    with pytest.raises(RuntimeError, match="bgm_artifact_outside_run"):
+        main.resolve_context_render_audio(context)
+
+
+def test_render_gate_requires_exact_current_narration_path(context, monkeypatch):
+    from videocreator.bgm_audit import write_narration_only_report
+
+    narration = Path(context.manifest["artifacts"]["voice_audio"])
+    sibling = context.project_root / "runs" / "run-002" / "audio"
+    sibling.mkdir(parents=True)
+    sibling_voice = sibling / "voice.mp3"
+    sibling_voice.write_bytes(narration.read_bytes())
+    report_path = context.run_dir / "audio" / "bgm-mix-report.json"
+    monkeypatch.setattr(
+        "videocreator.bgm_audit.probe_media",
+        lambda _path: MediaMetadata("audio", "mp3", None, None, 1000),
+    )
+    write_narration_only_report(sibling_voice, report_path, [])
+    fallback = resolution("narration_only")
+    main._write_bgm_selection(context, fallback, None)
+    main._bind_bgm_report_to_workflow(context, fallback, report_path)
+    context.manifest["artifacts"]["bgm_mix_report"] = str(report_path)
+    main._record_bgm_lineage(context, fallback, narration, report_path)
+
+    with pytest.raises(RuntimeError, match="bgm_narration_path_mismatch"):
         main.resolve_context_render_audio(context)
 
 

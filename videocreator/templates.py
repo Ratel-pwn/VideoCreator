@@ -125,4 +125,33 @@ def snapshot_template(template: TemplateDefinition) -> dict[str, Any]:
     files = {"template.json": _hash(template.root / "template.json")}
     for name, path in sorted(template.paths.items()):
         files[path.relative_to(template.root).as_posix()] = _hash(path)
-    return {"id": template.id, "version": template.version, "capabilities": list(template.capabilities), "files": files}
+    bgm_path = template.paths.get("bgm")
+    if bgm_path is None:
+        bgm_content: dict[str, Any] = {}
+        bgm_source_path = None
+        bgm_source_hash = None
+    else:
+        value = json.loads(bgm_path.read_text(encoding="utf-8-sig"))
+        if not isinstance(value, dict):
+            raise TemplateError(f"Invalid BGM policy: {bgm_path}")
+        bgm_content = value
+        bgm_source_path = bgm_path.relative_to(template.root).as_posix()
+        bgm_source_hash = files[bgm_source_path]
+    content_bytes = json.dumps(
+        bgm_content,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return {
+        "id": template.id,
+        "version": template.version,
+        "capabilities": list(template.capabilities),
+        "files": files,
+        "bgm_policy": {
+            "source_path": bgm_source_path,
+            "source_sha256": bgm_source_hash,
+            "content": bgm_content,
+            "content_sha256": hashlib.sha256(content_bytes).hexdigest(),
+        },
+    }

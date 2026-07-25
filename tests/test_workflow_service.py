@@ -106,6 +106,41 @@ def test_bgm_candidate_interaction_round_trips_unchanged(tmp_path: Path):
     assert resumed["interaction"] is None
 
 
+def test_service_rejects_oversized_bgm_response_before_queue_persistence(
+    tmp_path: Path,
+):
+    service = build_service(tmp_path)
+    service.initialize_project("demo", "chaos-museum")
+    service.start_workflow("demo", "A topic", run_id="run-1")
+    run = tmp_path / "projects/demo/runs/run-1"
+    state_path = run / "state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["status"] = "waiting_for_input"
+    state["pending_interaction"] = {
+        "id": "bgm-1",
+        "key": "bgm-online-candidates",
+        "kind": "bgm_candidates",
+        "prompt": "Find BGM",
+        "choices": [],
+        "payload": {
+            "limits": {"max_response_bytes": 80},
+            "response_schema": {
+                "properties": {"candidates": {"maxItems": 1}},
+            },
+        },
+    }
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    claimed = service.queue.claim("worker", 60)
+    service.queue.release_waiting(claimed.id, "worker")
+
+    response = json.dumps({"candidates": [], "padding": "x" * 100})
+    with pytest.raises(ServiceError, match="bytes"):
+        service.submit_workflow_input("demo", "run-1", "bgm-1", response)
+
+    job = service.queue.get("demo", "run-1")
+    assert service.queue.pending_inputs(job.id) == ()
+
+
 def test_cancelled_bgm_interaction_cannot_be_submitted_or_requeued(tmp_path: Path):
     service = build_service(tmp_path)
     service.initialize_project("demo", "chaos-museum")

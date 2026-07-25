@@ -181,3 +181,53 @@ def test_answer_audit_contains_only_bounded_hash_not_raw_response(tmp_path: Path
     assert "response" not in answered
     assert len(answered["response_sha256"]) == 64
     assert answered["response_bytes"] == len(secret.encode("utf-8"))
+
+
+@pytest.mark.parametrize(
+    "response, message",
+    [
+        (json.dumps({"candidates": [{"id": "a"}, {"id": "b"}]}), "candidates"),
+        (json.dumps({"candidates": [], "padding": "x" * 300}), "bytes"),
+    ],
+)
+def test_bgm_submission_bounds_apply_before_raw_response_persistence(
+    tmp_path: Path,
+    response: str,
+    message: str,
+):
+    ctx = Context(tmp_path)
+    port = DurableInteractionPort()
+    payload = {
+        "schema_version": 1,
+        "limits": {"max_response_bytes": 100},
+        "response_schema": {
+            "properties": {"candidates": {"maxItems": 1}},
+        },
+    }
+    with pytest.raises(InteractionRequired) as raised:
+        port.ask(
+            ctx,
+            "bgm-online-candidates",
+            "Find BGM",
+            "bgm_candidates",
+            payload=payload,
+        )
+
+    with pytest.raises(ValueError, match=message):
+        port.submit(ctx, raised.value.interaction["id"], response)
+
+    pending = ctx.state["pending_interaction"]
+    assert "response" not in pending
+    assert "submitted_interactions" not in ctx.state
+    audit = (tmp_path / "session/interactions.jsonl").read_text(encoding="utf-8")
+    assert response not in audit
+
+
+def test_bgm_submission_bounds_do_not_affect_other_interaction_kinds(tmp_path: Path):
+    ctx = Context(tmp_path)
+    port = DurableInteractionPort()
+    with pytest.raises(InteractionRequired) as raised:
+        port.ask(ctx, "note", "Provide note", "text")
+
+    response = "x" * 1000
+    assert port.submit(ctx, raised.value.interaction["id"], response) is True

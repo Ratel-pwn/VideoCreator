@@ -17,6 +17,7 @@ from .bgm_policy import BgmPolicy
 from .bgm_search import (
     DEFAULT_MAX_DOWNLOAD_BYTES,
     MAX_AGENT_CANDIDATES,
+    MAX_AGENT_RESPONSE_BYTES,
     BgmSearchError,
     OnlineBgmCandidate,
     candidate_to_track,
@@ -33,6 +34,8 @@ from .bgm_selection import (
 from .interactions import (
     InteractionContext,
     InteractionPort,
+    InteractionRequired,
+    clear_interaction_state,
     interaction_fingerprint,
 )
 
@@ -116,6 +119,8 @@ class BgmResolutionRequest:
     policy: BgmPolicy
     provider_config: dict[str, Any]
     download_dir: Path
+    max_agent_candidates: int = MAX_AGENT_CANDIDATES
+    max_agent_response_bytes: int = MAX_AGENT_RESPONSE_BYTES
 
     def __post_init__(self) -> None:
         download_dir = Path(self.download_dir).resolve()
@@ -125,6 +130,10 @@ class BgmResolutionRequest:
             raise ValueError("BGM download directory must stay inside the run") from exc
         object.__setattr__(self, "download_dir", download_dir)
         object.__setattr__(self, "local_tracks", tuple(self.local_tracks))
+        if not 1 <= self.max_agent_candidates <= MAX_AGENT_CANDIDATES:
+            raise ValueError("Invalid BGM Agent candidate limit")
+        if not 1 <= self.max_agent_response_bytes <= MAX_AGENT_RESPONSE_BYTES:
+            raise ValueError("Invalid BGM Agent response byte limit")
 
 
 @dataclass(frozen=True)
@@ -164,6 +173,10 @@ def _request_fingerprint(request: BgmResolutionRequest) -> str:
                 )
             ],
             "provider_config": _safe_provider_config(request.provider_config),
+            "agent_limits": {
+                "max_candidates": request.max_agent_candidates,
+                "max_response_bytes": request.max_agent_response_bytes,
+            },
         }
     )
 
@@ -263,9 +276,14 @@ def _score_from_dict(value: dict[str, Any]) -> CandidateScore:
     )
 
 
-def _query_payload(query: BgmQuery) -> dict[str, Any]:
+def _query_payload(
+    query: BgmQuery,
+    max_candidates: int = MAX_AGENT_CANDIDATES,
+    max_response_bytes: int = MAX_AGENT_RESPONSE_BYTES,
+) -> dict[str, Any]:
     return {
         "schema_version": 1,
+        "limits": {"max_response_bytes": max_response_bytes},
         "query": {
             "subjects": list(query.subjects),
             "moods": list(query.moods),
@@ -280,7 +298,7 @@ def _query_payload(query: BgmQuery) -> dict[str, Any]:
             "properties": {
                 "candidates": {
                     "type": "array",
-                    "maxItems": MAX_AGENT_CANDIDATES,
+                    "maxItems": max_candidates,
                     "items": {
                         "type": "object",
                         "additionalProperties": False,
@@ -1345,6 +1363,24 @@ def resolve_bgm_for_run(
             warnings,
         )
 
+    payload = _query_payload(
+        request.query,
+        request.max_agent_candidates,
+        request.max_agent_response_bytes,
+    )
+    expected_fingerprint = interaction_fingerprint("bgm_candidates", payload)
+    pending = request.context.state.get("pending_interaction")
+    if pending and pending.get("key") == INTERACTION_KEY:
+        stored_fingerprint = pending.get("fingerprint") or interaction_fingerprint(
+            str(pending.get("kind", "text")),
+            pending.get("payload"),
+        )
+        if stored_fingerprint == expected_fingerprint:
+            if not interaction_port.supports_agent_handoff:
+                raise InteractionRequired(pending)
+        else:
+            clear_interaction_state(request.context, INTERACTION_KEY)
+
     if not interaction_port.supports_agent_handoff:
         warnings.append("BGM Agent handoff is unavailable")
         return _narration_only(request, warnings)
@@ -1357,10 +1393,14 @@ def resolve_bgm_for_run(
             "the query and submit one JSON object matching response_schema"
         ),
         kind="bgm_candidates",
-        payload=_query_payload(request.query),
+        payload=payload,
     )
     try:
-        agent_candidates = parse_agent_candidates(response)
+        agent_candidates = parse_agent_candidates(
+            response,
+            max_candidates=request.max_agent_candidates,
+            max_response_bytes=request.max_agent_response_bytes,
+        )
     except BgmSearchError as exc:
         warnings.append(f"BGM Agent response was rejected: {exc}")
         return _narration_only(request, warnings)

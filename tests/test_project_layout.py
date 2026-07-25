@@ -15,10 +15,12 @@ def test_initialize_project_and_create_canonical_run(tmp_path):
         (template_root / name).write_text(name, encoding="utf-8")
     for name in ("pacing.json", "subtitle.json", "composition.json"):
         (template_root / name).write_text("{}", encoding="utf-8")
+    bgm_policy = {"enabled": True, "preferred_moods": ["reflective"]}
+    (template_root / "bgm.json").write_text(json.dumps(bgm_policy), encoding="utf-8")
     (template_root / "template.json").write_text(json.dumps({
         "id": "demo", "version": 1,
         "capabilities": ["prepare", "writing", "visual_planning", "final_assembly"],
-        "paths": {"prepare": "prepare.md", "writing": "writing.md", "visual_planning": "visual-planning.md", "pacing": "pacing.json", "subtitle": "subtitle.json", "composition": "composition.json"},
+        "paths": {"prepare": "prepare.md", "writing": "writing.md", "visual_planning": "visual-planning.md", "pacing": "pacing.json", "subtitle": "subtitle.json", "composition": "composition.json", "bgm": "bgm.json"},
     }), encoding="utf-8")
     template = load_template(tmp_path / "templates", "demo")
     project = initialize_project(tmp_path / "projects", "video", template)
@@ -30,6 +32,15 @@ def test_initialize_project_and_create_canonical_run(tmp_path):
     }
     assert run.visual_plan == run.root / "visual" / "visual-plan.json"
     assert (run.inputs / "template.snapshot.json").is_file()
+    template_snapshot = json.loads(
+        (run.inputs / "template.snapshot.json").read_text(encoding="utf-8")
+    )
+    assert template_snapshot["bgm_policy"]["content"] == bgm_policy
+    assert template_snapshot["bgm_policy"]["source_path"] == "bgm.json"
+    assert template_snapshot["bgm_policy"]["source_sha256"] == hashlib.sha256(
+        (template_root / "bgm.json").read_bytes()
+    ).hexdigest()
+    assert len(template_snapshot["bgm_policy"]["content_sha256"]) == 64
     assert (project / "library" / "bgm").is_dir()
 
 
@@ -40,9 +51,11 @@ def test_run_snapshots_bgm_audio_sidecar_hashes_and_provenance(tmp_path):
         (template_root / name).write_text(name, encoding="utf-8")
     for name in ("pacing.json", "subtitle.json", "composition.json"):
         (template_root / name).write_text("{}", encoding="utf-8")
+    bgm_policy = {"enabled": True, "preferred_moods": ["reflective"]}
+    (template_root / "bgm.json").write_text(json.dumps(bgm_policy), encoding="utf-8")
     (template_root / "template.json").write_text(json.dumps({
         "id": "demo", "version": 1, "capabilities": ["prepare", "writing", "visual_planning", "bgm"],
-        "paths": {"prepare": "prepare.md", "writing": "writing.md", "visual_planning": "visual-planning.md", "pacing": "pacing.json", "subtitle": "subtitle.json", "composition": "composition.json"},
+        "paths": {"prepare": "prepare.md", "writing": "writing.md", "visual_planning": "visual-planning.md", "pacing": "pacing.json", "subtitle": "subtitle.json", "composition": "composition.json", "bgm": "bgm.json"},
     }), encoding="utf-8")
     template = load_template(tmp_path / "templates", "demo")
     project = initialize_project(tmp_path / "projects", "video", template)

@@ -1178,7 +1178,44 @@ def ensure_current_subtitle_sync_audit(
 def _effective_bgm_policy(ctx: WorkflowContext) -> BgmPolicy:
     if ctx.template is None:
         raise RuntimeError("BGM stage requires a selected template")
-    policy = load_bgm_policy(ctx.template)
+    snapshot_path = ctx.run_dir / "inputs" / "template.snapshot.json"
+    snapshot = load_json(snapshot_path) if snapshot_path.is_file() else {}
+    frozen = snapshot.get("bgm_policy")
+    if not isinstance(frozen, dict):
+        selection_path = ctx.run_dir / "audio" / "bgm-selection.json"
+        selection = load_json(selection_path) if selection_path.is_file() else {}
+        recorded = selection.get("policy")
+        if isinstance(recorded, dict):
+            content = recorded
+        else:
+            content = asdict(load_bgm_policy(ctx.template))
+        source = ctx.template.paths.get("bgm")
+        source_path = (
+            source.relative_to(ctx.template.root).as_posix()
+            if source is not None
+            else None
+        )
+        source_hash = sha256_file(source) if source is not None else None
+        frozen = {
+            "source_path": source_path,
+            "source_sha256": source_hash,
+            "content": content,
+            "content_sha256": _stable_payload_hash(content),
+        }
+        snapshot["bgm_policy"] = frozen
+        if source_path is not None:
+            snapshot.setdefault("files", {})[source_path] = source_hash
+        save_json(snapshot_path, snapshot)
+    content = frozen.get("content")
+    if not isinstance(content, dict):
+        raise RuntimeError("bgm_policy_snapshot_invalid")
+    if frozen.get("content_sha256") != _stable_payload_hash(content):
+        raise RuntimeError("bgm_policy_snapshot_mismatch")
+    source_path = frozen.get("source_path")
+    if source_path is not None:
+        if frozen.get("source_sha256") != snapshot.get("files", {}).get(source_path):
+            raise RuntimeError("bgm_policy_snapshot_mismatch")
+    policy = BgmPolicy.from_dict(content)
     enabled = bool(ctx.config.get("bgm", {}).get("enabled", True))
     return replace(policy, enabled=policy.enabled and enabled)
 
@@ -1313,12 +1350,17 @@ def _bgm_request_for_context(
         else ""
     )
     policy = _effective_bgm_policy(ctx)
-    library = resolve_bgm_library(
-        ctx.repo_root,
-        ctx.project_root,
-        ctx.template,
-    )
-    ensure_bgm_library_snapshot(ctx, library)
+    if policy.enabled:
+        library = resolve_bgm_library(
+            ctx.repo_root,
+            ctx.project_root,
+            ctx.template,
+        )
+        ensure_bgm_library_snapshot(ctx, library)
+        provider_config = _load_bgm_search_config(ctx)
+    else:
+        library = BgmLibrarySelection("none", None, (), ())
+        provider_config = {}
     query = build_bgm_query(
         str(ctx.project_config.get("title", "")),
         ctx.topic,
@@ -1331,8 +1373,14 @@ def _bgm_request_for_context(
         local_tracks=library.tracks,
         query=query,
         policy=policy,
-        provider_config=_load_bgm_search_config(ctx),
+        provider_config=provider_config,
         download_dir=ctx.run_dir / "audio" / "bgm-downloads",
+        max_agent_candidates=int(
+            ctx.config.get("bgm", {}).get("max_agent_candidates", 20)
+        ),
+        max_agent_response_bytes=int(
+            ctx.config.get("bgm", {}).get("max_agent_response_bytes", 200000)
+        ),
     )
     return request, library.warnings
 
@@ -1682,10 +1730,51 @@ def _ensure_context_bgm_lineage(
     render_audio: Path,
 ) -> None:
     artifacts = ctx.manifest.get("artifacts", {})
+    run_root = ctx.run_dir.resolve()
+    audio_root = (ctx.run_dir / "audio").resolve()
+
+    def canonical(value: Any, *, code: str) -> Path:
+        path = Path(str(value)).resolve()
+        try:
+            path.relative_to(run_root)
+        except ValueError as exc:
+            raise RuntimeError("bgm_artifact_outside_run") from exc
+        if path.parent != audio_root:
+            raise RuntimeError(code)
+        return path
+
+    expected_report = audio_root / "bgm-mix-report.json"
+    if canonical(report_path, code="bgm_report_path_mismatch") != expected_report:
+        raise RuntimeError("bgm_report_path_mismatch")
+    if canonical(
+        artifacts.get("bgm_mix_report"),
+        code="bgm_report_path_mismatch",
+    ) != expected_report:
+        raise RuntimeError("bgm_report_path_mismatch")
+    voice_value = artifacts.get("voice_audio")
+    if not voice_value:
+        raise RuntimeError("bgm_narration_path_mismatch")
+    narration_path = canonical(
+        voice_value,
+        code="bgm_narration_path_mismatch",
+    )
+    report_narration = report.get("inputs", {}).get("narration", {})
+    if not isinstance(report_narration, dict):
+        raise RuntimeError("bgm_narration_path_mismatch")
+    if Path(str(report_narration.get("path"))).resolve() != narration_path:
+        raise RuntimeError("bgm_narration_path_mismatch")
+    if report_narration.get("sha256") != sha256_file(narration_path):
+        raise RuntimeError("bgm_narration_hash_mismatch")
+
     selection_value = artifacts.get("bgm_selection")
     if not selection_value:
         raise RuntimeError("missing_bgm_selection")
-    selection_path = Path(selection_value)
+    selection_path = canonical(
+        selection_value,
+        code="bgm_selection_path_mismatch",
+    )
+    if selection_path != audio_root / "bgm-selection.json":
+        raise RuntimeError("bgm_selection_path_mismatch")
     if not selection_path.is_file():
         raise RuntimeError("missing_bgm_selection")
     selection = load_json(selection_path)
@@ -1713,6 +1802,37 @@ def _ensure_context_bgm_lineage(
         raise RuntimeError("bgm_selection_report_mismatch")
 
     if report.get("mode") == "bgm":
+        expected_prepared = audio_root / "bgm.prepared.wav"
+        expected_mix = audio_root / "final-mix.wav"
+        if canonical(
+            artifacts.get("bgm_prepared"),
+            code="bgm_prepared_path_mismatch",
+        ) != expected_prepared:
+            raise RuntimeError("bgm_prepared_path_mismatch")
+        if canonical(
+            artifacts.get("final_mix"),
+            code="bgm_final_mix_path_mismatch",
+        ) != expected_mix:
+            raise RuntimeError("bgm_final_mix_path_mismatch")
+        if render_audio.resolve() != expected_mix:
+            raise RuntimeError("bgm_final_mix_path_mismatch")
+        outputs = report.get("outputs", {})
+        if Path(str(outputs.get("prepared_bgm", {}).get("path"))).resolve() != expected_prepared:
+            raise RuntimeError("bgm_prepared_path_mismatch")
+        if Path(str(outputs.get("render_audio", {}).get("path"))).resolve() != expected_mix:
+            raise RuntimeError("bgm_final_mix_path_mismatch")
+        source_path = canonical(
+            artifacts.get("bgm_source"),
+            code="bgm_source_path_mismatch",
+        )
+        report_source = report.get("inputs", {}).get("bgm", {})
+        if Path(str(report_source.get("path"))).resolve() != source_path:
+            raise RuntimeError("bgm_source_path_mismatch")
+        selected_track = selection.get("track")
+        if not isinstance(selected_track, dict) or Path(
+            str(selected_track.get("path"))
+        ).resolve() != source_path:
+            raise RuntimeError("bgm_source_path_mismatch")
         raw_settings = report.get("settings")
         if not isinstance(raw_settings, dict):
             raise RuntimeError("missing_bgm_mix_settings")
@@ -1733,6 +1853,14 @@ def _ensure_context_bgm_lineage(
     if not isinstance(lineage, dict):
         raise RuntimeError("missing_bgm_manifest_lineage")
     if (
+        Path(str(lineage.get("selection"))).resolve() != selection_path
+        or Path(str(lineage.get("mix_report"))).resolve() != expected_report
+        or Path(str(lineage.get("narration"))).resolve() != narration_path
+        or Path(str(lineage.get("render_audio"))).resolve()
+        != render_audio.resolve()
+    ):
+        raise RuntimeError("bgm_manifest_path_mismatch")
+    if (
         lineage.get("resolution_id") != workflow.get("resolution_id")
         or lineage.get("request_fingerprint")
         != workflow.get("request_fingerprint")
@@ -1740,6 +1868,35 @@ def _ensure_context_bgm_lineage(
         or lineage.get("render_audio_sha256") != sha256_file(render_audio)
     ):
         raise RuntimeError("bgm_manifest_lineage_mismatch")
+
+
+def _ensure_current_bgm_report_paths(
+    ctx: WorkflowContext,
+    report: dict[str, Any],
+    report_path: Path,
+) -> None:
+    artifacts = ctx.manifest.get("artifacts", {})
+    audio_root = (ctx.run_dir / "audio").resolve()
+    expected_report = audio_root / "bgm-mix-report.json"
+    if (
+        report_path.resolve() != expected_report
+        or Path(str(artifacts.get("bgm_mix_report"))).resolve()
+        != expected_report
+    ):
+        raise RuntimeError("bgm_report_path_mismatch")
+    narration = Path(str(artifacts.get("voice_audio"))).resolve()
+    try:
+        narration.relative_to(audio_root)
+    except ValueError as exc:
+        raise RuntimeError("bgm_artifact_outside_run") from exc
+    report_narration = report.get("inputs", {}).get("narration", {})
+    if (
+        not isinstance(report_narration, dict)
+        or Path(str(report_narration.get("path"))).resolve() != narration
+    ):
+        raise RuntimeError("bgm_narration_path_mismatch")
+    if report_narration.get("sha256") != sha256_file(narration):
+        raise RuntimeError("bgm_narration_hash_mismatch")
 
 
 def resolve_context_render_audio(ctx: WorkflowContext) -> Path:
@@ -1761,6 +1918,7 @@ def resolve_context_render_audio(ctx: WorkflowContext) -> Path:
     else:
         raise RuntimeError(f"Invalid BGM report mode: {mode}")
     render_audio = Path(audio_value)
+    _ensure_current_bgm_report_paths(ctx, report, report_path)
     ensure_bgm_mix_gate(render_audio, report_path)
     _ensure_context_bgm_lineage(
         ctx,
@@ -1930,6 +2088,23 @@ def resume_context(repo_root: Path, config_path: Path, run_dir: Path) -> Workflo
     config = load_json(config_path)
     if not state or not manifest:
         raise RuntimeError(f"Run directory is missing state or manifest: {run_dir}")
+    artifacts = manifest.get("artifacts", {})
+    migrations = state.setdefault("migrations", {})
+    if (
+        state.get("current_stage") == STAGE_VIDEO_RENDER
+        and state.get("status") not in {"completed", "cancelled"}
+        and not artifacts.get("bgm_mix_report")
+        and "task6_bgm_stage" not in migrations
+    ):
+        migrations["task6_bgm_stage"] = {
+            "from": STAGE_VIDEO_RENDER,
+            "to": STAGE_BGM,
+            "migrated_at": datetime.now().isoformat(),
+        }
+        state["current_stage"] = STAGE_BGM
+        state["status"] = "ready"
+        state.pop("last_error", None)
+        save_json(run_dir / "state.json", state)
     project_name = state.get("project_name") or manifest.get("project_name") or (run_dir.parent.parent.name if run_dir.parent.name == "runs" else "legacy")
     project_root = run_dir.parent.parent if run_dir.parent.name == "runs" else run_dir.parent
     project_config = load_json(project_root / "project.json")

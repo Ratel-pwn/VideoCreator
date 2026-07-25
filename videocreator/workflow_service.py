@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from typing import Any, Iterable
 
-from .interactions import interaction_fingerprint
+from .interactions import interaction_fingerprint, validate_interaction_response
 from .durable_io import atomic_write_json
 from .job_queue import JobCancelledError, JobQueue
 from .project_layout import initialize_project
@@ -246,6 +246,7 @@ class WorkflowService:
             pending.get("payload"),
         )
         try:
+            validate_interaction_response(pending, response)
             accepted = self.queue.submit_input(
                 project,
                 run_id,

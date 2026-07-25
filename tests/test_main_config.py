@@ -45,6 +45,54 @@ def test_resume_context_uses_project_containing_the_run(tmp_path: Path):
     assert context.project_root == project_root
 
 
+def test_resume_migrates_legacy_video_render_to_bgm_once(tmp_path: Path):
+    repo_root = tmp_path / "repo"
+    project_root = tmp_path / "projects" / "demo"
+    run_dir = project_root / "runs" / "run-1"
+    run_dir.mkdir(parents=True)
+    repo_root.mkdir()
+    config_path = repo_root / "workflow.config.json"
+    config_path.write_text(
+        json.dumps({"templates": {"root": "templates"}}),
+        encoding="utf-8",
+    )
+    (project_root / "project.json").write_text(
+        json.dumps({"name": "demo"}),
+        encoding="utf-8",
+    )
+    voice = run_dir / "audio" / "voice.mp3"
+    voice.parent.mkdir()
+    voice.write_bytes(b"voice")
+    artifacts = {"voice_audio": str(voice)}
+    (run_dir / "state.json").write_text(
+        json.dumps(
+            {
+                "run_id": "run-1",
+                "project_name": "demo",
+                "current_stage": "video_render",
+                "status": "failed",
+                "last_error": "legacy render failed",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "manifest.json").write_text(
+        json.dumps({"project_name": "demo", "artifacts": artifacts}),
+        encoding="utf-8",
+    )
+
+    first = resume_context(repo_root, config_path, run_dir)
+    second = resume_context(repo_root, config_path, run_dir)
+
+    assert first.state["current_stage"] == "bgm"
+    assert first.state["status"] == "ready"
+    assert "last_error" not in first.state
+    assert first.manifest["artifacts"] == artifacts
+    assert first.state["migrations"]["task6_bgm_stage"]["from"] == "video_render"
+    assert second.state["current_stage"] == "bgm"
+    assert second.state["migrations"] == first.state["migrations"]
+
+
 def test_prepare_cloned_voice_binds_source_once_and_reuses_speaker(tmp_path: Path):
     source = tmp_path / "library" / "voice" / "default" / "voice.mp3"
     source.parent.mkdir(parents=True)

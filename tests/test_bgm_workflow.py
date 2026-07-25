@@ -205,6 +205,62 @@ def test_provider_failure_requests_agent_candidates_in_durable_mode(tmp_path):
     assert repeated.value.interaction == first
 
 
+def test_agent_handoff_uses_workflow_candidate_and_response_limits(tmp_path):
+    from videocreator.bgm_workflow import resolve_bgm_for_run
+
+    req = request(
+        tmp_path,
+        max_agent_candidates=2,
+        max_agent_response_bytes=512,
+    )
+
+    with pytest.raises(InteractionRequired) as raised:
+        resolve_bgm_for_run(req, DurableInteractionPort())
+
+    payload = raised.value.interaction["payload"]
+    assert payload["response_schema"]["properties"]["candidates"]["maxItems"] == 2
+    assert payload["limits"]["max_response_bytes"] == 512
+
+
+def test_console_resume_preserves_matching_durable_agent_handoff(tmp_path):
+    from videocreator.bgm_workflow import resolve_bgm_for_run
+
+    req = request(tmp_path)
+    durable = DurableInteractionPort()
+    with pytest.raises(InteractionRequired) as raised:
+        resolve_bgm_for_run(req, durable)
+    pending = dict(raised.value.interaction)
+    durable.submit(req.context, pending["id"], agent_response())
+
+    with pytest.raises(InteractionRequired) as waiting:
+        resolve_bgm_for_run(req, ConsoleInteractionPort())
+
+    assert waiting.value.interaction["id"] == pending["id"]
+    assert req.context.state["pending_interaction"]["response"] == agent_response()
+    assert not list(req.download_dir.glob("bgm-resolution-*.json"))
+
+
+def test_console_resume_clears_stale_bgm_handoff_before_fallback(tmp_path):
+    from videocreator.bgm_workflow import resolve_bgm_for_run
+
+    first = request(tmp_path)
+    durable = DurableInteractionPort()
+    with pytest.raises(InteractionRequired) as raised:
+        resolve_bgm_for_run(first, durable)
+    durable.submit(first.context, raised.value.interaction["id"], agent_response())
+
+    changed = request(
+        tmp_path,
+        context=first.context,
+        query=replace(query(), moods=("urgent",)),
+    )
+    result = resolve_bgm_for_run(changed, ConsoleInteractionPort())
+
+    assert result.mode == "narration_only"
+    assert "pending_interaction" not in changed.context.state
+    assert "submitted_interactions" not in changed.context.state
+
+
 def test_console_mode_skips_agent_and_returns_narration_only(tmp_path):
     from videocreator.bgm_workflow import resolve_bgm_for_run
 

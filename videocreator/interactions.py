@@ -27,6 +27,81 @@ def interaction_fingerprint(
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def validate_interaction_response(
+    interaction: dict[str, Any],
+    response: str,
+) -> None:
+    """Apply typed interaction bounds before any raw response is persisted."""
+    if interaction.get("kind") != "bgm_candidates":
+        return
+    payload = interaction.get("payload")
+    if not isinstance(payload, dict):
+        return
+    limits = payload.get("limits")
+    schema = payload.get("response_schema")
+    max_bytes = (
+        limits.get("max_response_bytes")
+        if isinstance(limits, dict)
+        else None
+    )
+    candidates_schema = (
+        schema.get("properties", {}).get("candidates")
+        if isinstance(schema, dict)
+        else None
+    )
+    max_candidates = (
+        candidates_schema.get("maxItems")
+        if isinstance(candidates_schema, dict)
+        else None
+    )
+    encoded = response.encode("utf-8")
+    if isinstance(max_bytes, int) and len(encoded) > max_bytes:
+        raise ValueError(f"BGM response exceeds {max_bytes} bytes")
+    try:
+        parsed = json.loads(response)
+    except json.JSONDecodeError:
+        return
+    candidates = parsed.get("candidates") if isinstance(parsed, dict) else None
+    if not isinstance(candidates, list):
+        return
+    if isinstance(max_candidates, int) and len(candidates) > max_candidates:
+        raise ValueError(
+            f"BGM response has more than {max_candidates} candidates"
+        )
+
+
+def clear_interaction_state(
+    ctx: InteractionContext,
+    *keys: str,
+) -> None:
+    answers = ctx.state.get("interaction_answers", {})
+    answer_fingerprints = ctx.state.get(
+        "interaction_answer_fingerprints",
+        {},
+    )
+    consumed = ctx.state.get("consumed_interactions", {})
+    submitted = ctx.state.get("submitted_interactions", {})
+    for key in keys:
+        answers.pop(key, None)
+        answer_fingerprints.pop(key, None)
+        interaction_id = consumed.pop(key, None)
+        if interaction_id:
+            submitted.pop(interaction_id, None)
+    pending = ctx.state.get("pending_interaction")
+    if pending and pending.get("key") in keys:
+        submitted.pop(pending.get("id"), None)
+        ctx.state.pop("pending_interaction", None)
+    if not answers:
+        ctx.state.pop("interaction_answers", None)
+    if not answer_fingerprints:
+        ctx.state.pop("interaction_answer_fingerprints", None)
+    if not consumed:
+        ctx.state.pop("consumed_interactions", None)
+    if not submitted:
+        ctx.state.pop("submitted_interactions", None)
+    ctx.save_state()
+
+
 class InteractionContext(Protocol):
     run_id: str
     project_name: str
@@ -190,7 +265,7 @@ class DurableInteractionPort:
         fingerprint: str | None = None,
     ) -> bool:
         pending = ctx.state.get("pending_interaction")
-        submitted = ctx.state.setdefault("submitted_interactions", {})
+        submitted = ctx.state.get("submitted_interactions", {})
         if interaction_id in submitted:
             if submitted[interaction_id] != response:
                 raise ValueError("Interaction already has a different response")
@@ -207,6 +282,8 @@ class DurableInteractionPort:
         choices = pending.get("choices") or []
         if choices and response not in choices:
             raise ValueError(f"Response must be one of: {', '.join(choices)}")
+        validate_interaction_response(pending, response)
+        submitted = ctx.state.setdefault("submitted_interactions", {})
         pending["response"] = response
         pending["answered_at"] = _now()
         submitted[interaction_id] = response
@@ -227,32 +304,7 @@ class DurableInteractionPort:
         return True
 
     def clear(self, ctx: InteractionContext, *keys: str) -> None:
-        answers = ctx.state.get("interaction_answers", {})
-        answer_fingerprints = ctx.state.get(
-            "interaction_answer_fingerprints",
-            {},
-        )
-        consumed = ctx.state.get("consumed_interactions", {})
-        submitted = ctx.state.get("submitted_interactions", {})
-        for key in keys:
-            answers.pop(key, None)
-            answer_fingerprints.pop(key, None)
-            interaction_id = consumed.pop(key, None)
-            if interaction_id:
-                submitted.pop(interaction_id, None)
-        pending = ctx.state.get("pending_interaction")
-        if pending and pending.get("key") in keys:
-            submitted.pop(pending.get("id"), None)
-            ctx.state.pop("pending_interaction", None)
-        if not answers:
-            ctx.state.pop("interaction_answers", None)
-        if not answer_fingerprints:
-            ctx.state.pop("interaction_answer_fingerprints", None)
-        if not consumed:
-            ctx.state.pop("consumed_interactions", None)
-        if not submitted:
-            ctx.state.pop("submitted_interactions", None)
-        ctx.save_state()
+        clear_interaction_state(ctx, *keys)
 
 
 @dataclass(frozen=True)

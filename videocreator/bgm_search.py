@@ -786,10 +786,15 @@ def download_candidate(
         raise BgmSearchError(f"download failed: {exc}") from exc
 
 
-def parse_agent_candidates(response: str) -> list[OnlineBgmCandidate]:
+def parse_agent_candidates(
+    response: str,
+    *,
+    max_candidates: int = MAX_AGENT_CANDIDATES,
+    max_response_bytes: int = MAX_AGENT_RESPONSE_BYTES,
+) -> list[OnlineBgmCandidate]:
     encoded = response.encode("utf-8")
-    if len(encoded) > MAX_AGENT_RESPONSE_BYTES:
-        raise BgmSearchError(f"agent response exceeds {MAX_AGENT_RESPONSE_BYTES} bytes")
+    if len(encoded) > max_response_bytes:
+        raise BgmSearchError(f"agent response exceeds {max_response_bytes} bytes")
     try:
         payload = json.loads(
             response,
@@ -805,8 +810,8 @@ def parse_agent_candidates(response: str) -> list[OnlineBgmCandidate]:
     candidates = payload.get("candidates")
     if not isinstance(candidates, list):
         raise BgmSearchError("agent candidates must be a list")
-    if len(candidates) > MAX_AGENT_CANDIDATES:
-        raise BgmSearchError(f"agent response accepts at most {MAX_AGENT_CANDIDATES} candidates")
+    if len(candidates) > max_candidates:
+        raise BgmSearchError(f"agent response accepts at most {max_candidates} candidates")
     parsed: list[OnlineBgmCandidate] = []
     for candidate in candidates:
         if not isinstance(candidate, dict):
