@@ -152,8 +152,8 @@ def test_narration_only_stage_registers_report_and_advances(
 
 
 def test_selected_bgm_stage_registers_full_lineage(context, monkeypatch):
-    source = context.run_dir / "audio" / "selected.mp3"
-    metadata = context.run_dir / "audio" / "selected.bgm.json"
+    source = context.run_dir / "audio" / "bgm.source.mp3"
+    metadata = context.run_dir / "audio" / "bgm.source.bgm.json"
     source.write_bytes(b"selected")
     metadata.write_text("{}", encoding="utf-8")
     track = BgmTrack(
@@ -161,7 +161,7 @@ def test_selected_bgm_stage_registers_full_lineage(context, monkeypatch):
         path=source,
         metadata_path=metadata,
         level="project",
-        sha256="a" * 64,
+        sha256=main.sha256_file(source),
         title="Selected",
         creator="Composer",
         source_url="https://example.com/selected",
@@ -176,7 +176,7 @@ def test_selected_bgm_stage_registers_full_lineage(context, monkeypatch):
         avoid_for=(),
         preferred_start_ms=0,
         loopable=True,
-        metadata_sha256="b" * 64,
+        metadata_sha256=main.sha256_file(metadata),
     )
     prepared = context.run_dir / "audio" / "bgm.prepared.wav"
     final_mix = context.run_dir / "audio" / "final-mix.wav"
@@ -217,7 +217,11 @@ def test_selected_bgm_stage_registers_full_lineage(context, monkeypatch):
                         Path(context.manifest["artifacts"]["voice_audio"])
                     ),
                 },
-                "bgm": {"path": str(source)},
+                "bgm": {
+                    "path": str(source),
+                    "metadata_path": str(metadata),
+                    "metadata_sha256": main.sha256_file(metadata),
+                },
             },
             "outputs": {
                 "prepared_bgm": {"path": str(prepared)},
@@ -347,6 +351,41 @@ def test_bgm_stage_rejects_library_changed_after_run_snapshot(context):
 
     with pytest.raises(RuntimeError, match="snapshot_mismatch"):
         main.ensure_bgm_library_snapshot(context, library)
+
+
+def test_freeze_bgm_source_materializes_separate_metadata_sidecar(context):
+    source = context.run_dir / "audio" / "downloaded.mp3"
+    source.write_bytes(b"downloaded")
+    digest = main.sha256_file(source)
+    track = BgmTrack(
+        id="downloaded",
+        path=source,
+        metadata_path=source,
+        level="online",
+        sha256=digest,
+        title="Downloaded",
+        creator="Composer",
+        source_url="https://example.test/downloaded",
+        license="CC BY 4.0",
+        rights_status="cleared",
+        subjects=("technology",),
+        moods=("reflective",),
+        energy="low",
+        tempo_bpm=80,
+        instrumental=True,
+        template_tags=(),
+        avoid_for=(),
+        preferred_start_ms=0,
+        loopable=True,
+        metadata_sha256=digest,
+    )
+
+    frozen = main.freeze_bgm_source(context, track)
+
+    assert frozen.metadata_path == context.run_dir / "audio" / "bgm.source.bgm.json"
+    assert frozen.metadata_path.is_file()
+    assert frozen.metadata_path != frozen.path
+    assert frozen.metadata_sha256 == main.sha256_file(frozen.metadata_path)
 
 
 def test_disabled_bgm_bypasses_library_resolution_and_snapshot(context, monkeypatch):
@@ -515,6 +554,107 @@ def test_render_gate_requires_exact_current_narration_path(context, monkeypatch)
 
     with pytest.raises(RuntimeError, match="bgm_narration_path_mismatch"):
         main.resolve_context_render_audio(context)
+
+
+def _metadata_gate_fixture(context):
+    narration = Path(context.manifest["artifacts"]["voice_audio"])
+    source = context.run_dir / "audio" / "bgm.source.mp3"
+    metadata = context.run_dir / "audio" / "bgm.source.bgm.json"
+    prepared = context.run_dir / "audio" / "bgm.prepared.wav"
+    final_mix = context.run_dir / "audio" / "final-mix.wav"
+    report_path = context.run_dir / "audio" / "bgm-mix-report.json"
+    selection_path = context.run_dir / "audio" / "bgm-selection.json"
+    for path, value in (
+        (source, b"source"),
+        (metadata, b"metadata"),
+        (prepared, b"prepared"),
+        (final_mix, b"mix"),
+    ):
+        path.write_bytes(value)
+    metadata_hash = main.sha256_file(metadata)
+    selection_path.write_text(
+        json.dumps(
+            {
+                "track": {
+                    "path": str(source),
+                    "metadata_path": str(metadata),
+                    "metadata_sha256": metadata_hash,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    report = {
+        "mode": "bgm",
+        "inputs": {
+            "narration": {
+                "path": str(narration),
+                "sha256": main.sha256_file(narration),
+            },
+            "bgm": {
+                "path": str(source),
+                "metadata_path": str(metadata),
+                "metadata_sha256": metadata_hash,
+            },
+        },
+        "outputs": {
+            "prepared_bgm": {"path": str(prepared)},
+            "render_audio": {"path": str(final_mix)},
+        },
+    }
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    context.manifest["artifacts"].update(
+        {
+            "bgm_source": str(source),
+            "bgm_source_metadata": str(metadata),
+            "bgm_prepared": str(prepared),
+            "final_mix": str(final_mix),
+            "bgm_selection": str(selection_path),
+            "bgm_mix_report": str(report_path),
+        }
+    )
+    return report, report_path, final_mix, selection_path, metadata
+
+
+def test_render_gate_rejects_sibling_run_bgm_metadata_sidecar(context):
+    report, report_path, final_mix, selection_path, metadata = (
+        _metadata_gate_fixture(context)
+    )
+    sibling = context.project_root / "runs" / "run-002" / "audio"
+    sibling.mkdir(parents=True)
+    sibling_metadata = sibling / "bgm.source.bgm.json"
+    sibling_metadata.write_bytes(metadata.read_bytes())
+    metadata_hash = main.sha256_file(sibling_metadata)
+    context.manifest["artifacts"]["bgm_source_metadata"] = str(sibling_metadata)
+    selection = json.loads(selection_path.read_text(encoding="utf-8"))
+    selection["track"]["metadata_path"] = str(sibling_metadata)
+    selection["track"]["metadata_sha256"] = metadata_hash
+    selection_path.write_text(json.dumps(selection), encoding="utf-8")
+    report["inputs"]["bgm"]["metadata_path"] = str(sibling_metadata)
+    report["inputs"]["bgm"]["metadata_sha256"] = metadata_hash
+
+    with pytest.raises(RuntimeError, match="bgm_artifact_outside_run"):
+        main._ensure_context_bgm_lineage(
+            context,
+            report,
+            report_path,
+            final_mix,
+        )
+
+
+def test_render_gate_binds_bgm_metadata_hash_across_all_records(context):
+    report, report_path, final_mix, _selection_path, _metadata = (
+        _metadata_gate_fixture(context)
+    )
+    report["inputs"]["bgm"]["metadata_sha256"] = "0" * 64
+
+    with pytest.raises(RuntimeError, match="bgm_metadata_hash_mismatch"):
+        main._ensure_context_bgm_lineage(
+            context,
+            report,
+            report_path,
+            final_mix,
+        )
 
 
 def test_stale_final_mix_is_rejected_before_render(context):

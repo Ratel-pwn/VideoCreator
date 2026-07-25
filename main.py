@@ -1433,11 +1433,31 @@ def freeze_bgm_source(ctx: WorkflowContext, track: BgmTrack) -> BgmTrack:
         raise RuntimeError("Selected BGM source has no file extension")
     audio_path = ctx.run_dir / "audio" / f"bgm.source{suffix}"
     _copy_frozen_file(track.path, audio_path, track.sha256)
+    metadata_path = ctx.run_dir / "audio" / "bgm.source.bgm.json"
     if track.metadata_path.resolve() == track.path.resolve():
-        metadata_path = audio_path
-        metadata_hash = track.sha256
+        save_json(
+            metadata_path,
+            {
+                "schema_version": 1,
+                "id": track.id,
+                "title": track.title,
+                "creator": track.creator,
+                "source_url": track.source_url,
+                "license": track.license,
+                "rights_status": track.rights_status,
+                "subjects": list(track.subjects),
+                "moods": list(track.moods),
+                "energy": track.energy,
+                "tempo_bpm": track.tempo_bpm,
+                "instrumental": track.instrumental,
+                "template_tags": list(track.template_tags),
+                "avoid_for": list(track.avoid_for),
+                "preferred_start_ms": track.preferred_start_ms,
+                "loopable": track.loopable,
+            },
+        )
+        metadata_hash = sha256_file(metadata_path)
     else:
-        metadata_path = ctx.run_dir / "audio" / "bgm.source.bgm.json"
         _copy_frozen_file(
             track.metadata_path,
             metadata_path,
@@ -1778,6 +1798,37 @@ def _ensure_context_bgm_lineage(
     if not selection_path.is_file():
         raise RuntimeError("missing_bgm_selection")
     selection = load_json(selection_path)
+    if report.get("mode") == "bgm":
+        expected_metadata = audio_root / "bgm.source.bgm.json"
+        manifest_metadata = canonical(
+            artifacts.get("bgm_source_metadata"),
+            code="bgm_metadata_path_mismatch",
+        )
+        if manifest_metadata != expected_metadata or not manifest_metadata.is_file():
+            raise RuntimeError("bgm_metadata_path_mismatch")
+        selected_track = selection.get("track")
+        report_bgm = report.get("inputs", {}).get("bgm")
+        if not isinstance(selected_track, dict) or not isinstance(report_bgm, dict):
+            raise RuntimeError("bgm_metadata_path_mismatch")
+        selection_metadata = canonical(
+            selected_track.get("metadata_path"),
+            code="bgm_metadata_path_mismatch",
+        )
+        report_metadata = canonical(
+            report_bgm.get("metadata_path"),
+            code="bgm_metadata_path_mismatch",
+        )
+        if (
+            selection_metadata != expected_metadata
+            or report_metadata != expected_metadata
+        ):
+            raise RuntimeError("bgm_metadata_path_mismatch")
+        metadata_hash = sha256_file(expected_metadata)
+        if (
+            selected_track.get("metadata_sha256") != metadata_hash
+            or report_bgm.get("metadata_sha256") != metadata_hash
+        ):
+            raise RuntimeError("bgm_metadata_hash_mismatch")
     workflow = report.get("workflow")
     if not isinstance(workflow, dict):
         raise RuntimeError("missing_bgm_workflow_binding")
