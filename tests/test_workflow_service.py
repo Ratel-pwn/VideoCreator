@@ -59,6 +59,84 @@ def test_service_submits_only_current_interaction_and_requeues(tmp_path: Path):
     assert service.queue.get("demo", "run-1").status == "queued"
 
 
+def test_bgm_candidate_interaction_round_trips_unchanged(tmp_path: Path):
+    service = build_service(tmp_path)
+    service.initialize_project("demo", "chaos-museum")
+    service.start_workflow("demo", "A topic", run_id="run-1")
+    run = tmp_path / "projects/demo/runs/run-1"
+    state_path = run / "state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    payload = {
+        "schema_version": 1,
+        "query": {"subjects": ["economics"]},
+        "response_schema": {"type": "object"},
+    }
+    state["status"] = "waiting_for_input"
+    state["pending_interaction"] = {
+        "id": "bgm-1",
+        "key": "bgm-online-candidates",
+        "kind": "bgm_candidates",
+        "prompt": "Find BGM",
+        "choices": [],
+        "payload": payload,
+    }
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    claimed = service.queue.claim("worker", 60)
+    service.queue.release_waiting(claimed.id, "worker")
+
+    status = service.get_workflow_status("demo", "run-1")
+    assert status["interaction"]["kind"] == "bgm_candidates"
+    assert status["interaction"]["payload"] == payload
+
+    response = json.dumps({"candidates": []})
+    submitted = service.submit_workflow_input(
+        "demo",
+        "run-1",
+        "bgm-1",
+        response,
+    )
+    assert submitted["accepted"] is True
+    saved = json.loads(state_path.read_text(encoding="utf-8"))
+    assert saved["pending_interaction"]["response"] == response
+    resumed = service.get_workflow_status("demo", "run-1")
+    assert resumed["status"] == "queued"
+    assert resumed["interaction"] is None
+
+
+def test_cancelled_bgm_interaction_cannot_be_submitted_or_requeued(tmp_path: Path):
+    service = build_service(tmp_path)
+    service.initialize_project("demo", "chaos-museum")
+    service.start_workflow("demo", "A topic", run_id="run-1")
+    run = tmp_path / "projects/demo/runs/run-1"
+    state_path = run / "state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["status"] = "waiting_for_input"
+    state["pending_interaction"] = {
+        "id": "bgm-1",
+        "key": "bgm-online-candidates",
+        "kind": "bgm_candidates",
+        "prompt": "Find BGM",
+        "choices": [],
+        "payload": {"schema_version": 1},
+    }
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    cancelled = service.cancel_workflow("demo", "run-1")
+    assert cancelled["status"] == "cancelled"
+    status = service.get_workflow_status("demo", "run-1")
+    assert status["status"] == "cancelled"
+    assert status["interaction"] is None
+
+    with pytest.raises(ServiceError, match="cancelled"):
+        service.submit_workflow_input(
+            "demo",
+            "run-1",
+            "bgm-1",
+            json.dumps({"candidates": []}),
+        )
+    assert service.queue.get("demo", "run-1").status == "cancelled"
+
+
 def test_result_returns_text_but_never_media_binary(tmp_path: Path):
     service = build_service(tmp_path)
     service.initialize_project("demo", "chaos-museum")

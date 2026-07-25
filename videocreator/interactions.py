@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,6 +28,8 @@ class InteractionRequired(RuntimeError):
 
 
 class InteractionPort(Protocol):
+    supports_agent_handoff: bool
+
     def ask(
         self,
         ctx: InteractionContext,
@@ -34,12 +37,15 @@ class InteractionPort(Protocol):
         prompt: str,
         kind: str = "text",
         choices: tuple[str, ...] = (),
+        payload: dict[str, Any] | None = None,
     ) -> str: ...
 
     def clear(self, ctx: InteractionContext, *keys: str) -> None: ...
 
 
 class ConsoleInteractionPort:
+    supports_agent_handoff = False
+
     def ask(
         self,
         ctx: InteractionContext,
@@ -47,6 +53,7 @@ class ConsoleInteractionPort:
         prompt: str,
         kind: str = "text",
         choices: tuple[str, ...] = (),
+        payload: dict[str, Any] | None = None,
     ) -> str:
         suffix = f" [{' / '.join(choices)}]" if choices else ""
         while True:
@@ -60,6 +67,8 @@ class ConsoleInteractionPort:
 
 
 class DurableInteractionPort:
+    supports_agent_handoff = True
+
     def _append(self, ctx: InteractionContext, value: dict[str, Any]) -> None:
         path = ctx.run_dir / "session" / "interactions.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -73,6 +82,7 @@ class DurableInteractionPort:
         prompt: str,
         kind: str = "text",
         choices: tuple[str, ...] = (),
+        payload: dict[str, Any] | None = None,
     ) -> str:
         answers = ctx.state.setdefault("interaction_answers", {})
         if key in answers:
@@ -86,6 +96,8 @@ class DurableInteractionPort:
                 raise InteractionRequired(pending)
             response = str(pending["response"])
             answers[key] = response
+            consumed = ctx.state.setdefault("consumed_interactions", {})
+            consumed[key] = pending["id"]
             ctx.state.pop("pending_interaction", None)
             ctx.save_state()
             return response
@@ -98,6 +110,8 @@ class DurableInteractionPort:
             "choices": list(choices),
             "created_at": _now(),
         }
+        if payload is not None:
+            interaction["payload"] = deepcopy(payload)
         ctx.state["pending_interaction"] = interaction
         ctx.state["status"] = "waiting_for_input"
         ctx.save_state()
@@ -134,10 +148,23 @@ class DurableInteractionPort:
 
     def clear(self, ctx: InteractionContext, *keys: str) -> None:
         answers = ctx.state.get("interaction_answers", {})
+        consumed = ctx.state.get("consumed_interactions", {})
+        submitted = ctx.state.get("submitted_interactions", {})
         for key in keys:
             answers.pop(key, None)
+            interaction_id = consumed.pop(key, None)
+            if interaction_id:
+                submitted.pop(interaction_id, None)
+        pending = ctx.state.get("pending_interaction")
+        if pending and pending.get("key") in keys:
+            submitted.pop(pending.get("id"), None)
+            ctx.state.pop("pending_interaction", None)
         if not answers:
             ctx.state.pop("interaction_answers", None)
+        if not consumed:
+            ctx.state.pop("consumed_interactions", None)
+        if not submitted:
+            ctx.state.pop("submitted_interactions", None)
         ctx.save_state()
 
 

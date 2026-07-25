@@ -159,7 +159,10 @@ class WorkflowService:
         state = self._read_json(run / "state.json")
         manifest = self._read_json(run / "manifest.json")
         job = self.queue.get(project, run_id)
-        if state.get("pending_interaction"):
+        pending = state.get("pending_interaction")
+        if state.get("status") == "cancelled" or (job and job.status == "cancelled"):
+            status = "cancelled"
+        elif pending and "response" not in pending:
             status = "waiting_for_input"
         elif job and job.status in {"queued", "leased", "waiting", "completed", "failed", "cancelled"}:
             status = {"leased": "running", "waiting": "waiting_for_input"}.get(job.status, job.status)
@@ -169,12 +172,13 @@ class WorkflowService:
             status = state["status"]
         else:
             status = "running"
+        interaction = pending if status == "waiting_for_input" else None
         return {
             "project": project,
             "run_id": run_id,
             "status": status,
             "current_stage": state.get("current_stage"),
-            "interaction": state.get("pending_interaction"),
+            "interaction": interaction,
             "error": state.get("last_error") or (job.error if job else None),
             "updated_at": state.get("updated_at"),
             "artifacts": sorted((manifest.get("artifacts") or {}).keys()),
@@ -190,6 +194,13 @@ class WorkflowService:
         import main as workflow
 
         run = self._run(project, run_id)
+        state = self._read_json(run / "state.json")
+        job = self.queue.get(project, run_id)
+        if state.get("status") == "cancelled" or (job and job.status == "cancelled"):
+            raise ServiceError(
+                "state_conflict",
+                "Cannot submit input to a cancelled workflow",
+            )
         ctx = workflow.resume_context(self.home, self.config_path, run)
         port = DurableInteractionPort()
         try:

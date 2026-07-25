@@ -4,7 +4,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from videocreator.interactions import DurableInteractionPort, InteractionRequired
+from videocreator.interactions import (
+    ConsoleInteractionPort,
+    DurableInteractionPort,
+    InteractionRequired,
+)
 
 
 class Context:
@@ -53,7 +57,38 @@ def test_answers_can_be_replayed_then_cleared_for_a_repeated_stage(tmp_path: Pat
     port.submit(ctx, raised.value.interaction["id"], "n")
     assert port.ask(ctx, "approval", "Approve?", "confirmation", ("y", "n")) == "n"
     port.clear(ctx, "approval")
+    assert "submitted_interactions" not in ctx.state
 
     with pytest.raises(InteractionRequired) as repeated:
         port.ask(ctx, "approval", "Approve?", "confirmation", ("y", "n"))
     assert repeated.value.interaction["id"] != raised.value.interaction["id"]
+
+
+def test_typed_payload_is_persisted_unchanged_and_handoff_is_explicit(tmp_path: Path):
+    ctx = Context(tmp_path)
+    port = DurableInteractionPort()
+    payload = {
+        "schema_version": 1,
+        "query": {"subjects": ["economics"]},
+        "response_schema": {"type": "object"},
+    }
+
+    with pytest.raises(InteractionRequired) as raised:
+        port.ask(
+            ctx,
+            "bgm-online-candidates",
+            "Find BGM",
+            "bgm_candidates",
+            payload=payload,
+        )
+
+    assert DurableInteractionPort.supports_agent_handoff is True
+    assert ConsoleInteractionPort.supports_agent_handoff is False
+    assert raised.value.interaction["payload"] == payload
+    assert ctx.state["pending_interaction"]["payload"] == payload
+    event = json.loads(
+        (tmp_path / "session/interactions.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()[0]
+    )
+    assert event["payload"] == payload
