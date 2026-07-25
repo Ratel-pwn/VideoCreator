@@ -41,3 +41,4 @@ scripts/whisper_batch_transcribe.config.json
 scripts/yt_batch_download.config.json
 config/*.local.json
 config/*.private.json
+config/bgm-search.local.json
