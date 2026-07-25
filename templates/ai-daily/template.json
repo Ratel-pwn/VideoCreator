@@ -9,7 +9,8 @@
     "subtitles",
     "visual_planning",
     "asset_collection",
-    "final_assembly"
+    "final_assembly",
+    "bgm"
   ],
   "paths": {
     "prepare": "prepare.md",
@@ -17,7 +18,8 @@
     "visual_planning": "visual-planning.md",
     "pacing": "pacing.json",
     "subtitle": "subtitle.json",
-    "composition": "composition.json"
+    "composition": "composition.json",
+    "bgm": "bgm.json"
   }
 }
 

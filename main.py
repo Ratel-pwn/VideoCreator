@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from videocreator.asset_manifest import audit_asset_manifest
+from videocreator.bgm_library import resolve_bgm_library
 from videocreator.interactions import (
     ConsoleInteractionPort,
     InteractionPort,
@@ -368,7 +369,10 @@ def make_run_context(repo_root: Path, config_path: Path, mode: str, topic: str, 
     if not selected_template_id:
         raise RuntimeError("Project is missing template_id; migrate or initialize it first")
     template = load_template(resolve_path(repo_root, config.get("templates", {}).get("root", "templates")), selected_template_id)
-    libraries = {kind: resolve_library(repo_root, project_root, template, kind) for kind in ("style", "voice")}
+    libraries = {
+        **{kind: resolve_library(repo_root, project_root, template, kind) for kind in ("style", "voice")},
+        "bgm": resolve_bgm_library(repo_root, project_root, template),
+    }
     run_dir = project_root / "runs" / actual_run_id
     if not run_dir.exists():
         create_run(project_root, actual_run_id, template, libraries)

@@ -3,8 +3,9 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
+from .bgm_library import BgmLibrarySelection
 from .templates import LibrarySelection, TemplateDefinition, snapshot_template
 
 
@@ -42,14 +43,39 @@ def initialize_project(projects_root: Path, name: str, template: TemplateDefinit
     project = projects_root / name
     if project.exists():
         raise FileExistsError(f"project already exists: {project}")
-    for relative in ("sources", "library/style", "library/voice", "media/images", "media/videos", "runs"):
+    for relative in ("sources", "library/style", "library/voice", "library/bgm", "media/images", "media/videos", "runs"):
         (project / relative).mkdir(parents=True, exist_ok=True)
     config = {"schema_version": 2, "name": name, "template_id": template.id, **metadata}
     _write_json(project / "project.json", config)
     return project
 
 
-def create_run(project_root: Path, run_id: str, template: TemplateDefinition, libraries: dict[str, LibrarySelection]) -> RunPaths:
+def _snapshot_library_item(item: LibrarySelection | BgmLibrarySelection) -> dict[str, Any]:
+    if isinstance(item, BgmLibrarySelection):
+        return {
+            "level": item.level,
+            "root": str(item.root) if item.root else None,
+            "files": [
+                {"path": str(track.path), "sha256": track.sha256}
+                for track in item.tracks
+            ],
+        }
+    return {
+        "level": item.level,
+        "root": str(item.root) if item.root else None,
+        "files": [
+            {"path": str(file.path), "sha256": file.sha256}
+            for file in item.files
+        ],
+    }
+
+
+def create_run(
+    project_root: Path,
+    run_id: str,
+    template: TemplateDefinition,
+    libraries: Mapping[str, LibrarySelection | BgmLibrarySelection],
+) -> RunPaths:
     root = project_root / "runs" / run_id
     if root.exists():
         raise FileExistsError(f"run already exists: {root}")
@@ -62,9 +88,7 @@ def create_run(project_root: Path, run_id: str, template: TemplateDefinition, li
     _write_json(paths.inputs / "project.snapshot.json", project)
     _write_json(paths.inputs / "source-selection.json", {"files": []})
     _write_json(paths.inputs / "library.snapshot.json", {
-        kind: {"level": item.level, "root": str(item.root) if item.root else None, "files": [
-            {"path": str(file.path), "sha256": file.sha256} for file in item.files
-        ]} for kind, item in sorted(libraries.items())
+        kind: _snapshot_library_item(item) for kind, item in sorted(libraries.items())
     })
     _write_json(paths.state, {"schema_version": 2, "run_id": run_id, "stages": {}})
     _write_json(paths.manifest, {"schema_version": 2, "run_id": run_id, "project": project["name"], "template": {"id": template.id, "version": template.version}, "artifacts": {}})

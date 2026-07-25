@@ -30,6 +30,9 @@ library/**
 !library/voice/
 !library/voice/default/
 !library/voice/default/.gitkeep
+!library/bgm/
+!library/bgm/default/
+!library/bgm/default/README.md
 
 # Local runtime configs (keep local, do not publish raw values)
 scripts/jimeng_visual.config.json

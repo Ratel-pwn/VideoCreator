@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "enabled": true,
+  "instrumental_only": true,
+  "preferred_moods": ["restrained", "technological"],
+  "preferred_energy": "low-medium",
+  "preferred_tempo_bpm": [78, 108],
+  "avoid_tags": ["vocal", "heavy-drums"],
+  "ducking_strength": "medium",
+  "fade_in_ms": 2000,
+  "fade_out_ms": 3000
+}

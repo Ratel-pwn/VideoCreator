@@ -13,9 +13,10 @@ class TemplateError(ValueError):
 
 ALLOWED_CAPABILITIES = {
     "prepare", "writing", "tts", "subtitles", "visual_planning",
-    "asset_collection", "final_assembly",
+    "asset_collection", "final_assembly", "bgm",
 }
 REQUIRED_PATHS = {"prepare", "writing", "visual_planning", "pacing", "subtitle", "composition"}
+OPTIONAL_PATHS = {"bgm"}
 EXECUTABLE_SUFFIXES = {".py", ".js", ".jsx", ".ts", ".tsx", ".sh", ".ps1", ".bat", ".cmd"}
 
 
@@ -75,6 +76,9 @@ def load_template(templates_root: Path, template_id: str) -> TemplateDefinition:
     missing = REQUIRED_PATHS - set(declared)
     if missing:
         raise TemplateError(f"missing template paths: {sorted(missing)}")
+    unknown_paths = set(declared) - REQUIRED_PATHS - OPTIONAL_PATHS
+    if unknown_paths:
+        raise TemplateError(f"unknown template paths: {sorted(unknown_paths)}")
     paths: dict[str, Path] = {}
     for name, relative in declared.items():
         path = (root / relative).resolve()

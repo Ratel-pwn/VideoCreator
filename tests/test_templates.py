@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from videocreator.templates import TemplateError, discover_templates, load_template, resolve_library
+from videocreator.bgm_policy import load_bgm_policy
 
 
 def test_repository_exposes_declarative_templates():
@@ -18,6 +19,8 @@ def test_repository_exposes_declarative_templates():
     }
     assert all(not list(item.root.rglob("*.py")) for item in templates.values())
     assert all(not list(item.root.rglob("*.ts")) for item in templates.values())
+    assert all("bgm" in item.capabilities and "bgm" in item.paths for item in templates.values())
+    assert all(load_bgm_policy(item).enabled for item in templates.values())
 
 
 def test_template_rejects_path_traversal(tmp_path):

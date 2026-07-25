@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "enabled": true,
+  "instrumental_only": true,
+  "preferred_moods": ["confident", "modern"],
+  "preferred_energy": "medium",
+  "preferred_tempo_bpm": [90, 120],
+  "avoid_tags": ["vocal", "heavy-drums"],
+  "ducking_strength": "medium",
+  "fade_in_ms": 1500,
+  "fade_out_ms": 2500
+}

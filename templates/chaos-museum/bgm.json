@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "enabled": true,
+  "instrumental_only": true,
+  "preferred_moods": ["reflective", "restrained"],
+  "preferred_energy": "low-medium",
+  "preferred_tempo_bpm": [70, 100],
+  "avoid_tags": ["vocal", "heavy-drums", "comedy"],
+  "ducking_strength": "medium",
+  "fade_in_ms": 2000,
+  "fade_out_ms": 3000
+}
