@@ -1,6 +1,7 @@
 {
   "max_candidates": 8,
   "max_download_bytes": 52428800,
+  "max_provider_response_bytes": 2097152,
   "providers": [
     {"type": "wikimedia", "enabled": true}
   ]

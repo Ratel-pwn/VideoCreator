@@ -4,12 +4,24 @@ from pathlib import Path
 
 import pytest
 
+from videocreator.media import MediaMetadata
+
+
+PUBLIC_IP = "93.184.216.34"
+
 
 class FakeResponse:
-    def __init__(self, payload: bytes, url: str = "https://example.test/file.mp3"):
+    def __init__(
+        self,
+        payload: bytes,
+        *,
+        status: int = 200,
+        headers: dict[str, str] | None = None,
+    ):
         self.payload = payload
-        self.url = url
-        self.headers = {"Content-Type": "audio/mpeg"}
+        self.status = status
+        self.headers = headers or {"Content-Type": "audio/mpeg"}
+        self.closed = False
 
     def read(self, size: int = -1) -> bytes:
         if size < 0:
@@ -18,14 +30,16 @@ class FakeResponse:
         value, self.payload = self.payload[:size], self.payload[size:]
         return value
 
-    def geturl(self) -> str:
-        return self.url
-
     def __enter__(self):
         return self
 
     def __exit__(self, *_):
+        self.closed = True
         return False
+
+
+def public_resolver(*_args) -> tuple[str, ...]:
+    return (PUBLIC_IP,)
 
 
 def reflective_query():
@@ -86,6 +100,7 @@ def test_provider_results_are_normalized_without_claiming_unknown_rights():
         reflective_query(),
         {"providers": [{"type": "wikimedia", "enabled": True}]},
         opener=lambda *_args, **_kwargs: FakeResponse(json.dumps(payload).encode()),
+        resolver=public_resolver,
     )
 
     assert len(candidates) == 1
@@ -123,18 +138,17 @@ def test_provider_discards_non_http_download_results():
         reflective_query(),
         {"providers": [{"type": "wikimedia", "enabled": True}]},
         opener=lambda *_args, **_kwargs: FakeResponse(json.dumps(payload).encode()),
+        resolver=public_resolver,
     )
 
     assert values == []
 
 
 def test_download_rejects_non_http_url(tmp_path):
-    from videocreator.bgm_search import BgmSearchError, download_candidate
-
-    candidate = online_candidate(download_url="file:///C:/secret.mp3")
+    from videocreator.bgm_search import BgmSearchError
 
     with pytest.raises(BgmSearchError, match="http"):
-        download_candidate(candidate, tmp_path, opener=lambda *_: None)
+        online_candidate(download_url="file:///C:/secret.mp3")
 
 
 def test_candidate_normalizes_non_string_rights_status_to_unknown():
@@ -142,25 +156,30 @@ def test_candidate_normalizes_non_string_rights_status_to_unknown():
 
 
 def test_download_rejects_private_network_host(tmp_path):
-    from videocreator.bgm_search import BgmSearchError, download_candidate
-
-    candidate = online_candidate(download_url="http://127.0.0.1/secret.mp3")
+    from videocreator.bgm_search import BgmSearchError
 
     with pytest.raises(BgmSearchError, match="public"):
-        download_candidate(candidate, tmp_path, opener=lambda *_: None)
+        online_candidate(download_url="http://127.0.0.1/secret.mp3")
 
 
 def test_download_rejects_redirect_to_non_http_scheme_and_removes_partial_file(tmp_path):
     from videocreator.bgm_search import BgmSearchError, download_candidate
 
+    response = FakeResponse(
+        b"",
+        status=302,
+        headers={"Location": "file:///C:/secret.mp3"},
+    )
     with pytest.raises(BgmSearchError, match="redirect"):
         download_candidate(
             online_candidate(),
             tmp_path,
-            opener=lambda *_args, **_kwargs: FakeResponse(b"audio", "file:///C:/secret.mp3"),
+            opener=lambda *_args, **_kwargs: response,
+            resolver=public_resolver,
         )
 
     assert list(tmp_path.iterdir()) == []
+    assert response.closed
 
 
 def test_download_enforces_size_limit_and_records_sha256(tmp_path):
@@ -173,6 +192,7 @@ def test_download_enforces_size_limit_and_records_sha256(tmp_path):
             tmp_path,
             opener=lambda *_args, **_kwargs: FakeResponse(b"12345"),
             max_download_bytes=4,
+            resolver=public_resolver,
         )
     assert list(tmp_path.iterdir()) == []
 
@@ -180,6 +200,7 @@ def test_download_enforces_size_limit_and_records_sha256(tmp_path):
         oversized,
         tmp_path,
         opener=lambda *_args, **_kwargs: FakeResponse(b"audio"),
+        resolver=public_resolver,
     )
     assert path.parent == tmp_path
     assert path.name != "file.mp3"
@@ -222,7 +243,11 @@ def test_candidate_to_track_preserves_online_provenance(tmp_path):
     path.write_bytes(b"audio")
     candidate = online_candidate(license="CC BY 4.0", rights_status="unknown")
 
-    track = candidate_to_track(candidate, path)
+    track = candidate_to_track(
+        candidate,
+        path,
+        probe=lambda _: MediaMetadata("audio", "mp3", None, None, 1000),
+    )
 
     assert track.level == "online"
     assert track.path == path
