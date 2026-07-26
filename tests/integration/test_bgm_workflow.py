@@ -86,6 +86,8 @@ def write_sidecar(
     track_id: str,
     *,
     source_url: str = "https://example.test/music/source",
+    provider: str | None = None,
+    rights_status: str = "cleared",
 ) -> Path:
     sidecar = audio.with_suffix(".bgm.json")
     sidecar.write_text(
@@ -96,8 +98,9 @@ def write_sidecar(
                 "title": f"Track {track_id}",
                 "creator": "Fixture Composer",
                 "source_url": source_url,
+                "provider": provider,
                 "license": "CC BY 4.0",
-                "rights_status": "cleared",
+                "rights_status": rights_status,
                 "subjects": ["technology", "education"],
                 "moods": ["curious", "calm", "technological"],
                 "energy": "low-medium",
@@ -469,7 +472,12 @@ def test_selected_track_and_mix_hash_gates_fail_closed(tmp_path: Path):
         ensure_bgm_mix_gate(final_mix, report_path)
 
 
-def make_e2e_context(tmp_path: Path) -> WorkflowContext:
+def make_e2e_context(
+    tmp_path: Path,
+    *,
+    provider: str | None = None,
+    rights_status: str = "cleared",
+) -> WorkflowContext:
     template = load_template(REPO_ROOT / "templates", "science-explainer")
     projects_root = tmp_path / "projects"
     project = initialize_project(
@@ -480,7 +488,12 @@ def make_e2e_context(tmp_path: Path) -> WorkflowContext:
     )
     bgm = project / "library" / "bgm" / "calm-technology.wav"
     generate_audio(bgm, 3, 180)
-    write_sidecar(bgm, "calm-technology")
+    write_sidecar(
+        bgm,
+        "calm-technology",
+        provider=provider,
+        rights_status=rights_status,
+    )
     library = resolve_bgm_library(REPO_ROOT, project, template)
     run_paths = create_run(
         project,
@@ -694,3 +707,46 @@ def test_local_bgm_workflow_mixes_and_renders_one_audio_stream(tmp_path: Path):
             "NUL" if sys.platform == "win32" else "/dev/null",
         ]
     )
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(
+    not RENDERER_AVAILABLE,
+    reason="Node, npm, FFmpeg, and ffprobe are required",
+)
+def test_local_blank_provenance_is_canonical_through_render_gate(tmp_path: Path):
+    context = make_e2e_context(
+        tmp_path,
+        provider="",
+        rights_status="",
+    )
+
+    main.run_bgm(context)
+    main.run_video_render(context)
+
+    artifacts = context.manifest["artifacts"]
+    selection = json.loads(
+        Path(artifacts["bgm_selection"]).read_text(encoding="utf-8")
+    )
+    report = json.loads(
+        Path(artifacts["bgm_mix_report"]).read_text(encoding="utf-8")
+    )
+    frozen = json.loads(
+        Path(artifacts["bgm_source_metadata"]).read_text(encoding="utf-8")
+    )
+    lineage = context.manifest["lineage"]["bgm"]
+
+    for record in (
+        selection["track"],
+        report["provenance"],
+        frozen,
+        lineage,
+    ):
+        assert record["provider"] is None
+        assert record["rights_status"] == "unknown"
+    assert Path(artifacts["final_video"]).is_file()
+    assert main.resolve_context_render_audio(context).is_file()
+
+    lineage["rights_status"] = "cleared"
+    with pytest.raises(RuntimeError, match="bgm_manifest_provenance_mismatch"):
+        main.resolve_context_render_audio(context)

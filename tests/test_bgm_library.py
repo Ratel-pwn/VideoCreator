@@ -141,6 +141,30 @@ def test_unknown_rights_status_keeps_track_and_appends_warning(tmp_path, monkeyp
     )
 
 
+def test_blank_provider_and_rights_status_are_canonicalized(
+    tmp_path,
+    monkeypatch,
+):
+    from videocreator.bgm_library import load_bgm_directory
+
+    write_track(
+        tmp_path,
+        "blank-provenance",
+        provider="   ",
+        rights_status="\t ",
+    )
+    monkeypatch.setattr(
+        "videocreator.bgm_library.probe_media",
+        lambda _: MediaMetadata("audio", "mp3", None, None, 1_000),
+    )
+
+    tracks, warnings = load_bgm_directory(tmp_path, "project")
+
+    assert tracks[0].provider is None
+    assert tracks[0].rights_status == "unknown"
+    assert any("rights status is unknown" in warning for warning in warnings)
+
+
 def test_duplicate_track_ids_are_rejected_and_lower_level_is_used(
     tmp_path, monkeypatch
 ):

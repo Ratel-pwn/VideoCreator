@@ -42,6 +42,18 @@ class BgmTrack:
     metadata_sha256: str = ""
     provider: str | None = None
 
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "provider",
+            normalize_bgm_provider(self.provider),
+        )
+        object.__setattr__(
+            self,
+            "rights_status",
+            normalize_bgm_rights_status(self.rights_status),
+        )
+
 
 @dataclass(frozen=True)
 class BgmLibrarySelection:
@@ -71,6 +83,17 @@ def _optional_string(value: Any, field: str) -> str | None:
     if not isinstance(value, str):
         raise ValueError(f"{field} must be a string")
     return value or None
+
+
+def normalize_bgm_provider(value: Any) -> str | None:
+    provider = _optional_string(value, "provider")
+    if provider is None:
+        return None
+    return provider.strip() or None
+
+
+def normalize_bgm_rights_status(value: Any) -> str:
+    return str(value if value is not None else "unknown").strip() or "unknown"
 
 
 def _source_url(value: Any) -> str | None:
@@ -135,9 +158,9 @@ def _load_track(audio_path: Path, level: str) -> BgmTrack:
         title=raw["title"],
         creator=_optional_string(raw.get("creator"), "creator"),
         source_url=_source_url(raw.get("source_url")),
-        provider=_optional_string(raw.get("provider"), "provider"),
+        provider=normalize_bgm_provider(raw.get("provider")),
         license=_optional_string(raw.get("license"), "license"),
-        rights_status=str(raw.get("rights_status", "unknown")) or "unknown",
+        rights_status=normalize_bgm_rights_status(raw.get("rights_status")),
         subjects=_as_string_tuple(raw["subjects"], "subjects"),
         moods=_as_string_tuple(raw["moods"], "moods"),
         energy=raw["energy"],

@@ -26,6 +26,8 @@ from videocreator.durable_io import atomic_write_json
 from videocreator.bgm_library import (
     BgmLibrarySelection,
     BgmTrack,
+    normalize_bgm_provider,
+    normalize_bgm_rights_status,
     resolve_bgm_library,
 )
 from videocreator.bgm_mix import (
@@ -1464,7 +1466,15 @@ def freeze_bgm_source(ctx: WorkflowContext, track: BgmTrack) -> BgmTrack:
             metadata_path,
             track.metadata_sha256,
         )
-        metadata_hash = track.metadata_sha256
+        frozen_metadata = load_json(metadata_path)
+        frozen_metadata["provider"] = normalize_bgm_provider(
+            frozen_metadata.get("provider")
+        )
+        frozen_metadata["rights_status"] = normalize_bgm_rights_status(
+            frozen_metadata.get("rights_status")
+        )
+        save_json(metadata_path, frozen_metadata)
+        metadata_hash = sha256_file(metadata_path)
     return replace(
         track,
         path=audio_path,
@@ -1922,22 +1932,29 @@ def _ensure_context_bgm_lineage(
             raise RuntimeError("bgm_manifest_provenance_mismatch")
 
         def provenance_value(record: dict[str, Any], field: str) -> Any:
-            if field in record:
-                return record[field]
-            return None if field == "provider" else "unknown"
+            value = record.get(field)
+            if field == "provider":
+                return normalize_bgm_provider(value)
+            return normalize_bgm_rights_status(value)
 
         for field in ("provider", "rights_status"):
             if field not in lineage:
                 continue
-            expected = lineage[field]
-            if any(
-                provenance_value(record, field) != expected
-                for record in (
-                    selected_track,
-                    report_provenance,
-                    frozen_metadata,
+            try:
+                expected = provenance_value(lineage, field)
+                mismatch = any(
+                    provenance_value(record, field) != expected
+                    for record in (
+                        selected_track,
+                        report_provenance,
+                        frozen_metadata,
+                    )
                 )
-            ):
+            except ValueError as exc:
+                raise RuntimeError(
+                    "bgm_manifest_provenance_mismatch"
+                ) from exc
+            if mismatch:
                 raise RuntimeError("bgm_manifest_provenance_mismatch")
     if (
         Path(str(lineage.get("selection"))).resolve() != selection_path
