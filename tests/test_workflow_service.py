@@ -558,6 +558,35 @@ def test_result_uses_strict_public_allowlist_and_current_run_containment(
     )["artifacts"]
 
 
+def test_result_rejects_same_directory_manifest_aliases(tmp_path: Path):
+    service = build_service(tmp_path)
+    service.initialize_project("demo", "chaos-museum")
+    service.start_workflow("demo", "A topic", run_id="run-1")
+    run = tmp_path / "projects/demo/runs/run-1"
+    private_draft = run / "writing/private.md"
+    render_input = run / "render/render-input.json"
+    private_draft.write_text("PRIVATE-DRAFT", encoding="utf-8")
+    render_input.write_text('{"private": true}', encoding="utf-8")
+    manifest_path = run / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["artifacts"].update(
+        {
+            "draft_approved": str(private_draft),
+            "final_video": str(render_input),
+        }
+    )
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    result = service.get_workflow_result(
+        "demo",
+        "run-1",
+        include_text=["draft_approved"],
+    )
+
+    assert "draft_approved" not in result["artifacts"]
+    assert "final_video" not in result["artifacts"]
+
+
 @pytest.mark.parametrize(
     "name",
     [

@@ -74,6 +74,8 @@ def import_legacy_project(
         raise ValueError(f"Invalid project.json: {project_path}") from exc
     if not isinstance(project, dict):
         raise ValueError(f"Invalid project.json: {project_path}")
+    if project.get("schema_version") != 2:
+        raise ValueError("project.json must use schema_version 2")
     project_name = project.get("name")
     if not isinstance(project_name, str) or not project_name.strip():
         raise ValueError("project.json must declare name")

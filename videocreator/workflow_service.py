@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -33,21 +34,34 @@ PUBLIC_RESULT_ARTIFACTS = frozenset(
         "render_report",
     }
 )
-PUBLIC_ARTIFACT_DIRECTORIES = {
-    "draft_approved": "writing",
-    "voice_audio": "audio",
-    "voice_subtitle": "subtitles",
-    "subtitle_sync_audit": "review",
-    "visual_plan": "visual",
-    "visual_plan_audit": "visual",
-    "asset_manifest": "visual",
-    "bgm_selection": "audio",
-    "bgm_mix_report": "audio",
-    "final_mix": "audio",
-    "voice_audio_cleaned": "audio",
-    "voice_subtitle_cleaned": "subtitles",
-    "final_video": "render",
-    "render_report": "render",
+PUBLIC_ARTIFACT_PATTERNS = {
+    "draft_approved": (r"writing/script\.approved\.md",),
+    "voice_audio": (
+        r"audio/voice\.(?:mp3|wav|m4a|aac|flac|ogg)",
+        r"audio/narration\.imported\.(?:mp3|wav|m4a|aac|flac|ogg)",
+    ),
+    "voice_subtitle": (
+        r"audio/voice\.srt",
+        r"subtitles/subtitles\.imported\.srt",
+    ),
+    "subtitle_sync_audit": (r"review/subtitle-sync-audit\.json",),
+    "visual_plan": (r"visual/visual-plan\.json",),
+    "visual_plan_audit": (r"visual/visual-plan-audit\.json",),
+    "asset_manifest": (r"visual/asset-manifest\.json",),
+    "bgm_selection": (r"audio/bgm-selection\.json",),
+    "bgm_mix_report": (r"audio/bgm-mix-report\.json",),
+    "final_mix": (r"audio/final-mix\.wav",),
+    "voice_audio_cleaned": (
+        r"audio/final-mix\.wav",
+        r"audio/voice\.(?:mp3|wav|m4a|aac|flac|ogg)",
+        r"audio/narration\.imported\.(?:mp3|wav|m4a|aac|flac|ogg)",
+    ),
+    "voice_subtitle_cleaned": (
+        r"audio/voice\.srt",
+        r"subtitles/subtitles\.imported\.srt",
+    ),
+    "final_video": (r"render/final\.mp4",),
+    "render_report": (r"render/render-report\.json",),
 }
 
 
@@ -232,15 +246,16 @@ class WorkflowService:
         key: str,
         raw_path: Any,
     ) -> Path | None:
-        expected_directory = PUBLIC_ARTIFACT_DIRECTORIES.get(key)
-        if expected_directory is None:
+        patterns = PUBLIC_ARTIFACT_PATTERNS.get(key)
+        if patterns is None:
             return None
         try:
             path = Path(raw_path).resolve()
             relative = path.relative_to(run.resolve())
         except (OSError, TypeError, ValueError):
             return None
-        if not relative.parts or relative.parts[0] != expected_directory:
+        relative_posix = relative.as_posix()
+        if not any(re.fullmatch(pattern, relative_posix) for pattern in patterns):
             return None
         return path
 

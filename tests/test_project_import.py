@@ -11,14 +11,19 @@ from videocreator.project_import import discover_legacy_artifacts, import_legacy
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
-def make_project(root: Path, *, include_project_json: bool = True) -> None:
+def make_project(
+    root: Path,
+    *,
+    include_project_json: bool = True,
+    schema_version: int = 2,
+) -> None:
     for folder in ("audio", "drafts", "runs"):
         (root / folder).mkdir(parents=True, exist_ok=True)
     if include_project_json:
         (root / "project.json").write_text(
             json.dumps(
                 {
-                    "schema_version": 2,
+                    "schema_version": schema_version,
                     "name": root.name,
                     "template_id": "chaos-museum",
                 }
@@ -94,6 +99,23 @@ def test_import_requires_valid_project_template_before_publishing(
     artifacts = discover_legacy_artifacts(tmp_path)
 
     with pytest.raises(ValueError, match="project.json"):
+        import_legacy_project(
+            tmp_path,
+            "legacy-run",
+            artifacts,
+            repo_root=REPO_ROOT,
+        )
+
+    assert not (tmp_path / "runs/legacy-run").exists()
+
+
+def test_import_rejects_unsupported_project_schema_before_publishing(
+    tmp_path: Path,
+):
+    make_project(tmp_path, schema_version=1)
+    artifacts = discover_legacy_artifacts(tmp_path)
+
+    with pytest.raises(ValueError, match="schema_version 2"):
         import_legacy_project(
             tmp_path,
             "legacy-run",
