@@ -3,6 +3,8 @@ import json
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from videocreator.media import MediaMetadata
 
 
@@ -203,3 +205,66 @@ def test_local_track_source_url_rejects_userinfo_without_leaking_secret(
     assert tracks == ()
     assert any("userinfo" in warning for warning in warnings)
     assert "SUPER-SECRET" not in "\n".join(warnings)
+
+
+@pytest.mark.parametrize(
+    "source_url",
+    (
+        "https://example.test/source?token=SUPER-SECRET",
+        "https://example.test/source#SUPER-SECRET",
+    ),
+)
+def test_local_track_source_url_rejects_query_or_fragment_without_leaking_secret(
+    tmp_path,
+    monkeypatch,
+    source_url,
+):
+    from videocreator.bgm_library import load_bgm_directory
+
+    write_track(tmp_path, "secret-url", source_url=source_url)
+    monkeypatch.setattr(
+        "videocreator.bgm_library.probe_media",
+        lambda _: MediaMetadata("audio", "mp3", None, None, 1_000),
+    )
+
+    tracks, warnings = load_bgm_directory(tmp_path, "project")
+
+    assert tracks == ()
+    assert any("query or fragment" in warning for warning in warnings)
+    assert "SUPER-SECRET" not in "\n".join(warnings)
+
+
+def test_unsafe_project_source_url_falls_through_to_template_without_secret(
+    tmp_path,
+    monkeypatch,
+):
+    from videocreator.bgm_library import resolve_bgm_library
+    from videocreator.project_layout import create_run
+
+    repo, project, template = make_bgm_tree(tmp_path)
+    write_track(
+        project / "library/bgm",
+        "unsafe-project",
+        source_url="https://example.test/source?token=SUPER-SECRET",
+    )
+    write_track(template.root / "library/bgm", "safe-template")
+    monkeypatch.setattr(
+        "videocreator.bgm_library.probe_media",
+        lambda _: MediaMetadata("audio", "mp3", None, None, 1_000),
+    )
+
+    selected = resolve_bgm_library(repo, project, template)
+
+    assert selected.level == "template"
+    assert [track.id for track in selected.tracks] == ["safe-template"]
+    assert "SUPER-SECRET" not in "\n".join(selected.warnings)
+    (project / "project.json").write_text(
+        json.dumps({"name": "demo", "template_id": template.id}),
+        encoding="utf-8",
+    )
+    run = create_run(project, "run-001", template, {"bgm": selected})
+    snapshot_text = (run.inputs / "library.snapshot.json").read_text(
+        encoding="utf-8"
+    )
+    assert "unsafe-project" not in snapshot_text
+    assert "SUPER-SECRET" not in snapshot_text

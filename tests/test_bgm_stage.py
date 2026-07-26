@@ -378,6 +378,7 @@ def test_freeze_bgm_source_materializes_separate_metadata_sidecar(context):
         preferred_start_ms=0,
         loopable=True,
         metadata_sha256=digest,
+        provider="agent-web-search",
     )
 
     frozen = main.freeze_bgm_source(context, track)
@@ -386,6 +387,49 @@ def test_freeze_bgm_source_materializes_separate_metadata_sidecar(context):
     assert frozen.metadata_path.is_file()
     assert frozen.metadata_path != frozen.path
     assert frozen.metadata_sha256 == main.sha256_file(frozen.metadata_path)
+    metadata_payload = json.loads(frozen.metadata_path.read_text(encoding="utf-8"))
+    assert metadata_payload["provider"] == "agent-web-search"
+
+
+def test_selection_and_manifest_lineage_preserve_provider(context):
+    source = context.run_dir / "audio" / "online.wav"
+    source.write_bytes(b"online")
+    digest = main.sha256_file(source)
+    track = BgmTrack(
+        id="online",
+        path=source,
+        metadata_path=source,
+        level="online",
+        sha256=digest,
+        title="Online",
+        creator="Composer",
+        source_url="https://example.test/source",
+        license="CC BY 4.0",
+        rights_status="cleared",
+        subjects=(),
+        moods=(),
+        energy="low",
+        tempo_bpm=90,
+        instrumental=True,
+        template_tags=(),
+        avoid_for=(),
+        preferred_start_ms=0,
+        loopable=True,
+        metadata_sha256=digest,
+        provider="wikimedia",
+    )
+    resolved = resolution("bgm", track)
+    selection_path = main._write_bgm_selection(context, resolved, track)
+    report_path = context.run_dir / "audio" / "bgm-mix-report.json"
+    report_path.write_text("{}", encoding="utf-8")
+    main._record_bgm_lineage(context, resolved, source, report_path)
+
+    selection = json.loads(selection_path.read_text(encoding="utf-8"))
+    lineage = context.manifest["lineage"]["bgm"]
+    assert selection["track"]["provider"] == "wikimedia"
+    assert selection["track"]["rights_status"] == "cleared"
+    assert lineage["provider"] == "wikimedia"
+    assert lineage["rights_status"] == "cleared"
 
 
 def test_disabled_bgm_bypasses_library_resolution_and_snapshot(context, monkeypatch):

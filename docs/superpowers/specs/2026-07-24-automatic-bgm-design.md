@@ -171,7 +171,7 @@ Every run freezes the selected inputs and generated outputs:
 ```text
 runs/<run-id>/inputs/library.snapshot.json   # Selected BGM library level and hashes
 runs/<run-id>/audio/bgm.source.<ext>         # Frozen selected local or online track
-runs/<run-id>/audio/bgm-selection.json       # Candidates, scores, rejection reasons, provenance
+runs/<run-id>/audio/bgm-selection.json       # Query, policy, scores, selected track, provenance, warnings
 runs/<run-id>/audio/bgm.prepared.wav         # Normalized, cropped or looped BGM stem
 runs/<run-id>/audio/final-mix.wav            # Narration plus BGM
 runs/<run-id>/audio/bgm-mix-report.json      # Hash chain, mix parameters, loudness, warnings

@@ -248,6 +248,7 @@ def _track_from_dict(
         request,
         normalized["metadata_path"],
     )
+    normalized.setdefault("provider", None)
     for field in tuple_fields:
         normalized[field] = tuple(normalized.get(field, ()))
     return BgmTrack(**normalized)

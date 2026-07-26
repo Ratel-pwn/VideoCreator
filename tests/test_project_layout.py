@@ -68,6 +68,7 @@ def test_run_snapshots_bgm_audio_sidecar_hashes_and_provenance(tmp_path):
         "Example Composer", "https://example.com/calm", "CC BY 4.0", "verified",
         (), (), "low", None, True, (), (), 0, True,
         hashlib.sha256(metadata.read_bytes()).hexdigest(),
+        "wikimedia",
     )
 
     run = create_run(project, "run-bgm", template, {
@@ -86,6 +87,7 @@ def test_run_snapshots_bgm_audio_sidecar_hashes_and_provenance(tmp_path):
         "provenance": {
             "creator": "Example Composer",
             "source_url": "https://example.com/calm",
+            "provider": "wikimedia",
             "license": "CC BY 4.0",
             "rights_status": "verified",
         },

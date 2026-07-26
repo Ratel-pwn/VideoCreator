@@ -49,6 +49,7 @@ def make_result(tmp_path: Path):
         preferred_start_ms=0,
         loopable=True,
         metadata_sha256=hashlib.sha256(metadata.read_bytes()).hexdigest(),
+        provider="wikimedia",
     )
     return BgmMixResult(
         narration_path=narration,
@@ -93,6 +94,8 @@ def test_mix_report_records_hash_chain_provenance_and_measurement(tmp_path):
     assert report["configuration_sha256"] == "config-hash"
     assert report["measurement"]["integrated_lufs"] == -16.1
     assert report["provenance"]["source_url"] == "https://example.com/source"
+    assert report["provenance"]["provider"] == "wikimedia"
+    assert report["provenance"]["rights_status"] == "known"
     assert json.loads(path.read_text(encoding="utf-8")) == report
 
 

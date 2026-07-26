@@ -31,6 +31,7 @@ Example sidecar:
   "title": "Calm Technology",
   "creator": "Example Composer",
   "source_url": "https://example.org/tracks/calm-technology",
+  "provider": null,
   "license": "CC BY 4.0",
   "rights_status": "cleared",
   "subjects": ["technology", "education"],
@@ -57,7 +58,8 @@ Example sidecar:
 | `energy` | Yes | Non-empty energy label such as `low`, `low-medium`, or `medium`. |
 | `instrumental` | Yes | Boolean; template policy normally rejects vocals. |
 | `creator` | No | Creator or performer attribution. |
-| `source_url` | No | Public HTTP(S) source page without credentials or signed query data. |
+| `source_url` | No | Public HTTP(S) source page without userinfo, query parameters, or fragments. Unsafe values make the track ineligible without echoing the URL in warnings. |
+| `provider` | No | Origin provider for imported online media; local tracks normally use `null`. |
 | `license` | No | License or usage basis recorded in selection provenance. |
 | `rights_status` | No | Rights review label; missing or `unknown` remains eligible but emits a warning. |
 | `tempo_bpm` | No | Numeric tempo or `null`. |
@@ -78,7 +80,7 @@ The first level containing at least one eligible track wins completely. Tracks f
 
 ## Online Fallback
 
-When no local candidate is eligible, VideoCreator queries enabled core providers from `config/bgm-search.local.json`, falling back to the committed `config/bgm-search.example.json` defaults when the local file is absent. Provider candidates must expose public HTTP(S) source and download URLs. Downloads are size-bounded, redirect- and host-validated, media-probed, stored inside the run, and retain creator, source, provider, license, and rights metadata.
+When no local candidate is eligible, VideoCreator queries enabled core providers from `config/bgm-search.local.json`, falling back to the committed `config/bgm-search.example.json` defaults when the local file is absent. Provider candidates must expose public HTTP(S) source and download URLs. Downloads are size-bounded, redirect- and host-validated, media-probed, stored inside the run, and retain creator, source, provider, license, and rights metadata through selection, resolution ledgers, frozen sidecars, mix reports, and run lineage.
 
 If providers do not produce an eligible track and the workflow is running through an MCP-capable Agent, it writes a durable `bgm_candidates` interaction. The Agent searches public downloadable material and returns the declared JSON schema. The run waits and resumes from that interaction without discarding accepted responses or duplicating validated downloads.
 

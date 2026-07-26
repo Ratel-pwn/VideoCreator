@@ -158,6 +158,7 @@ def write_bgm_mix_report(
         "provenance": {
             "creator": result.bgm.creator,
             "source_url": result.bgm.source_url,
+            "provider": result.bgm.provider,
             "license": result.bgm.license,
             "rights_status": result.bgm.rights_status,
         },

@@ -40,6 +40,7 @@ class BgmTrack:
     preferred_start_ms: int
     loopable: bool
     metadata_sha256: str = ""
+    provider: str | None = None
 
 
 @dataclass(frozen=True)
@@ -81,6 +82,8 @@ def _source_url(value: Any) -> str | None:
         raise ValueError("source_url must use http or https")
     if parsed.username is not None or parsed.password is not None:
         raise ValueError("source_url must not contain userinfo")
+    if parsed.query or parsed.fragment:
+        raise ValueError("source_url must not contain query or fragment")
     return normalized
 
 
@@ -132,6 +135,7 @@ def _load_track(audio_path: Path, level: str) -> BgmTrack:
         title=raw["title"],
         creator=_optional_string(raw.get("creator"), "creator"),
         source_url=_source_url(raw.get("source_url")),
+        provider=_optional_string(raw.get("provider"), "provider"),
         license=_optional_string(raw.get("license"), "license"),
         rights_status=str(raw.get("rights_status", "unknown")) or "unknown",
         subjects=_as_string_tuple(raw["subjects"], "subjects"),

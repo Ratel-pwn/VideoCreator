@@ -118,7 +118,7 @@ Each populated library level completely overrides lower levels; tracks are not m
 
 The stage freezes the chosen audio and sidecar, loops or crops the BGM to narration duration, applies fades and narration-driven ducking, and writes:
 
-- `audio/bgm-selection.json`: query, candidates, scores, selected track, source URL, attribution, license, rights status, and warnings.
+- `audio/bgm-selection.json`: query, effective policy, per-track scores, selected track, source URL, provider, attribution, license, rights status, and warnings.
 - `audio/bgm-mix-report.json`: input/output hashes, settings, duration, loudness, FFmpeg evidence, provenance, and gate findings.
 - `audio/final-mix.wav`: the sole render audio when BGM mixing succeeds.
 

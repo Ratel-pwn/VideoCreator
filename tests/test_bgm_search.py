@@ -253,4 +253,6 @@ def test_candidate_to_track_preserves_online_provenance(tmp_path):
     assert track.path == path
     assert track.metadata_path == path
     assert track.source_url == candidate.source_page_url
+    assert track.provider == candidate.provider
+    assert track.rights_status == candidate.rights_status
     assert track.sha256 == hashlib.sha256(b"audio").hexdigest()

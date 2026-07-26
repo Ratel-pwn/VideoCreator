@@ -1089,6 +1089,20 @@ def test_defensive_source_url_redaction_removes_userinfo_and_signed_query():
     assert "SIGNED" not in redacted
 
 
+def test_legacy_track_ledger_without_provider_remains_readable(tmp_path):
+    from videocreator import bgm_workflow
+
+    req = request(tmp_path)
+    legacy = track(req.download_dir, track_id="legacy")
+    payload = bgm_workflow._track_to_dict(req, legacy)
+    payload.pop("provider", None)
+
+    restored = bgm_workflow._track_from_dict(req, payload)
+
+    assert restored.id == legacy.id
+    assert restored.provider is None
+
+
 def test_stale_request_cleanup_cannot_delete_new_request_selected_media(
     tmp_path,
     monkeypatch,

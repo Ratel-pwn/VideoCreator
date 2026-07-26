@@ -1443,6 +1443,7 @@ def freeze_bgm_source(ctx: WorkflowContext, track: BgmTrack) -> BgmTrack:
                 "title": track.title,
                 "creator": track.creator,
                 "source_url": track.source_url,
+                "provider": track.provider,
                 "license": track.license,
                 "rights_status": track.rights_status,
                 "subjects": list(track.subjects),
@@ -1503,6 +1504,7 @@ def _bgm_selection_payload(
                 "level": track.level,
                 "creator": track.creator,
                 "source_url": track.source_url,
+                "provider": track.provider,
                 "license": track.license,
                 "rights_status": track.rights_status,
             }
@@ -1576,6 +1578,16 @@ def _record_bgm_lineage(
         "request_fingerprint": resolution.request_fingerprint,
         "mode": resolution.mode,
         "source": resolution.source,
+        "provider": (
+            resolution.track.provider
+            if resolution.track is not None
+            else None
+        ),
+        "rights_status": (
+            resolution.track.rights_status
+            if resolution.track is not None
+            else None
+        ),
         "narration": ctx.manifest["artifacts"]["voice_audio"],
         "subtitle_sync_audit": ctx.manifest["artifacts"].get(
             "subtitle_sync_audit"

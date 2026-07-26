@@ -66,6 +66,7 @@ def _snapshot_library_item(item: LibrarySelection | BgmLibrarySelection) -> dict
                     "provenance": {
                         "creator": track.creator,
                         "source_url": track.source_url,
+                        "provider": track.provider,
                         "license": track.license,
                         "rights_status": track.rights_status,
                     },

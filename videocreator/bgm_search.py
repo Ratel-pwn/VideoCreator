@@ -1000,6 +1000,7 @@ def candidate_to_track(
         title=candidate.title,
         creator=candidate.creator,
         source_url=candidate.source_page_url,
+        provider=candidate.provider,
         license=candidate.license,
         rights_status=candidate.rights_status,
         subjects=candidate.subjects,

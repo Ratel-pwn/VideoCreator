@@ -301,6 +301,15 @@ def test_provider_fallback_downloads_and_preserves_attribution(
     assert result.track.source_url == candidate.source_page_url
     assert result.track.creator == candidate.creator
     assert result.track.license == candidate.license
+    assert result.track.provider == candidate.provider
+    assert result.track.rights_status == candidate.rights_status
+    ledger = json.loads(
+        next(
+            request.download_dir.glob("bgm-resolution-*.json")
+        ).read_text(encoding="utf-8")
+    )
+    assert ledger["track"]["provider"] == candidate.provider
+    assert ledger["track"]["rights_status"] == candidate.rights_status
 
 
 @pytest.mark.integration
@@ -345,6 +354,16 @@ def test_agent_fallback_waits_then_resumes_from_durable_state(
     assert result.mode == "bgm"
     assert result.source == "agent"
     assert result.interaction_id == interaction["id"]
+    assert result.track is not None
+    assert result.track.provider == candidate.provider
+    assert result.track.rights_status == candidate.rights_status
+    ledger = json.loads(
+        next(
+            resumed_request.download_dir.glob("bgm-resolution-*.json")
+        ).read_text(encoding="utf-8")
+    )
+    assert ledger["track"]["provider"] == candidate.provider
+    assert ledger["track"]["rights_status"] == candidate.rights_status
     assert "pending_interaction" not in resumed_context.state
     assert acknowledge_bgm_resolution(
         resumed_request,
