@@ -5,6 +5,7 @@ from pathlib import Path
 from videocreator.subtitle_sync import (
     SyncThresholds,
     audit_subtitle_sync,
+    parse_srt,
     sha256_file,
 )
 
@@ -13,6 +14,7 @@ def make_fixture(tmp_path: Path) -> dict:
     audio = tmp_path / "voice.wav"
     srt = tmp_path / "voice.srt"
     report = tmp_path / "alignment-report.json"
+    approved = tmp_path / "narration.txt"
     with wave.open(str(audio), "wb") as output:
         output.setnchannels(1)
         output.setsampwidth(2)
@@ -23,13 +25,21 @@ def make_fixture(tmp_path: Path) -> dict:
         "2\n00:00:01,000 --> 00:00:02,000\n第二句\n",
         encoding="utf-8",
     )
+    approved.write_text("绗竴鍙ョ浜屽彞\n", encoding="utf-8")
+    approved.write_text(
+        " ".join(item["text"] for item in parse_srt(srt)) + "\n",
+        encoding="utf-8",
+    )
     report.write_text(
         json.dumps({
             "audio_sha256": sha256_file(audio),
             "srt_sha256": sha256_file(srt),
+            "approved_text_path": str(approved),
+            "approved_text_sha256": sha256_file(approved),
             "exact_match_coverage": 0.98,
             "character_error_rate": 0.05,
             "timing_coverage": 1.0,
+            "max_unresolved_span_ms": 0,
             "blocks": [
                 {"index": 1, "boundary_drift_ms": 100, "confidence": 0.9},
                 {"index": 2, "boundary_drift_ms": 120, "confidence": 0.9},
@@ -106,6 +116,59 @@ def test_audit_passes_fresh_high_coverage_alignment(tmp_path):
 
     assert result["status"] == "passed"
     assert result["findings"] == []
+
+
+def test_audit_rejects_small_approved_text_omission_even_at_high_coverage(
+    tmp_path,
+):
+    fixture = make_fixture(tmp_path)
+    fixture["srt"].write_text(
+        "1\n00:00:00,000 --> 00:00:01,000\n绗竴鍙n",
+        encoding="utf-8",
+    )
+    report = json.loads(
+        fixture["alignment_report"].read_text(encoding="utf-8")
+    )
+    report["srt_sha256"] = sha256_file(fixture["srt"])
+    report["exact_match_coverage"] = 0.99
+    report["timing_coverage"] = 0.99
+    fixture["alignment_report"].write_text(
+        json.dumps(report),
+        encoding="utf-8",
+    )
+
+    result = audit_subtitle_sync(**fixture)
+
+    assert "approved_text_mismatch" in finding_codes(result)
+
+
+def test_audit_rejects_changed_approved_text_hash(tmp_path):
+    fixture = make_fixture(tmp_path)
+    report = json.loads(
+        fixture["alignment_report"].read_text(encoding="utf-8")
+    )
+    approved = Path(report["approved_text_path"])
+    approved.write_text("changed approved text", encoding="utf-8")
+
+    result = audit_subtitle_sync(**fixture)
+
+    assert "approved_text_hash_mismatch" in finding_codes(result)
+
+
+def test_audit_enforces_maximum_unresolved_span(tmp_path):
+    fixture = make_fixture(tmp_path)
+    report = json.loads(
+        fixture["alignment_report"].read_text(encoding="utf-8")
+    )
+    report["max_unresolved_span_ms"] = 2_100
+    fixture["alignment_report"].write_text(
+        json.dumps(report),
+        encoding="utf-8",
+    )
+
+    result = audit_subtitle_sync(**fixture)
+
+    assert "unresolved_span_too_long" in finding_codes(result)
 
 
 def test_audit_targets_the_segment_containing_unmatched_text(tmp_path):

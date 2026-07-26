@@ -8,6 +8,7 @@ from .interactions import interaction_fingerprint, validate_interaction_response
 from .durable_io import atomic_write_json
 from .job_queue import JobCancelledError, JobQueue
 from .project_layout import initialize_project
+from .run_identity import resolve_run_dir, validate_run_id
 from .runtime_config import McpRuntimeConfig
 from .templates import discover_templates
 
@@ -40,6 +41,7 @@ class WorkflowService:
         self.runtime = runtime
         self.templates_root = self._resolve(self.config.get("templates", {}).get("root", "templates"))
         self.projects_root = self._resolve(self.config.get("projects", {}).get("root", "projects"))
+        self.reconcile_workflow_outbox()
 
     def _resolve(self, value: str) -> Path:
         path = Path(value).expanduser()
@@ -56,10 +58,86 @@ class WorkflowService:
         return project
 
     def _run(self, project: str, run_id: str) -> Path:
-        path = (self._project(project) / "runs" / run_id).resolve()
+        try:
+            path = resolve_run_dir(self._project(project), run_id)
+        except ValueError as exc:
+            raise ServiceError("invalid_argument", str(exc)) from exc
         if not (path / "state.json").is_file():
             raise ServiceError("not_found", f"Run not found: {project}/{run_id}")
         return path
+
+    def reconcile_workflow_outbox(self) -> int:
+        if not self.projects_root.is_dir():
+            return 0
+        recovered = 0
+        for project_dir in sorted(self.projects_root.iterdir()):
+            if not (project_dir / "project.json").is_file():
+                continue
+            runs_root = project_dir / "runs"
+            if not runs_root.is_dir():
+                continue
+            for run_dir in sorted(runs_root.iterdir()):
+                state_path = run_dir / "state.json"
+                if not run_dir.is_dir() or not state_path.is_file():
+                    continue
+                try:
+                    state = json.loads(
+                        state_path.read_text(encoding="utf-8-sig")
+                    )
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if (
+                    state.get("execution_owner") != "mcp"
+                    or state.get("status")
+                    in {"completed", "cancelled", "failed"}
+                ):
+                    continue
+                run_id = str(state.get("run_id", ""))
+                try:
+                    expected_run = resolve_run_dir(project_dir, run_id)
+                except ValueError:
+                    continue
+                if expected_run != run_dir.resolve():
+                    continue
+                outbox = state.setdefault("queue_outbox", {})
+                action = outbox.get("action", "advance")
+                job = self.queue.get(project_dir.name, run_id)
+                if job is None:
+                    job = self.queue.enqueue(project_dir.name, run_id)
+                    recovered += 1
+                elif (
+                    action == "resume"
+                    and outbox.get("status") == "pending"
+                    and job.status == "failed"
+                ):
+                    try:
+                        job = self.queue.resume_failed(
+                            project_dir.name,
+                            run_id,
+                        )
+                        recovered += 1
+                    except ValueError:
+                        job = self.queue.get(project_dir.name, run_id)
+                        if job is None or job.status not in {
+                            "queued",
+                            "leased",
+                            "waiting",
+                        }:
+                            raise
+                if (
+                    outbox.get("status") != "dispatched"
+                    or outbox.get("job_id") != job.id
+                ):
+                    outbox.update(
+                        {
+                            "schema_version": 1,
+                            "action": job.action,
+                            "status": "dispatched",
+                            "job_id": job.id,
+                        }
+                    )
+                    atomic_write_json(state_path, state)
+        return recovered
 
     @staticmethod
     def _read_json(path: Path) -> dict[str, Any]:
@@ -127,20 +205,39 @@ class WorkflowService:
         if not topic.strip():
             raise ServiceError("invalid_argument", "Topic cannot be empty")
         self._project(project)
+        if run_id is not None:
+            try:
+                validate_run_id(run_id)
+            except ValueError as exc:
+                raise ServiceError("invalid_argument", str(exc)) from exc
         import main as workflow
 
         try:
             ctx = workflow.make_run_context(
-                self.home, self.config_path, "chat", topic.strip(), run_id, None, project, None
+                self.home,
+                self.config_path,
+                "chat",
+                topic.strip(),
+                run_id,
+                None,
+                project,
+                None,
+                execution_owner="mcp",
+                initial_context=context,
             )
         except FileExistsError as exc:
             raise ServiceError("state_conflict", str(exc)) from exc
-        if context:
-            context_path = ctx.run_dir / "inputs" / "agent-context.md"
-            context_path.write_text(context.strip() + "\n", encoding="utf-8")
-            ctx.manifest.setdefault("artifacts", {})["agent_context"] = str(context_path)
-            ctx.save_manifest()
-        job = self.queue.enqueue(project, ctx.run_id)
+        try:
+            job = self.queue.enqueue(project, ctx.run_id)
+        except Exception as exc:
+            raise ServiceError(
+                "service_unavailable",
+                f"Workflow run was created but queue dispatch failed: {exc}",
+            ) from exc
+        ctx.state["queue_outbox"].update(
+            {"status": "dispatched", "job_id": job.id}
+        )
+        ctx.save_state()
         return {
             "project": project,
             "run_id": ctx.run_id,
@@ -272,11 +369,31 @@ class WorkflowService:
         state = self._read_json(run / "state.json")
         state["status"] = "ready"
         state.pop("last_error", None)
+        state["queue_outbox"] = {
+            "schema_version": 1,
+            "action": "resume",
+            "status": "pending",
+        }
         atomic_write_json(run / "state.json", state)
         try:
             job = self.queue.resume_failed(project, run_id)
-        except (KeyError, ValueError) as exc:
-            raise ServiceError("state_conflict", str(exc)) from exc
+        except Exception as exc:
+            current = self.queue.get(project, run_id)
+            if current is None or current.status not in {
+                "queued",
+                "leased",
+                "waiting",
+            }:
+                raise ServiceError(
+                    "service_unavailable",
+                    "Workflow resume was recorded but queue resume failed: "
+                    f"{exc}",
+                ) from exc
+            job = current
+        state["queue_outbox"].update(
+            {"status": "dispatched", "job_id": job.id}
+        )
+        atomic_write_json(run / "state.json", state)
         return {"project": project, "run_id": run_id, "status": job.status}
 
     def cancel_workflow(self, project: str, run_id: str) -> dict[str, Any]:

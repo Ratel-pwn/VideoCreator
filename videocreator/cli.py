@@ -173,7 +173,11 @@ def list_runs(project_root: Path) -> list[RunSummary]:
     runs_root = project_root / "runs"
     if not runs_root.is_dir():
         return []
-    values = [_load_run(path) for path in runs_root.iterdir() if path.is_dir()]
+    values = [
+        _load_run(path)
+        for path in runs_root.iterdir()
+        if path.is_dir() and not path.name.startswith(".creating-")
+    ]
     return sorted(values, key=lambda item: (item.sort_value, item.run_id), reverse=True)
 
 

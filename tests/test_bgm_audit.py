@@ -271,3 +271,25 @@ def test_audit_rejects_non_authoritative_audio_path(tmp_path):
 
     assert audit["status"] == "failed"
     assert "artifact_path_mismatch" in finding_codes(audit)
+
+
+def test_bgm_report_publication_does_not_use_non_atomic_path_write(
+    tmp_path,
+    monkeypatch,
+):
+    from videocreator import bgm_audit
+
+    output = tmp_path / "bgm-mix-report.json"
+    monkeypatch.setattr(
+        Path,
+        "write_text",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("non-atomic report write")
+        ),
+    )
+
+    bgm_audit._write_report({"schema_version": 1}, output)
+
+    assert json.loads(output.read_text(encoding="utf-8")) == {
+        "schema_version": 1
+    }

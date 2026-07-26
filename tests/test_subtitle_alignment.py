@@ -1,3 +1,5 @@
+import pytest
+
 from videocreator.subtitle_alignment import (
     RecognizedChar,
     align_approved_text,
@@ -54,6 +56,20 @@ def test_blocks_use_matched_character_boundaries():
     assert blocks[0].end_ms == 400
     assert blocks[1].start_ms == 800
     assert blocks[1].end_ms == 1200
+
+
+def test_blocks_fail_instead_of_dropping_an_unresolved_approved_chunk():
+    result = align_approved_text("abcd", chars("ab"))
+
+    with pytest.raises(ValueError, match="unresolved approved subtitle chunk"):
+        build_aligned_blocks(["ab", "cd"], result)
+
+
+def test_blocks_fail_when_segmentation_omits_approved_text():
+    result = align_approved_text("abcd", chars("abcd"))
+
+    with pytest.raises(ValueError, match="does not cover"):
+        build_aligned_blocks(["ab"], result)
 
 
 def test_whisper_artifacts_include_alignment_evidence():

@@ -160,6 +160,9 @@ class DurableInteractionPort:
     supports_agent_handoff = True
 
     def _append(self, ctx: InteractionContext, value: dict[str, Any]) -> None:
+        assert_active = getattr(ctx, "assert_active", None)
+        if callable(assert_active):
+            assert_active()
         path = ctx.run_dir / "session" / "interactions.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as stream:

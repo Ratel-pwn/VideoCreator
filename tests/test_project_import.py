@@ -26,7 +26,7 @@ def make_project(root: Path) -> None:
     )
 
 
-def test_import_registers_existing_files_without_moving_them(tmp_path: Path):
+def test_import_materializes_immutable_run_local_inputs(tmp_path: Path):
     make_project(tmp_path)
     artifacts = discover_legacy_artifacts(tmp_path)
 
@@ -34,8 +34,12 @@ def test_import_registers_existing_files_without_moving_them(tmp_path: Path):
 
     state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
     manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
-    assert state["current_stage"] == "visual_assets"
-    assert Path(manifest["artifacts"]["voice_audio"]).is_absolute()
+    assert state["current_stage"] == "subtitle_sync"
+    for key in ("draft_approved", "voice_audio", "voice_subtitle", "visual_plan"):
+        imported = Path(manifest["artifacts"][key]).resolve()
+        imported.relative_to(run_dir.resolve())
+        assert imported.is_file()
+    assert Path(manifest["artifacts"]["narration_text"]).is_file()
     assert (tmp_path / "audio" / "voice.mp3").is_file()
 
 

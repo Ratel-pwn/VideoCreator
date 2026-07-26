@@ -1,5 +1,7 @@
 import json
 import sqlite3
+import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -32,6 +34,150 @@ def test_worker_releases_waiting_job_without_occupying_lease(tmp_path: Path):
     assert worker.run_once()
     assert service.queue.get("demo", "run-1").status == "waiting"
     assert service.queue.get("demo", "run-1").worker_id is None
+
+
+def test_worker_stops_run_mutation_after_heartbeat_loses_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    service = prepare(tmp_path)
+    execute_started = threading.Event()
+    heartbeat_ran = threading.Event()
+    observed: dict[str, bool] = {}
+
+    def execute(ctx):
+        execute_started.set()
+        assert heartbeat_ran.wait(timeout=2)
+        ctx.state["stale_worker_write"] = True
+        with pytest.raises(RuntimeError, match="lease"):
+            ctx.save_state()
+        observed["fenced"] = True
+        return WorkflowOutcome("completed")
+
+    worker = WorkflowWorker(
+        service,
+        worker_id="worker-loses-lease",
+        execute=execute,
+    )
+
+    def lose_lease(_job, _stopped, lease_lost):
+        assert execute_started.wait(timeout=2)
+        lease_lost.set()
+        heartbeat_ran.set()
+
+    monkeypatch.setattr(worker, "_heartbeat", lose_lease)
+
+    assert worker.run_once()
+
+    state = json.loads(
+        (
+            tmp_path / "projects/demo/runs/run-1/state.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert observed["fenced"] is True
+    assert "stale_worker_write" not in state
+    assert service.queue.get("demo", "run-1").status == "queued"
+
+
+def test_worker_cannot_write_artifacts_after_lease_loss(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    service = prepare(tmp_path)
+    execute_started = threading.Event()
+    heartbeat_ran = threading.Event()
+
+    def execute(ctx):
+        import main
+
+        execute_started.set()
+        assert heartbeat_ran.wait(timeout=2)
+        with pytest.raises(RuntimeError, match="lease"):
+            main.persist_chat(
+                ctx,
+                [{"role": "user", "content": "stale artifact"}],
+            )
+        return WorkflowOutcome("completed")
+
+    worker = WorkflowWorker(
+        service,
+        worker_id="worker-artifact-fence",
+        execute=execute,
+    )
+
+    def lose_lease(_job, _stopped, lease_lost):
+        assert execute_started.wait(timeout=2)
+        lease_lost.set()
+        heartbeat_ran.set()
+
+    monkeypatch.setattr(worker, "_heartbeat", lose_lease)
+
+    assert worker.run_once()
+
+    run = tmp_path / "projects/demo/runs/run-1"
+    assert not (run / "session/conversation.json").exists()
+    assert not (run / "session/conversation.md").exists()
+
+
+def test_cancellation_terminates_subprocess_before_output_commit(
+    tmp_path: Path,
+):
+    service = prepare(tmp_path)
+    marker = tmp_path / "cancelled-subprocess-output.txt"
+
+    def execute(ctx):
+        service.queue.request_cancel("demo", "run-1")
+        ctx.run_process(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import pathlib,sys,time;"
+                    "time.sleep(0.5);"
+                    "pathlib.Path(sys.argv[1]).write_text('stale')"
+                ),
+                str(marker),
+            ],
+            check=True,
+        )
+        return WorkflowOutcome("completed")
+
+    worker = WorkflowWorker(
+        service,
+        worker_id="worker-cancel-subprocess",
+        execute=execute,
+    )
+
+    assert worker.run_once()
+
+    assert not marker.exists()
+    assert service.queue.get("demo", "run-1").status == "cancelled"
+
+
+def test_heartbeat_database_error_fences_worker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    service = prepare(tmp_path)
+    worker = WorkflowWorker(service, worker_id="worker-heartbeat-error")
+    job = service.queue.claim(worker.worker_id, 60)
+    lease_lost = threading.Event()
+
+    class StopAfterOneWait:
+        def wait(self, _interval):
+            return False
+
+    monkeypatch.setattr(
+        service.queue,
+        "renew",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            sqlite3.OperationalError("database unavailable")
+        ),
+    )
+
+    worker._heartbeat(job, StopAfterOneWait(), lease_lost)
+
+    assert lease_lost.is_set()
 
 
 def test_worker_completes_or_records_failure(tmp_path: Path):

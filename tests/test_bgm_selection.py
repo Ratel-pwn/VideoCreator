@@ -26,6 +26,7 @@ def track(track_id: str, **overrides) -> BgmTrack:
         "avoid_for": (),
         "preferred_start_ms": 0,
         "loopable": True,
+        "duration_ms": 60_000,
     }
     values.update(overrides)
     return BgmTrack(**values)
@@ -122,6 +123,30 @@ def test_selector_rejects_non_instrumental_tracks_when_required():
     assert not score.eligible
     assert score.rejection_reasons == ("instrumental_only",)
     assert selected.track is None
+
+
+def test_short_non_loopable_track_is_rejected_before_selection():
+    from videocreator.bgm_selection import select_bgm_candidate
+
+    short = track(
+        "short",
+        loopable=False,
+        duration_ms=2_000,
+        preferred_start_ms=500,
+    )
+    long = track("long", loopable=False, duration_ms=30_000)
+
+    result = select_bgm_candidate(
+        [short, long],
+        neutral_query(),
+        BgmPolicy(),
+        required_duration_ms=10_000,
+    )
+
+    assert result.track == long
+    rejected = next(score for score in result.scores if score.track_id == "short")
+    assert rejected.eligible is False
+    assert rejected.rejection_reasons == ("too_short_non_loopable",)
 
 
 def test_selector_penalizes_policy_avoid_tags():

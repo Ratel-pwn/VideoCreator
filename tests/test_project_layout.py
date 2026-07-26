@@ -4,6 +4,7 @@ import json
 import pytest
 
 from videocreator.bgm_library import BgmLibrarySelection, BgmTrack
+from videocreator import project_layout
 from videocreator.project_layout import create_run, initialize_project
 from videocreator.templates import load_template
 
@@ -80,6 +81,7 @@ def test_run_snapshots_bgm_audio_sidecar_hashes_and_provenance(tmp_path):
     assert snapshot["bgm"]["files"] == [{
         "path": str(audio),
         "sha256": "expected-audio-hash",
+        "duration_ms": 0,
         "metadata": {
             "path": str(metadata),
             "sha256": hashlib.sha256(metadata.read_bytes()).hexdigest(),
@@ -99,4 +101,50 @@ def test_initialize_project_never_overwrites(tmp_path):
     project.mkdir(parents=True)
     with pytest.raises(FileExistsError):
         initialize_project(tmp_path / "projects", "video", object())
+
+
+def test_run_is_not_published_when_snapshot_creation_fails(
+    tmp_path,
+    monkeypatch,
+):
+    template_root = tmp_path / "templates" / "demo"
+    template_root.mkdir(parents=True)
+    for name in ("prepare.md", "writing.md", "visual-planning.md"):
+        (template_root / name).write_text(name, encoding="utf-8")
+    for name in ("pacing.json", "subtitle.json", "composition.json"):
+        (template_root / name).write_text("{}", encoding="utf-8")
+    (template_root / "template.json").write_text(
+        json.dumps(
+            {
+                "id": "demo",
+                "version": 1,
+                "capabilities": ["prepare", "writing", "visual_planning"],
+                "paths": {
+                    "prepare": "prepare.md",
+                    "writing": "writing.md",
+                    "visual_planning": "visual-planning.md",
+                    "pacing": "pacing.json",
+                    "subtitle": "subtitle.json",
+                    "composition": "composition.json",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    template = load_template(tmp_path / "templates", "demo")
+    project = initialize_project(tmp_path / "projects", "video", template)
+    original = project_layout._write_json
+
+    def fail_library_snapshot(path, value):
+        if path.name == "library.snapshot.json":
+            raise OSError("snapshot write failed")
+        original(path, value)
+
+    monkeypatch.setattr(project_layout, "_write_json", fail_library_snapshot)
+
+    with pytest.raises(OSError, match="snapshot write failed"):
+        create_run(project, "run-crash", template, {})
+
+    assert not (project / "runs" / "run-crash").exists()
+    assert not list((project / "runs").glob(".creating-*"))
 

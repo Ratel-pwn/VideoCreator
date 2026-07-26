@@ -22,7 +22,13 @@ from videocreator.bgm_audit import (
     write_bgm_mix_report,
     write_narration_only_report,
 )
-from videocreator.durable_io import atomic_write_json
+from videocreator.durable_io import (
+    atomic_copy_file,
+    atomic_write_json,
+    atomic_write_text,
+    fsync_directory,
+)
+from videocreator.execution_fence import LeaseLostError
 from videocreator.bgm_library import (
     BgmLibrarySelection,
     BgmTrack,
@@ -60,6 +66,7 @@ from videocreator.render_contract import (
     normalize_scenes,
     normalize_v2_scenes,
 )
+from videocreator.run_identity import resolve_run_dir, validate_run_id
 from videocreator.subtitle_sync import (
     SyncThresholds,
     audit_subtitle_sync,
@@ -146,6 +153,12 @@ def save_json(path: Path, data: dict[str, Any]) -> None:
 
 def read_text(path: Path) -> str:
     return path.read_text(encoding="utf-8")
+
+
+def _assert_context_active(ctx: Any) -> None:
+    assert_active = getattr(ctx, "assert_active", None)
+    if callable(assert_active):
+        assert_active()
 
 
 def resolve_path(base: Path, value: str) -> Path:
@@ -291,6 +304,8 @@ class WorkflowContext:
     template: TemplateDefinition | None = None
     interactions: InteractionPort = field(default_factory=ConsoleInteractionPort)
     should_cancel: Callable[[], bool] = field(default=lambda: False)
+    mutation_guard: Callable[[], None] = field(default=lambda: None)
+    process_runner: Callable[..., Any] = field(default=subprocess.run)
 
     @property
     def output_root(self) -> Path:
@@ -366,6 +381,15 @@ class WorkflowContext:
         self.manifest.setdefault("artifacts", {})[key] = str(path)
         self.save_manifest()
 
+    def assert_active(self) -> None:
+        self.mutation_guard()
+
+    def run_process(self, command: Any, **kwargs: Any) -> Any:
+        self.assert_active()
+        result = self.process_runner(command, **kwargs)
+        self.assert_active()
+        return result
+
     def set_stage(self, stage: str, status: str = "in_progress", error: str | None = None) -> None:
         self.state["current_stage"] = stage
         self.state["status"] = status
@@ -377,19 +401,35 @@ class WorkflowContext:
         self.save_state()
 
     def save_state(self) -> None:
+        self.assert_active()
         save_json(self.run_dir / "state.json", self.state)
 
     def save_manifest(self) -> None:
+        self.assert_active()
         save_json(self.run_dir / "manifest.json", self.manifest)
 
 
-def make_run_context(repo_root: Path, config_path: Path, mode: str, topic: str, run_id: str | None, imported_chat: Path | None, project_name_override: str | None = None, template_id: str | None = None) -> WorkflowContext:
+def make_run_context(
+    repo_root: Path,
+    config_path: Path,
+    mode: str,
+    topic: str,
+    run_id: str | None,
+    imported_chat: Path | None,
+    project_name_override: str | None = None,
+    template_id: str | None = None,
+    *,
+    execution_owner: str | None = None,
+    initial_context: str | None = None,
+) -> WorkflowContext:
     config = load_json(config_path)
     if not config:
         raise RuntimeError(f"Config not found or empty: {config_path}")
     stem = slugify(topic or (imported_chat.stem if imported_chat else "workflow"))
     project_name = project_name_override or normalize_project_name(topic or (imported_chat.stem if imported_chat else stem))
-    actual_run_id = run_id or f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{stem}"
+    actual_run_id = validate_run_id(
+        run_id or f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{stem}"
+    )
     projects_root = resolve_path(repo_root, config.get("projects", {}).get("root") or config.get("output", {}).get("root") or "projects")
     project_root = projects_root / project_name
     project_config_path = project_root / "project.json"
@@ -409,9 +449,63 @@ def make_run_context(repo_root: Path, config_path: Path, mode: str, topic: str, 
         **{kind: resolve_library(repo_root, project_root, template, kind) for kind in ("style", "voice")},
         "bgm": resolve_bgm_library(repo_root, project_root, template),
     }
-    run_dir = project_root / "runs" / actual_run_id
-    if not run_dir.exists():
-        create_run(project_root, actual_run_id, template, libraries)
+    run_dir = resolve_run_dir(project_root, actual_run_id)
+    created_at = now_iso()
+    initial_state = {
+        "schema_version": 2,
+        "run_id": actual_run_id,
+        "project_name": project_name,
+        "mode": mode,
+        "current_stage": STAGE_PREPARE if mode == "chat" else STAGE_DRAFT,
+        "status": "created",
+        "created_at": created_at,
+        "updated_at": created_at,
+        "stages": {},
+    }
+    if execution_owner:
+        initial_state["execution_owner"] = execution_owner
+        initial_state["queue_outbox"] = {
+            "schema_version": 1,
+            "action": "advance",
+            "status": "pending",
+            "created_at": created_at,
+        }
+    initial_manifest = {
+        "schema_version": 2,
+        "run_id": actual_run_id,
+        "project": project_config["name"],
+        "project_name": project_name,
+        "mode": mode,
+        "topic": topic,
+        "created_at": created_at,
+        "template": {"id": template.id, "version": template.version},
+        "artifacts": {},
+    }
+    input_text_snapshots: dict[str, str] = {}
+    if initial_context and initial_context.strip():
+        normalized_context = initial_context.strip() + "\n"
+        context_path = run_dir / "inputs" / "agent-context.md"
+        input_text_snapshots["agent-context.md"] = normalized_context
+        initial_manifest["artifacts"] = {
+            "agent_context": str(context_path),
+        }
+        initial_manifest["lineage"] = {
+            "agent_context": {
+                "path": str(context_path),
+                "sha256": hashlib.sha256(
+                    normalized_context.encode("utf-8")
+                ).hexdigest(),
+            },
+        }
+    create_run(
+        project_root,
+        actual_run_id,
+        template,
+        libraries,
+        initial_state=initial_state,
+        initial_manifest=initial_manifest,
+        input_text_snapshots=input_text_snapshots,
+    )
 
     state_path = run_dir / "state.json"
     manifest_path = run_dir / "manifest.json"
@@ -429,6 +523,14 @@ def make_run_context(repo_root: Path, config_path: Path, mode: str, topic: str, 
         "project_name": project_name,
         "mode": mode,
     })
+    if execution_owner:
+        state["execution_owner"] = execution_owner
+        state["queue_outbox"] = {
+            "schema_version": 1,
+            "action": "advance",
+            "status": "pending",
+            "created_at": now_iso(),
+        }
     state.setdefault("current_stage", STAGE_PREPARE if mode == "chat" else STAGE_DRAFT)
     state.setdefault("status", "created")
     state.setdefault("created_at", now_iso())
@@ -474,6 +576,42 @@ def make_run_context(repo_root: Path, config_path: Path, mode: str, topic: str, 
     ctx.save_manifest()
     return ctx
 
+
+def load_frozen_agent_context(ctx: WorkflowContext) -> str:
+    lineage = ctx.manifest.get("lineage", {}).get("agent_context")
+    artifact = ctx.manifest.get("artifacts", {}).get("agent_context")
+    if lineage is None and artifact is None:
+        return ""
+    if not isinstance(lineage, dict):
+        raise RuntimeError("Agent context snapshot lineage is missing")
+    expected = (ctx.run_dir / "inputs" / "agent-context.md").resolve()
+    try:
+        recorded = Path(str(lineage["path"])).resolve()
+        recorded.relative_to((ctx.run_dir / "inputs").resolve())
+    except (KeyError, OSError, ValueError) as exc:
+        raise RuntimeError("Agent context snapshot path is invalid") from exc
+    if recorded != expected or (
+        artifact is not None and Path(str(artifact)).resolve() != expected
+    ):
+        raise RuntimeError("Agent context snapshot path is invalid")
+    if not expected.is_file():
+        raise RuntimeError("Agent context snapshot is missing")
+    expected_hash = lineage.get("sha256")
+    if (
+        not isinstance(expected_hash, str)
+        or sha256_file(expected) != expected_hash
+    ):
+        raise RuntimeError("Agent context snapshot hash mismatch")
+    return expected.read_text(encoding="utf-8").strip()
+
+
+def frozen_agent_context_prompt(ctx: WorkflowContext) -> str:
+    value = load_frozen_agent_context(ctx)
+    if not value:
+        return ""
+    return f"\n\nFrozen workflow context:\n{value}"
+
+
 def load_or_init_chat_messages(ctx: WorkflowContext) -> list[dict[str, str]]:
     session_json = ctx.artifact_path("sessions", "session.json")
     if session_json.exists():
@@ -483,11 +621,11 @@ def load_or_init_chat_messages(ctx: WorkflowContext) -> list[dict[str, str]]:
 
 
 def persist_chat(ctx: WorkflowContext, messages: list[dict[str, str]]) -> None:
+    ctx.assert_active()
     session_json = ctx.artifact_path("sessions", "session.json")
     session_md = ctx.artifact_path("sessions", "session.md")
-    session_json.parent.mkdir(parents=True, exist_ok=True)
-    session_json.write_text(json.dumps(messages, ensure_ascii=False, indent=2), encoding="utf-8")
-    session_md.write_text(render_session_markdown(messages), encoding="utf-8")
+    atomic_write_json(session_json, messages)
+    atomic_write_text(session_md, render_session_markdown(messages))
     ctx.register_artifact("session_json", session_json)
     ctx.register_artifact("session_md", session_md)
 
@@ -501,14 +639,22 @@ def run_prepare(ctx: WorkflowContext) -> None:
     skill_path = ctx.template.paths["prepare"]
     skill_text = read_text(skill_path)
     feedback = ctx.state.pop("prepare_feedback", "")
+    context_prompt = frozen_agent_context_prompt(ctx)
     messages = [
         {"role": "system", "content": skill_text},
-        {"role": "user", "content": f"主题：{ctx.topic}\n\n请输出本次话题讨论的准备提纲。{feedback}"},
+        {
+            "role": "user",
+            "content": (
+                f"主题：{ctx.topic}\n\n"
+                f"请输出本次话题讨论的准备提纲。{feedback}"
+                f"{context_prompt}"
+            ),
+        },
     ]
     result = call_compatible_openai(ctx.config["llm"]["base_url"], ctx.llm_api_key, ctx.config["llm"]["model"], messages)
+    ctx.assert_active()
     prepare_path = ctx.artifact_path("sessions", "prepare.md")
-    prepare_path.parent.mkdir(parents=True, exist_ok=True)
-    prepare_path.write_text(result + "\n", encoding="utf-8")
+    atomic_write_text(prepare_path, result + "\n")
     ctx.register_artifact("prepare_note", prepare_path)
     print("\n=== 前置准备 ===\n")
     print(result)
@@ -570,9 +716,9 @@ def import_chat(ctx: WorkflowContext) -> None:
     raw = read_text(ctx.imported_chat)
     session_md = ctx.artifact_path("sessions", "session.md")
     session_json = ctx.artifact_path("sessions", "session.json")
-    session_md.parent.mkdir(parents=True, exist_ok=True)
-    session_md.write_text(raw, encoding="utf-8")
-    session_json.write_text(json.dumps([{"role": "user", "content": raw}], ensure_ascii=False, indent=2), encoding="utf-8")
+    ctx.assert_active()
+    atomic_write_text(session_md, raw)
+    atomic_write_json(session_json, [{"role": "user", "content": raw}])
     ctx.register_artifact("session_md", session_md)
     ctx.register_artifact("session_json", session_json)
     ctx.set_stage(STAGE_DRAFT, status="ready")
@@ -583,6 +729,7 @@ def generate_draft(ctx: WorkflowContext, feedback: str = "") -> str:
     session_md = Path(ctx.manifest["artifacts"]["session_md"])
     transcript = read_text(session_md)
     style_reference = build_style_reference(ctx.active_style_library_dir)
+    context_prompt = frozen_agent_context_prompt(ctx)
     messages = [
         {"role": "system", "content": article_skill},
         {
@@ -591,7 +738,9 @@ def generate_draft(ctx: WorkflowContext, feedback: str = "") -> str:
                 f"Active style library: {ctx.active_style_library_dir}\n"
                 f"Active voice source: {ctx.active_voice_source_file}\n\n"
                 f"Style reference samples:\n{style_reference}\n\n"
-                f"Generate an article from the following conversation. {feedback}\n\n{transcript}"
+                f"Generate an article from the following conversation. "
+                f"{feedback}\n\n{transcript}"
+                f"{context_prompt}"
             ),
         },
     ]
@@ -603,8 +752,8 @@ def run_draft(ctx: WorkflowContext) -> None:
     feedback = ctx.state.pop("draft_feedback", "")
     draft = generate_draft(ctx, feedback)
     raw_path = ctx.artifact_path("drafts", "draft.raw.md")
-    raw_path.parent.mkdir(parents=True, exist_ok=True)
-    raw_path.write_text(draft + "\n", encoding="utf-8")
+    ctx.assert_active()
+    atomic_write_text(raw_path, draft + "\n")
     ctx.register_artifact("draft_raw", raw_path)
     print("\n=== 文稿草稿 ===\n")
     print(draft)
@@ -618,7 +767,8 @@ def run_draft(ctx: WorkflowContext) -> None:
 def approve_draft(ctx: WorkflowContext) -> None:
     raw_path = Path(ctx.manifest["artifacts"]["draft_raw"])
     approved_path = ctx.artifact_path("drafts", "draft.approved.md")
-    approved_path.write_text(read_text(raw_path), encoding="utf-8")
+    ctx.assert_active()
+    atomic_write_text(approved_path, read_text(raw_path))
     ctx.register_artifact("draft_approved", approved_path)
     ctx.set_stage(STAGE_TTS, status="ready")
 
@@ -686,13 +836,15 @@ def prepare_cloned_voice(
             ],
             check=True,
         )
+        _assert_context_active(ctx)
         config["voice_source_sha256"] = source_sha256
         config["voice_source_speaker_id"] = speaker_id
-        tts_config.write_text(
+        atomic_write_text(
+            tts_config,
             json.dumps(config, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
         )
 
+    _assert_context_active(ctx)
     ctx.manifest.setdefault("resources", {}).update(resources)
     ctx.save_manifest()
     return {**resources, "cloned": not already_bound}
@@ -702,14 +854,14 @@ def run_tts(ctx: WorkflowContext) -> None:
     draft_path = Path(ctx.manifest["artifacts"]["draft_approved"])
     draft_text = strip_markdown(read_text(draft_path))
     source_text_path = ctx.run_dir / "audio" / "narration.txt"
-    source_text_path.parent.mkdir(parents=True, exist_ok=True)
-    source_text_path.write_text(draft_text + "\n", encoding="utf-8")
+    ctx.assert_active()
+    atomic_write_text(source_text_path, draft_text + "\n")
     tts_script = resolve_path(ctx.repo_root, ctx.config["tts"]["script"])
     tts_config = resolve_path(ctx.repo_root, ctx.config["tts"]["config"])
     subtitle_script = resolve_path(ctx.repo_root, ctx.config["subtitle"]["script"])
     subtitle_config = resolve_path(ctx.repo_root, ctx.config["subtitle"]["config"])
     if ctx.config["tts"].get("voice_source_mode"):
-        prepare_cloned_voice(ctx, tts_config)
+        prepare_cloned_voice(ctx, tts_config, runner=ctx.run_process)
     output_audio = ctx.artifact_path("audio", f"voice.{ctx.config['tts']['output_format']}")
     subtitle_path = ctx.artifact_path("audio", "voice.srt")
     segment_manifest_path = ctx.run_dir / "audio" / "tts-segments.json"
@@ -745,8 +897,8 @@ def run_tts(ctx: WorkflowContext) -> None:
         str(alignment_report_path),
     ]
     try:
-        subprocess.run(tts_command, check=True)
-        subprocess.run(subtitle_command, check=True)
+        ctx.run_process(tts_command, check=True)
+        ctx.run_process(subtitle_command, check=True)
     except subprocess.CalledProcessError as exc:
         raise RuntimeError(f"Audio/subtitle script failed with code {exc.returncode}") from exc
     ctx.register_artifact("voice_audio", output_audio)
@@ -786,6 +938,9 @@ def ensure_subtitle_sync_gate(
     audit_output_path: Path,
     config: dict[str, Any],
     segment_manifest_path: Path | None = None,
+    *,
+    approved_text_path: Path | None = None,
+    before_commit: Callable[[], None] = lambda: None,
 ) -> dict[str, Any]:
     if not alignment_report_path.is_file():
         raise RuntimeError(
@@ -800,6 +955,8 @@ def ensure_subtitle_sync_gate(
         thresholds=thresholds,
         audit_output_path=audit_output_path,
         segment_manifest_path=segment_manifest_path,
+        approved_text_path=approved_text_path,
+        before_commit=before_commit,
     )
     if result["status"] != "passed":
         codes = ", ".join(
@@ -820,6 +977,8 @@ def write_subtitle_sync_audit(
     thresholds: SyncThresholds,
     audit_output_path: Path,
     segment_manifest_path: Path | None = None,
+    approved_text_path: Path | None = None,
+    before_commit: Callable[[], None] = lambda: None,
 ) -> dict[str, Any]:
     result = audit_subtitle_sync(
         audio_path,
@@ -831,8 +990,9 @@ def write_subtitle_sync_audit(
             if segment_manifest_path and segment_manifest_path.is_file()
             else None
         ),
+        approved_text=approved_text_path,
     )
-    audit_output_path.parent.mkdir(parents=True, exist_ok=True)
+    before_commit()
     save_json(audit_output_path, result)
     return result
 
@@ -843,6 +1003,7 @@ def bind_render_inputs_to_sync_audit(
     audio_path: Path,
     subtitle_path: Path,
     audit_output_path: Path,
+    before_commit: Callable[[], None] = lambda: None,
 ) -> dict[str, Any]:
     source_inputs = result.get("inputs") or {}
     render_audio_hash = sha256_file(audio_path)
@@ -857,6 +1018,7 @@ def bind_render_inputs_to_sync_audit(
             or source_inputs.get("srt_sha256") != render_srt_hash
         ),
     }
+    before_commit()
     save_json(audit_output_path, result)
     return result
 
@@ -881,13 +1043,13 @@ def _run_alignment(ctx: WorkflowContext, *, stronger: bool = False) -> str:
     ]
     if stronger:
         command.extend(["--beam-size", "8"])
-    subprocess.run(command, check=True)
+    ctx.run_process(command, check=True)
     return "alignment rebuilt"
 
 
 def _reassemble_tts_audio(ctx: WorkflowContext, _target: str) -> str:
     from scripts.volc_tts_ws import load_config as load_tts_manifest
-    from scripts.volc_tts_ws import write_audio_chunks, write_tts_segment_manifest
+    from scripts.volc_tts_ws import write_audio_chunks
 
     artifacts = ctx.manifest["artifacts"]
     manifest_path = Path(artifacts["tts_segment_manifest"])
@@ -898,16 +1060,39 @@ def _reassemble_tts_audio(ctx: WorkflowContext, _target: str) -> str:
     )
     audio = [Path(item["audio_path"]).read_bytes() for item in segments]
     output = Path(artifacts["voice_audio"])
-    write_audio_chunks(
-        audio,
-        output,
-        audio_format=ctx.config["tts"]["output_format"],
+    temporary = output.with_name(
+        f".{output.stem}.reassembled{output.suffix}"
     )
-    write_tts_segment_manifest(
+    ctx.assert_active()
+    temporary.unlink(missing_ok=True)
+    try:
+        write_audio_chunks(
+            audio,
+            temporary,
+            audio_format=ctx.config["tts"]["output_format"],
+            runner=ctx.run_process,
+        )
+        ctx.assert_active()
+        os.replace(temporary, output)
+        fsync_directory(output.parent)
+    except LeaseLostError:
+        raise
+    except BaseException:
+        ctx.assert_active()
+        temporary.unlink(missing_ok=True)
+        raise
+    ctx.assert_active()
+    atomic_write_json(
         manifest_path,
-        segments=segments,
-        output=output,
-        speaker_fingerprint=str(manifest.get("speaker_fingerprint", "")),
+        {
+            "schema_version": 1,
+            "output_path": str(output),
+            "output_sha256": sha256_file(output),
+            "speaker_fingerprint": str(
+                manifest.get("speaker_fingerprint", "")
+            ),
+            "segments": segments,
+        },
     )
     _run_alignment(ctx)
     return "TTS segments reassembled"
@@ -934,7 +1119,7 @@ def _regenerate_tts_segment(ctx: WorkflowContext, target: str) -> str:
         "--repair-segment",
         target,
     ]
-    subprocess.run(command, check=True)
+    ctx.run_process(command, check=True)
     _run_alignment(ctx)
     return f"regenerated {target}"
 
@@ -974,6 +1159,7 @@ def _repair_subtitle_sync(ctx: WorkflowContext, audit_path: Path) -> dict[str, A
         attempt = run_repair(action, handlers=handlers)
         history[action["fingerprint"]] = attempt
         attempts.append(attempt)
+        ctx.assert_active()
         save_json(history_path, {
             "schema_version": 1,
             "attempts": attempts,
@@ -988,6 +1174,12 @@ def _repair_subtitle_sync(ctx: WorkflowContext, audit_path: Path) -> dict[str, A
             thresholds=thresholds,
             audit_output_path=audit_path,
             segment_manifest_path=segment_manifest,
+            approved_text_path=(
+                Path(artifacts["narration_text"])
+                if artifacts.get("narration_text")
+                else None
+            ),
+            before_commit=ctx.assert_active,
         )
     return load_json(audit_path)
 
@@ -1014,6 +1206,12 @@ def audit_subtitles_for_context(
         thresholds=thresholds,
         audit_output_path=audit_path,
         segment_manifest_path=segment_manifest,
+        approved_text_path=(
+            Path(artifacts["narration_text"])
+            if artifacts.get("narration_text")
+            else None
+        ),
+        before_commit=ctx.assert_active,
     )
     if result["status"] != "passed" and allow_repair:
         result = _repair_subtitle_sync(ctx, audit_path)
@@ -1023,10 +1221,48 @@ def audit_subtitles_for_context(
 
 def run_subtitle_sync(ctx: WorkflowContext) -> None:
     ctx.set_stage(STAGE_SUBTITLE_SYNC)
+    artifacts = ctx.manifest.setdefault("artifacts", {})
+    required_inputs = ("voice_audio", "narration_text")
+    missing_inputs = [
+        key
+        for key in required_inputs
+        if not artifacts.get(key)
+        or not Path(str(artifacts[key])).is_file()
+    ]
+    if missing_inputs:
+        raise RuntimeError(
+            "Subtitle synchronization is missing immutable run inputs: "
+            + ", ".join(missing_inputs)
+        )
+    alignment_outputs = {
+        "voice_subtitle": (
+            ctx.run_dir / "subtitles" / "subtitles.aligned.srt"
+        ),
+        "subtitle_alignment_timing": (
+            ctx.run_dir / "subtitles" / "alignment-timing.json"
+        ),
+        "subtitle_alignment_report": (
+            ctx.run_dir / "subtitles" / "alignment-report.json"
+        ),
+    }
+    for key, path in alignment_outputs.items():
+        if not artifacts.get(key):
+            artifacts[key] = str(path)
+    if not all(
+        Path(str(artifacts[key])).is_file()
+        for key in alignment_outputs
+    ):
+        ctx.save_manifest()
+        _run_alignment(ctx)
+        ctx.save_manifest()
     audit_path = ctx.run_dir / "review" / "subtitle-sync-audit.json"
     result = audit_subtitles_for_context(ctx, allow_repair=True)
     if result["status"] == "passed":
-        ctx.set_stage(STAGE_VISUAL_PLAN, status="ready")
+        next_stage = ctx.state.pop(
+            "resume_after_subtitle_sync",
+            STAGE_VISUAL_PLAN,
+        )
+        ctx.set_stage(next_stage, status="ready")
         return
     codes = ", ".join(
         sorted({item["code"] for item in result.get("findings", [])})
@@ -1074,7 +1310,7 @@ def run_visual_plan(ctx: WorkflowContext) -> None:
         "--subtitle-policy-file", str(ctx.template.paths["subtitle"]),
     ]
     try:
-        subprocess.run(command, check=True)
+        ctx.run_process(command, check=True)
     except subprocess.CalledProcessError as exc:
         raise RuntimeError(f"Visual plan script failed with code {exc.returncode}") from exc
     audit = audit_visual_plan(
@@ -1083,6 +1319,7 @@ def run_visual_plan(ctx: WorkflowContext) -> None:
         load_json(ctx.template.paths["subtitle"]),
     )
     audit_path = ctx.run_dir / "visual" / "visual-plan-audit.json"
+    ctx.assert_active()
     save_json(audit_path, audit)
     ctx.register_artifact("visual_plan", output_path)
     ctx.register_artifact("visual_plan_audit", audit_path)
@@ -1133,7 +1370,7 @@ def run_visual_assets(ctx: WorkflowContext) -> None:
     env = os.environ.copy()
     env["PYTHON_EXECUTABLE"] = sys.executable
     try:
-        subprocess.run(command, check=True, env=env)
+        ctx.run_process(command, check=True, env=env)
     except subprocess.CalledProcessError as exc:
         raise RuntimeError(f"Visual asset build script failed with code {exc.returncode}") from exc
     ctx.register_artifact("asset_manifest", manifest_path)
@@ -1207,6 +1444,7 @@ def _effective_bgm_policy(ctx: WorkflowContext) -> BgmPolicy:
         snapshot["bgm_policy"] = frozen
         if source_path is not None:
             snapshot.setdefault("files", {})[source_path] = source_hash
+        ctx.assert_active()
         save_json(snapshot_path, snapshot)
     content = frozen.get("content")
     if not isinstance(content, dict):
@@ -1383,6 +1621,9 @@ def _bgm_request_for_context(
         max_agent_response_bytes=int(
             ctx.config.get("bgm", {}).get("max_agent_response_bytes", 200000)
         ),
+        required_duration_ms=int(
+            getattr(ctx, "_bgm_required_duration_ms", 0)
+        ),
     )
     return request, library.warnings
 
@@ -1412,7 +1653,13 @@ def acknowledge_bgm_for_context(
     )
 
 
-def _copy_frozen_file(source: Path, destination: Path, expected_hash: str) -> None:
+def _copy_frozen_file(
+    source: Path,
+    destination: Path,
+    expected_hash: str,
+    *,
+    before_commit: Callable[[], None] = lambda: None,
+) -> None:
     if not source.is_file() or sha256_file(source) != expected_hash:
         raise RuntimeError(f"BGM source changed before freezing: {source}")
     if destination.is_file() and sha256_file(destination) == expected_hash:
@@ -1424,6 +1671,7 @@ def _copy_frozen_file(source: Path, destination: Path, expected_hash: str) -> No
         shutil.copyfile(source, temporary)
         if sha256_file(temporary) != expected_hash:
             raise RuntimeError("Frozen BGM copy hash mismatch")
+        before_commit()
         os.replace(temporary, destination)
     finally:
         temporary.unlink(missing_ok=True)
@@ -1434,9 +1682,17 @@ def freeze_bgm_source(ctx: WorkflowContext, track: BgmTrack) -> BgmTrack:
     if not suffix:
         raise RuntimeError("Selected BGM source has no file extension")
     audio_path = ctx.run_dir / "audio" / f"bgm.source{suffix}"
-    _copy_frozen_file(track.path, audio_path, track.sha256)
+    ctx.assert_active()
+    _copy_frozen_file(
+        track.path,
+        audio_path,
+        track.sha256,
+        before_commit=ctx.assert_active,
+    )
+    ctx.assert_active()
     metadata_path = ctx.run_dir / "audio" / "bgm.source.bgm.json"
     if track.metadata_path.resolve() == track.path.resolve():
+        ctx.assert_active()
         save_json(
             metadata_path,
             {
@@ -1457,6 +1713,7 @@ def freeze_bgm_source(ctx: WorkflowContext, track: BgmTrack) -> BgmTrack:
                 "avoid_for": list(track.avoid_for),
                 "preferred_start_ms": track.preferred_start_ms,
                 "loopable": track.loopable,
+                "duration_ms": track.duration_ms,
             },
         )
         metadata_hash = sha256_file(metadata_path)
@@ -1465,7 +1722,9 @@ def freeze_bgm_source(ctx: WorkflowContext, track: BgmTrack) -> BgmTrack:
             track.metadata_path,
             metadata_path,
             track.metadata_sha256,
+            before_commit=ctx.assert_active,
         )
+        ctx.assert_active()
         frozen_metadata = load_json(metadata_path)
         frozen_metadata["provider"] = normalize_bgm_provider(
             frozen_metadata.get("provider")
@@ -1473,6 +1732,7 @@ def freeze_bgm_source(ctx: WorkflowContext, track: BgmTrack) -> BgmTrack:
         frozen_metadata["rights_status"] = normalize_bgm_rights_status(
             frozen_metadata.get("rights_status")
         )
+        frozen_metadata["duration_ms"] = track.duration_ms
         save_json(metadata_path, frozen_metadata)
         metadata_hash = sha256_file(metadata_path)
     return replace(
@@ -1501,6 +1761,7 @@ def _bgm_selection_payload(
         "source": resolution.source,
         "workflow_config_sha256": _workflow_bgm_config_hash(ctx),
         "effective_policy_sha256": _effective_bgm_policy_hash(ctx),
+        "required_duration_ms": request.required_duration_ms,
         "query": asdict(request.query),
         "policy": asdict(request.policy),
         "track": (
@@ -1517,6 +1778,7 @@ def _bgm_selection_payload(
                 "provider": track.provider,
                 "license": track.license,
                 "rights_status": track.rights_status,
+                "duration_ms": track.duration_ms,
             }
             if track is not None
             else None
@@ -1534,6 +1796,7 @@ def _write_bgm_selection(
     track: BgmTrack | None,
 ) -> Path:
     path = ctx.run_dir / "audio" / "bgm-selection.json"
+    ctx.assert_active()
     save_json(path, _bgm_selection_payload(ctx, resolution, track))
     ctx.register_artifact("bgm_selection", path)
     return path
@@ -1573,6 +1836,7 @@ def _bind_bgm_report_to_workflow(
         "effective_policy_sha256": _effective_bgm_policy_hash(ctx),
         "selection_sha256": sha256_file(selection_path),
     }
+    ctx.assert_active()
     save_json(report_path, report)
     return report
 
@@ -1617,9 +1881,29 @@ def _reuse_current_bgm_outputs(
     report_path: Path,
 ) -> bool:
     selection_path = ctx.run_dir / "audio" / "bgm-selection.json"
-    if not selection_path.is_file() or not report_path.is_file():
+    artifacts = ctx.manifest.get("artifacts", {})
+    lineage = ctx.manifest.get("lineage", {}).get("bgm")
+    report_is_bound = (
+        artifacts.get("bgm_mix_report") == str(report_path)
+        or (
+            isinstance(lineage, dict)
+            and lineage.get("mix_report") == str(report_path)
+        )
+    )
+
+    def reject_bound_report(exc: Exception | None = None) -> bool:
+        if report_is_bound:
+            if exc is None:
+                raise RuntimeError("bound BGM mix report is invalid")
+            raise RuntimeError("bound BGM mix report is invalid") from exc
         return False
-    selection = load_json(selection_path)
+
+    if not selection_path.is_file() or not report_path.is_file():
+        return reject_bound_report()
+    try:
+        selection = load_json(selection_path)
+    except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        return reject_bound_report(exc)
     expected_config = _workflow_bgm_config_hash(ctx)
     expected_policy = _effective_bgm_policy_hash(ctx)
     if (
@@ -1629,11 +1913,14 @@ def _reuse_current_bgm_outputs(
         or selection.get("workflow_config_sha256") != expected_config
         or selection.get("effective_policy_sha256") != expected_policy
     ):
-        return False
-    report = load_json(report_path)
+        return reject_bound_report()
+    try:
+        report = load_json(report_path)
+    except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        return reject_bound_report(exc)
     workflow = report.get("workflow")
     if not isinstance(workflow, dict):
-        return False
+        return reject_bound_report()
     if (
         workflow.get("resolution_id") != resolution.resolution_id
         or workflow.get("request_fingerprint")
@@ -1642,19 +1929,37 @@ def _reuse_current_bgm_outputs(
         or workflow.get("effective_policy_sha256") != expected_policy
         or workflow.get("selection_sha256") != sha256_file(selection_path)
     ):
-        return False
+        return reject_bound_report()
+    if report.get("mode") != resolution.mode:
+        return reject_bound_report()
 
-    ctx.register_artifact("bgm_selection", selection_path)
-    ctx.register_artifact("bgm_mix_report", report_path)
     if resolution.mode == "narration_only":
         render_audio = Path(ctx.manifest["artifacts"]["voice_audio"])
     elif resolution.mode == "bgm":
         track = selection.get("track")
         if not isinstance(track, dict) or not isinstance(track.get("path"), str):
-            return False
+            return reject_bound_report()
         source_path = Path(track["path"])
         prepared_path = ctx.run_dir / "audio" / "bgm.prepared.wav"
         render_audio = ctx.run_dir / "audio" / "final-mix.wav"
+    else:
+        return reject_bound_report()
+
+    try:
+        ensure_bgm_mix_gate(render_audio, report_path)
+        if isinstance(lineage, dict):
+            _ensure_context_bgm_lineage(
+                ctx,
+                report,
+                report_path,
+                render_audio,
+            )
+    except (RuntimeError, ValueError) as exc:
+        return reject_bound_report(exc)
+
+    ctx.register_artifact("bgm_selection", selection_path)
+    ctx.register_artifact("bgm_mix_report", report_path)
+    if resolution.mode == "bgm":
         ctx.register_artifact("bgm_source", source_path)
         metadata_path = track.get("metadata_path")
         if (
@@ -1667,17 +1972,6 @@ def _reuse_current_bgm_outputs(
             )
         ctx.register_artifact("bgm_prepared", prepared_path)
         ctx.register_artifact("final_mix", render_audio)
-    else:
-        return False
-
-    ensure_bgm_mix_gate(render_audio, report_path)
-    if isinstance(ctx.manifest.get("lineage", {}).get("bgm"), dict):
-        _ensure_context_bgm_lineage(
-            ctx,
-            report,
-            report_path,
-            render_audio,
-        )
     _record_bgm_lineage(
         ctx,
         resolution,
@@ -1703,7 +1997,12 @@ def _clear_selected_bgm_artifacts(ctx: WorkflowContext) -> None:
 
 def run_bgm(ctx: WorkflowContext) -> None:
     ctx.set_stage(STAGE_BGM)
-    ensure_current_subtitle_sync_audit(ctx)
+    sync_audit = ensure_current_subtitle_sync_audit(ctx)
+    duration_value = (sync_audit.get("metrics") or {}).get(
+        "audio_duration_ms"
+    )
+    if isinstance(duration_value, int) and duration_value > 0:
+        setattr(ctx, "_bgm_required_duration_ms", duration_value)
     artifacts = ctx.manifest.get("artifacts", {})
     narration_value = artifacts.get("voice_audio")
     if not narration_value:
@@ -1721,6 +2020,7 @@ def run_bgm(ctx: WorkflowContext) -> None:
             narration,
             report_path,
             resolution.warnings,
+            before_commit=ctx.assert_active,
         )
         _bind_bgm_report_to_workflow(ctx, resolution, report_path)
         ensure_bgm_mix_gate(narration, report_path)
@@ -1747,10 +2047,14 @@ def run_bgm(ctx: WorkflowContext) -> None:
         prepared_path,
         mix_path,
         _effective_bgm_policy(ctx),
-        subprocess.run,
+        ctx.run_process,
         settings=bgm_mix_settings_for_context(ctx),
     )
-    write_bgm_mix_report(result, report_path)
+    write_bgm_mix_report(
+        result,
+        report_path,
+        before_commit=ctx.assert_active,
+    )
     _bind_bgm_report_to_workflow(ctx, resolution, report_path)
     ensure_bgm_mix_gate(mix_path, report_path)
     register_bgm_artifacts(ctx, result)
@@ -2072,6 +2376,12 @@ def run_video_render(ctx: WorkflowContext) -> None:
             Path(artifacts["tts_segment_manifest"])
             if artifacts.get("tts_segment_manifest")
             else None,
+            approved_text_path=(
+                Path(artifacts["narration_text"])
+                if artifacts.get("narration_text")
+                else None
+            ),
+            before_commit=ctx.assert_active,
         )
 
     render_audio = resolve_context_render_audio(ctx)
@@ -2084,6 +2394,7 @@ def run_video_render(ctx: WorkflowContext) -> None:
             audio_path=narration_path,
             subtitle_path=render_subtitle,
             audit_output_path=sync_audit_path,
+            before_commit=ctx.assert_active,
         )
         ctx.register_artifact("subtitle_sync_audit", sync_audit_path)
 
@@ -2121,6 +2432,7 @@ def run_video_render(ctx: WorkflowContext) -> None:
     render_input_path = ctx.run_dir / "render" / "render-input.json"
     final_video_path = ctx.run_dir / "render" / "final.mp4"
     render_report_path = ctx.run_dir / "render" / "render-report.json"
+    ctx.assert_active()
     save_json(render_input_path, render_input)
     command = [
         sys.executable,
@@ -2133,7 +2445,7 @@ def run_video_render(ctx: WorkflowContext) -> None:
         str(final_video_path),
     ]
     try:
-        subprocess.run(command, check=True)
+        ctx.run_process(command, check=True)
     except subprocess.CalledProcessError as exc:
         raise RuntimeError(f"Remotion render failed with code {exc.returncode}") from exc
 
@@ -2142,6 +2454,7 @@ def run_video_render(ctx: WorkflowContext) -> None:
     ctx.register_artifact("voice_subtitle_cleaned", render_subtitle)
     ctx.register_artifact("final_video", final_video_path)
     ctx.register_artifact("render_report", render_report_path)
+    ctx.state["quality_gate_version"] = 2
     ctx.set_stage(STAGE_VIDEO_RENDER_CONFIRM, status="awaiting_confirmation")
 
 
@@ -2181,36 +2494,271 @@ def cleanup_intermediate(ctx: WorkflowContext) -> None:
             keep = True
         if keep or not path.exists() or FINAL_ARTIFACT_KEYS.get(key, False):
             continue
+        ctx.assert_active()
         path.unlink(missing_ok=True)
         del artifacts[key]
     ctx.save_manifest()
 
 
-def resume_context(repo_root: Path, config_path: Path, run_dir: Path) -> WorkflowContext:
+def _is_within(path: Path, directory: Path) -> bool:
+    try:
+        path.resolve().relative_to(directory.resolve())
+    except ValueError:
+        return False
+    return True
+
+
+def _resume_artifact_destination(
+    run_dir: Path,
+    key: str,
+    source: Path,
+) -> Path:
+    fixed = {
+        "draft_approved": run_dir / "writing" / "script.approved.md",
+        "voice_subtitle": run_dir / "subtitles" / "subtitles.imported.srt",
+        "narration_text": run_dir / "audio" / "narration.txt",
+        "tts_segment_manifest": run_dir / "audio" / "tts-segments.json",
+        "subtitle_alignment_timing": (
+            run_dir / "subtitles" / "alignment-timing.json"
+        ),
+        "subtitle_alignment_report": (
+            run_dir / "subtitles" / "alignment-report.json"
+        ),
+        "visual_plan": run_dir / "visual" / "visual-plan.json",
+        "asset_manifest": run_dir / "visual" / "asset-manifest.json",
+    }
+    if key == "voice_audio":
+        suffix = source.suffix.lower() or ".bin"
+        return run_dir / "audio" / f"narration.imported{suffix}"
+    return fixed[key]
+
+
+def _materialize_resume_inputs(
+    run_dir: Path,
+    manifest: dict[str, Any],
+    *,
+    before_commit: Callable[[], None] = lambda: None,
+) -> bool:
+    before_commit()
+    for name in (
+        "inputs",
+        "session",
+        "writing",
+        "audio",
+        "subtitles",
+        "visual",
+        "render",
+        "review",
+    ):
+        (run_dir / name).mkdir(parents=True, exist_ok=True)
+
+    artifacts = manifest.setdefault("artifacts", {})
+    materialized = manifest.setdefault("lineage", {}).setdefault(
+        "run_local_materialization",
+        {},
+    )
+    changed = False
+    keys = (
+        "draft_approved",
+        "voice_audio",
+        "voice_subtitle",
+        "narration_text",
+        "tts_segment_manifest",
+        "subtitle_alignment_timing",
+        "subtitle_alignment_report",
+        "visual_plan",
+        "asset_manifest",
+    )
+    for key in keys:
+        value = artifacts.get(key)
+        if not value:
+            continue
+        source = Path(str(value))
+        if not source.is_file() or _is_within(source, run_dir):
+            continue
+        source_hash = sha256_file(source)
+        destination = _resume_artifact_destination(run_dir, key, source)
+        before_commit()
+        atomic_copy_file(
+            source,
+            destination,
+            expected_sha256=source_hash,
+        )
+        artifacts[key] = str(destination)
+        materialized[key] = {
+            "source_path": str(source.resolve()),
+            "source_sha256": source_hash,
+            "snapshot_path": str(destination),
+            "snapshot_sha256": sha256_file(destination),
+        }
+        changed = True
+
+    narration_value = artifacts.get("narration_text")
+    narration_exists = bool(
+        narration_value and Path(str(narration_value)).is_file()
+    )
+    if not narration_exists:
+        narration = ""
+        draft_value = artifacts.get("draft_approved")
+        subtitle_value = artifacts.get("voice_subtitle")
+        if draft_value and Path(str(draft_value)).is_file():
+            narration = strip_markdown(
+                Path(str(draft_value)).read_text(encoding="utf-8-sig")
+            )
+        elif subtitle_value and Path(str(subtitle_value)).is_file():
+            narration = subtitle_to_plain_text(
+                Path(str(subtitle_value)).read_text(encoding="utf-8-sig")
+            )
+        if narration:
+            narration_path = run_dir / "audio" / "narration.txt"
+            before_commit()
+            atomic_write_text(narration_path, narration + "\n")
+            artifacts["narration_text"] = str(narration_path)
+            changed = True
+
+    planned = {
+        "voice_subtitle": run_dir / "subtitles" / "subtitles.aligned.srt",
+        "subtitle_alignment_timing": (
+            run_dir / "subtitles" / "alignment-timing.json"
+        ),
+        "subtitle_alignment_report": (
+            run_dir / "subtitles" / "alignment-report.json"
+        ),
+    }
+    for key, path in planned.items():
+        value = artifacts.get(key)
+        if not value or not Path(str(value)).exists():
+            artifacts[key] = str(path)
+            changed = True
+    return changed
+
+
+def _path_artifact_exists(artifacts: dict[str, Any], key: str) -> bool:
+    value = artifacts.get(key)
+    return bool(value and Path(str(value)).is_file())
+
+
+def _migrate_resume_quality_gates(
+    state: dict[str, Any],
+    artifacts: dict[str, Any],
+) -> bool:
+    if state.get("status") in {"completed", "cancelled"}:
+        return False
+    current = state.get("current_stage")
+    gated_stages = {
+        STAGE_VISUAL_PLAN,
+        STAGE_VISUAL_PLAN_CONFIRM,
+        STAGE_VISUAL_ASSETS,
+        STAGE_VISUAL_ASSETS_CONFIRM,
+        STAGE_BGM,
+        STAGE_VIDEO_RENDER,
+        STAGE_VIDEO_RENDER_CONFIRM,
+    }
+    if current not in gated_stages:
+        return False
+
+    if (
+        current == STAGE_VIDEO_RENDER_CONFIRM
+        and state.get("quality_gate_version") == 2
+    ):
+        return False
+
+    subtitle_ready = all(
+        _path_artifact_exists(artifacts, key)
+        for key in (
+            "voice_audio",
+            "voice_subtitle",
+            "narration_text",
+            "subtitle_alignment_report",
+        )
+    )
+    bgm_ready = _path_artifact_exists(artifacts, "bgm_mix_report")
+    target = current
+    resume_after_sync: str | None = None
+    if current == STAGE_VIDEO_RENDER_CONFIRM:
+        target = STAGE_SUBTITLE_SYNC
+        resume_after_sync = STAGE_BGM
+    elif not subtitle_ready:
+        target = STAGE_SUBTITLE_SYNC
+        resume_after_sync = (
+            STAGE_BGM
+            if current
+            in {STAGE_BGM, STAGE_VIDEO_RENDER, STAGE_VIDEO_RENDER_CONFIRM}
+            else current
+        )
+    elif current == STAGE_VIDEO_RENDER and not bgm_ready:
+        target = STAGE_BGM
+
+    if target == current:
+        return False
+    migrations = state.setdefault("migrations", {})
+    migrations.setdefault(
+        "quality_gates_v2",
+        {
+            "from": current,
+            "to": target,
+            "migrated_at": now_iso(),
+        },
+    )
+    if current == STAGE_VIDEO_RENDER and target == STAGE_BGM:
+        migrations.setdefault(
+            "task6_bgm_stage",
+            {
+                "from": current,
+                "to": target,
+                "migrated_at": now_iso(),
+            },
+        )
+    state["current_stage"] = target
+    state["status"] = "ready"
+    state.pop("last_error", None)
+    if resume_after_sync:
+        state["resume_after_subtitle_sync"] = resume_after_sync
+    else:
+        state.pop("resume_after_subtitle_sync", None)
+    return True
+
+
+def resume_context(
+    repo_root: Path,
+    config_path: Path,
+    run_dir: Path,
+    *,
+    mutation_guard: Callable[[], None] = lambda: None,
+    process_runner: Callable[..., Any] = subprocess.run,
+) -> WorkflowContext:
+    mutation_guard()
     state = load_json(run_dir / "state.json")
     manifest = load_json(run_dir / "manifest.json")
     config = load_json(config_path)
     if not state or not manifest:
         raise RuntimeError(f"Run directory is missing state or manifest: {run_dir}")
+    if run_dir.parent.name != "runs":
+        raise RuntimeError(f"Run must be contained by a project runs directory: {run_dir}")
+    project_root = run_dir.parent.parent
+    expected_run_dir = resolve_run_dir(
+        project_root,
+        validate_run_id(str(state.get("run_id", ""))),
+    )
+    if expected_run_dir != run_dir.resolve():
+        raise RuntimeError(
+            f"Run ID does not match the authoritative run directory: {run_dir}"
+        )
     artifacts = manifest.get("artifacts", {})
-    migrations = state.setdefault("migrations", {})
-    if (
-        state.get("current_stage") == STAGE_VIDEO_RENDER
-        and state.get("status") not in {"completed", "cancelled"}
-        and not artifacts.get("bgm_mix_report")
-        and "task6_bgm_stage" not in migrations
-    ):
-        migrations["task6_bgm_stage"] = {
-            "from": STAGE_VIDEO_RENDER,
-            "to": STAGE_BGM,
-            "migrated_at": datetime.now().isoformat(),
-        }
-        state["current_stage"] = STAGE_BGM
-        state["status"] = "ready"
-        state.pop("last_error", None)
+    manifest_changed = _materialize_resume_inputs(
+        run_dir,
+        manifest,
+        before_commit=mutation_guard,
+    )
+    artifacts = manifest.get("artifacts", {})
+    state_changed = _migrate_resume_quality_gates(state, artifacts)
+    if manifest_changed:
+        mutation_guard()
+        save_json(run_dir / "manifest.json", manifest)
+    if state_changed:
+        mutation_guard()
         save_json(run_dir / "state.json", state)
     project_name = state.get("project_name") or manifest.get("project_name") or (run_dir.parent.parent.name if run_dir.parent.name == "runs" else "legacy")
-    project_root = run_dir.parent.parent if run_dir.parent.name == "runs" else run_dir.parent
     project_config = load_json(project_root / "project.json")
     template = None
     if project_config.get("template_id"):
@@ -2230,6 +2778,8 @@ def resume_context(repo_root: Path, config_path: Path, run_dir: Path) -> Workflo
         manifest=manifest,
         project_config=project_config,
         template=template,
+        mutation_guard=mutation_guard,
+        process_runner=process_runner,
     )
 
 
@@ -2266,6 +2816,8 @@ def execute_until_boundary(ctx: WorkflowContext) -> WorkflowOutcome:
         raise RuntimeError(f"Missing stage handlers: {', '.join(missing)}")
 
     while True:
+        if hasattr(ctx, "assert_active"):
+            ctx.assert_active()
         stage = ctx.state.get("current_stage")
         if ctx.should_cancel():
             ctx.set_stage(stage, status="cancelled")

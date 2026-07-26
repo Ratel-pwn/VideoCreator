@@ -113,7 +113,7 @@ def test_narration_only_stage_registers_report_and_advances(
     monkeypatch.setattr(
         main,
         "write_narration_only_report",
-        lambda narration, path, warnings: (
+        lambda narration, path, warnings, **_kwargs: (
             path.write_text(
                 json.dumps(
                     {
@@ -208,7 +208,7 @@ def test_selected_bgm_stage_registers_full_lineage(context, monkeypatch):
         return result
 
     monkeypatch.setattr(main, "mix_bgm", mix)
-    def write_report(_result, path):
+    def write_report(_result, path, **_kwargs):
         settings = main.bgm_mix_settings_for_context(context)
         value = {
             "mode": "bgm",
@@ -853,3 +853,149 @@ def test_stale_final_mix_is_rejected_before_render(context):
 
     with pytest.raises(RuntimeError, match="artifact_hash_mismatch"):
         main.resolve_context_render_audio(context)
+
+
+def test_truncated_unbound_bgm_report_is_regenerated(
+    context,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        main,
+        "ensure_current_subtitle_sync_audit",
+        lambda _ctx: {"status": "passed"},
+    )
+    fallback = resolution("narration_only")
+    monkeypatch.setattr(
+        main,
+        "resolve_bgm_for_context",
+        lambda _ctx: fallback,
+    )
+    monkeypatch.setattr(
+        main,
+        "ensure_bgm_mix_gate",
+        lambda _audio, _report: {"status": "passed"},
+    )
+    monkeypatch.setattr(
+        main,
+        "acknowledge_bgm_for_context",
+        lambda _ctx, _resolution: None,
+    )
+    main._write_bgm_selection(context, fallback, None)
+    report_path = context.run_dir / "audio" / "bgm-mix-report.json"
+    report_path.write_text("{", encoding="utf-8")
+    regenerated: list[Path] = []
+
+    def write_report(narration, path, warnings, **_kwargs):
+        regenerated.append(path)
+        payload = {
+            "schema_version": 1,
+            "mode": "narration_only",
+            "status": "passed",
+            "inputs": {
+                "narration": {
+                    "path": str(narration),
+                    "sha256": main.sha256_file(narration),
+                }
+            },
+            "outputs": {
+                "render_audio": {
+                    "path": str(narration),
+                    "sha256": main.sha256_file(narration),
+                }
+            },
+            "warnings": list(warnings),
+        }
+        main.save_json(path, payload)
+        return payload
+
+    monkeypatch.setattr(main, "write_narration_only_report", write_report)
+
+    main.run_bgm(context)
+
+    assert regenerated == [report_path]
+    assert json.loads(report_path.read_text(encoding="utf-8"))["workflow"][
+        "resolution_id"
+    ] == fallback.resolution_id
+
+
+def test_truncated_bound_bgm_report_remains_a_hard_failure(
+    context,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        main,
+        "ensure_current_subtitle_sync_audit",
+        lambda _ctx: {"status": "passed"},
+    )
+    fallback = resolution("narration_only")
+    monkeypatch.setattr(
+        main,
+        "resolve_bgm_for_context",
+        lambda _ctx: fallback,
+    )
+    main._write_bgm_selection(context, fallback, None)
+    report_path = context.run_dir / "audio" / "bgm-mix-report.json"
+    report_path.write_text("{", encoding="utf-8")
+    context.manifest["artifacts"]["bgm_mix_report"] = str(report_path)
+    context.manifest.setdefault("lineage", {})["bgm"] = {
+        "mix_report": str(report_path),
+        "mix_report_sha256": main.sha256_file(report_path),
+    }
+    context.save_manifest()
+
+    with pytest.raises(RuntimeError, match="bound BGM mix report is invalid"):
+        main.run_bgm(context)
+
+
+def test_valid_json_tampering_of_bound_bgm_report_is_a_hard_failure(
+    context,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        main,
+        "ensure_current_subtitle_sync_audit",
+        lambda _ctx: {"status": "passed"},
+    )
+    fallback = resolution("narration_only")
+    monkeypatch.setattr(
+        main,
+        "resolve_bgm_for_context",
+        lambda _ctx: fallback,
+    )
+    monkeypatch.setattr(
+        main,
+        "write_narration_only_report",
+        lambda *_args, **_kwargs: pytest.fail(
+            "bound report must not be regenerated"
+        ),
+    )
+    selection_path = main._write_bgm_selection(context, fallback, None)
+    report_path = context.run_dir / "audio" / "bgm-mix-report.json"
+    main.save_json(
+        report_path,
+        {
+            "schema_version": 1,
+            "mode": "narration_only",
+            "status": "passed",
+            "workflow": {
+                "resolution_id": "tampered",
+                "request_fingerprint": fallback.request_fingerprint,
+                "workflow_config_sha256": main._workflow_bgm_config_hash(
+                    context
+                ),
+                "effective_policy_sha256": (
+                    main._effective_bgm_policy_hash(context)
+                ),
+                "selection_sha256": main.sha256_file(selection_path),
+            },
+        },
+    )
+    context.manifest["artifacts"]["bgm_mix_report"] = str(report_path)
+    context.manifest.setdefault("lineage", {})["bgm"] = {
+        "mix_report": str(report_path),
+        "mix_report_sha256": main.sha256_file(report_path),
+    }
+    context.save_manifest()
+
+    with pytest.raises(RuntimeError, match="bound BGM mix report is invalid"):
+        main.run_bgm(context)

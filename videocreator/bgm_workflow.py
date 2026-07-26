@@ -83,6 +83,21 @@ def _atomic_json(path: Path, value: dict[str, Any]) -> None:
     atomic_write_json(path, value)
 
 
+def _assert_request_active(request: BgmResolutionRequest) -> None:
+    assert_active = getattr(request.context, "assert_active", None)
+    if callable(assert_active):
+        assert_active()
+
+
+def _atomic_request_json(
+    request: BgmResolutionRequest,
+    path: Path,
+    value: dict[str, Any],
+) -> None:
+    _assert_request_active(request)
+    _atomic_json(path, value)
+
+
 def _read_json(path: Path) -> dict[str, Any]:
     if not path.is_file():
         return {}
@@ -121,6 +136,7 @@ class BgmResolutionRequest:
     download_dir: Path
     max_agent_candidates: int = MAX_AGENT_CANDIDATES
     max_agent_response_bytes: int = MAX_AGENT_RESPONSE_BYTES
+    required_duration_ms: int = 0
 
     def __post_init__(self) -> None:
         download_dir = Path(self.download_dir).resolve()
@@ -134,6 +150,12 @@ class BgmResolutionRequest:
             raise ValueError("Invalid BGM Agent candidate limit")
         if not 1 <= self.max_agent_response_bytes <= MAX_AGENT_RESPONSE_BYTES:
             raise ValueError("Invalid BGM Agent response byte limit")
+        if (
+            isinstance(self.required_duration_ms, bool)
+            or not isinstance(self.required_duration_ms, int)
+            or self.required_duration_ms < 0
+        ):
+            raise ValueError("Invalid required BGM duration")
 
 
 @dataclass(frozen=True)
@@ -177,6 +199,7 @@ def _request_fingerprint(request: BgmResolutionRequest) -> str:
                 "max_candidates": request.max_agent_candidates,
                 "max_response_bytes": request.max_agent_response_bytes,
             },
+            "required_duration_ms": request.required_duration_ms,
         }
     )
 
@@ -281,10 +304,25 @@ def _query_payload(
     query: BgmQuery,
     max_candidates: int = MAX_AGENT_CANDIDATES,
     max_response_bytes: int = MAX_AGENT_RESPONSE_BYTES,
+    *,
+    required_duration_ms: int = 0,
+    rejection_scores: Iterable[CandidateScore] = (),
 ) -> dict[str, Any]:
+    rejections = [
+        {
+            "track_id": score.track_id,
+            "reasons": list(score.rejection_reasons),
+        }
+        for score in rejection_scores
+        if score.rejection_reasons
+    ]
     return {
         "schema_version": 1,
         "limits": {"max_response_bytes": max_response_bytes},
+        "technical": {
+            "required_duration_ms": required_duration_ms,
+            "rejections": rejections,
+        },
         "query": {
             "subjects": list(query.subjects),
             "moods": list(query.moods),
@@ -380,6 +418,7 @@ def _current_resolution_path(request: BgmResolutionRequest) -> Path:
 
 
 def _load_download_ledger(request: BgmResolutionRequest) -> dict[str, Any]:
+    _assert_request_active(request)
     path = _download_ledger_path(request)
     value = _read_json(path)
     if not value:
@@ -428,7 +467,7 @@ def _migrate_legacy_download_ledger(
                     source,
                     destination,
                 )
-                _move_legacy_candidate(source, destination)
+                _move_legacy_candidate(request, source, destination)
                 relative = _relative_artifact(request, destination)
                 entry["path"] = relative
                 track = entry.get("track")
@@ -454,7 +493,7 @@ def _migrate_legacy_download_ledger(
                             "Invalid legacy validated BGM candidate"
                         )
                     continue
-                _move_legacy_candidate(source, destination)
+                _move_legacy_candidate(request, source, destination)
                 changed = True
     cleanup = ledger.get("cleanup")
     if isinstance(cleanup, dict):
@@ -485,7 +524,7 @@ def _migrate_legacy_download_ledger(
                 cleanup["selected"] = migrated_selected
                 changed = True
     if changed:
-        _atomic_json(ledger_path, ledger)
+        _atomic_request_json(request, ledger_path, ledger)
     return ledger
 
 
@@ -535,18 +574,31 @@ def _verify_legacy_candidate_entry(
         raise RuntimeError("Legacy BGM candidate hash mismatch")
 
 
-def _move_legacy_candidate(source: Path, destination: Path) -> None:
+def _move_legacy_candidate(
+    request: BgmResolutionRequest,
+    source: Path,
+    destination: Path,
+) -> None:
+    _assert_request_active(request)
     destination.parent.mkdir(parents=True, exist_ok=True)
     if destination.is_file():
         if source.is_file():
-            _copy_durable(source, destination)
+            _copy_durable(
+                source,
+                destination,
+                before_commit=lambda: _assert_request_active(request),
+            )
         else:
             fsync_directory(destination.parent)
         return
     if not source.is_file():
         # Cleaned/rejected tombstones may outlive their deterministic file.
         return
-    _copy_durable(source, destination)
+    _copy_durable(
+        source,
+        destination,
+        before_commit=lambda: _assert_request_active(request),
+    )
 
 
 def _migrate_legacy_cleanup_path(
@@ -571,7 +623,7 @@ def _write_download_ledger(
     request: BgmResolutionRequest,
     ledger: dict[str, Any],
 ) -> None:
-    _atomic_json(_download_ledger_path(request), ledger)
+    _atomic_request_json(request, _download_ledger_path(request), ledger)
 
 
 def _valid_fingerprint(value: str) -> bool:
@@ -674,6 +726,7 @@ def _validated_candidate(
             return None
 
     candidate_dir = _request_candidate_dir(request)
+    _assert_request_active(request)
     candidate_dir.mkdir(parents=True, exist_ok=True)
     discovered_paths = [
         path
@@ -753,6 +806,7 @@ def _validated_candidate(
             allowed_hosts=allowed_hosts,
             output_name=f"candidate-{fingerprint}",
         )
+        _assert_request_active(request)
         deterministic = _deterministic_candidate_path(
             request,
             fingerprint,
@@ -813,7 +867,12 @@ def _download_and_select(
         if (track := _validated_candidate(candidate, request, warnings))
         is not None
     ]
-    return select_bgm_candidate(tracks, request.query, request.policy)
+    return select_bgm_candidate(
+        tracks,
+        request.query,
+        request.policy,
+        required_duration_ms=request.required_duration_ms,
+    )
 
 
 def _resolution_id(
@@ -836,10 +895,14 @@ def _resolution_id(
 def _interaction_binding(
     request: BgmResolutionRequest,
 ) -> tuple[str | None, str | None]:
-    expected = interaction_fingerprint(
-        "bgm_candidates",
-        _query_payload(request.query),
-    )
+    binding = request.context.state.get("bgm_interaction_binding")
+    if (
+        not isinstance(binding, dict)
+        or binding.get("request_fingerprint") != _request_fingerprint(request)
+        or not isinstance(binding.get("interaction_fingerprint"), str)
+    ):
+        return None, None
+    expected = binding["interaction_fingerprint"]
     consumed = request.context.state.get("consumed_interactions", {})
     answer_fingerprints = request.context.state.get(
         "interaction_answer_fingerprints",
@@ -1016,7 +1079,7 @@ def _migrate_legacy_resolution_ledger(
     migrated_path = matching[0]["path"]
     track["path"] = migrated_path
     track["metadata_path"] = migrated_path
-    _atomic_json(_resolution_ledger_path(request), value)
+    _atomic_request_json(request, _resolution_ledger_path(request), value)
     return value
 
 
@@ -1033,8 +1096,13 @@ def _commit_resolution(
         committed = _resolution_from_record(request, existing)
         _claim_resolution_authority(request, committed)
         return committed
-    _atomic_json(path, _resolution_to_record(request, resolution))
-    _atomic_json(
+    _atomic_request_json(
+        request,
+        path,
+        _resolution_to_record(request, resolution),
+    )
+    _atomic_request_json(
+        request,
         _current_resolution_path(request),
         {
             "schema_version": 1,
@@ -1043,7 +1111,58 @@ def _commit_resolution(
             "committed_at": _now(),
         },
     )
-    return resolution
+    return _resolution_from_record(request, _read_json(path))
+
+
+def _scrub_agent_response_state(
+    request: BgmResolutionRequest,
+    resolution: BgmResolution,
+) -> None:
+    if resolution.interaction_id is None:
+        return
+    state = request.context.state
+    changed = False
+    answers = state.get("interaction_answers")
+    if isinstance(answers, dict) and INTERACTION_KEY in answers:
+        current = answers[INTERACTION_KEY]
+        if not (
+            isinstance(current, dict) and current.get("redacted") is True
+        ):
+            response = str(current)
+            answers[INTERACTION_KEY] = {
+                "redacted": True,
+                "response_sha256": hashlib.sha256(
+                    response.encode("utf-8")
+                ).hexdigest(),
+            }
+            changed = True
+    submitted = state.get("submitted_interactions")
+    if (
+        isinstance(submitted, dict)
+        and resolution.interaction_id in submitted
+    ):
+        current = submitted[resolution.interaction_id]
+        if not (
+            isinstance(current, dict) and current.get("redacted") is True
+        ):
+            response = str(current)
+            submitted[resolution.interaction_id] = {
+                "redacted": True,
+                "response_sha256": hashlib.sha256(
+                    response.encode("utf-8")
+                ).hexdigest(),
+            }
+            changed = True
+    pending = state.get("pending_interaction")
+    if (
+        isinstance(pending, dict)
+        and pending.get("id") == resolution.interaction_id
+        and "response" in pending
+    ):
+        pending.pop("response", None)
+        changed = True
+    if changed:
+        request.context.save_state()
 
 
 def _claim_resolution_authority(
@@ -1059,7 +1178,8 @@ def _claim_resolution_authority(
             == resolution.request_fingerprint
             and current.get("resolution_id") == resolution.resolution_id
         )
-    _atomic_json(
+    _atomic_request_json(
+        request,
         path,
         {
             "schema_version": 1,
@@ -1151,6 +1271,7 @@ def _unlink_candidate_artifact(
         raise RuntimeError("BGM cleanup artifact belongs to another request")
     if selected is not None and path == selected:
         return
+    _assert_request_active(request)
     path.unlink(missing_ok=True)
 
 
@@ -1159,6 +1280,7 @@ def _finalize_resolution(
     resolution: BgmResolution,
 ) -> BgmResolution:
     committed = _commit_resolution(request, resolution)
+    _scrub_agent_response_state(request, committed)
     _cleanup_downloads(
         request,
         committed.track.path if committed.track and committed.source != "local" else None,
@@ -1166,7 +1288,12 @@ def _finalize_resolution(
     return committed
 
 
-def _copy_durable(source: Path, destination: Path) -> None:
+def _copy_durable(
+    source: Path,
+    destination: Path,
+    *,
+    before_commit: Any = lambda: None,
+) -> None:
     source_digest = _sha256_file(source)
     if destination.is_file():
         if _sha256_file(destination) != source_digest:
@@ -1180,6 +1307,7 @@ def _copy_durable(source: Path, destination: Path) -> None:
             shutil.copyfileobj(input_stream, output)
             output.flush()
             os.fsync(output.fileno())
+        before_commit()
         os.replace(temporary, destination)
         fsync_directory(destination.parent)
     finally:
@@ -1196,17 +1324,28 @@ def _materialize_selected_track(
         return track
     except ValueError:
         pass
+    _assert_request_active(request)
     request.download_dir.mkdir(parents=True, exist_ok=True)
     prefix = f"selected-{_request_fingerprint(request)}-{track.sha256}"
     audio_path = request.download_dir / f"{prefix}{track.path.suffix.casefold()}"
-    _copy_durable(track.path, audio_path)
+    _assert_request_active(request)
+    _copy_durable(
+        track.path,
+        audio_path,
+        before_commit=lambda: _assert_request_active(request),
+    )
     if track.metadata_path.resolve() == track.path.resolve():
         metadata_path = audio_path
     else:
         metadata_path = request.download_dir / (
             f"{prefix}.metadata{track.metadata_path.suffix.casefold()}"
         )
-        _copy_durable(track.metadata_path, metadata_path)
+        _assert_request_active(request)
+        _copy_durable(
+            track.metadata_path,
+            metadata_path,
+            before_commit=lambda: _assert_request_active(request),
+        )
     return replace(
         track,
         path=audio_path.resolve(),
@@ -1275,7 +1414,7 @@ def acknowledge_bgm_resolution(
     if not acknowledged:
         value["status"] = "acknowledged"
         value["acknowledged_at"] = _now()
-        _atomic_json(path, value)
+        _atomic_request_json(request, path, value)
     interaction = value.get("interaction") or {}
     interaction_id = interaction.get("id")
     interaction_fp = interaction.get("fingerprint")
@@ -1285,12 +1424,24 @@ def acknowledge_bgm_resolution(
         {},
     )
     pending = request.context.state.get("pending_interaction")
+    current_binding = request.context.state.get("bgm_interaction_binding")
+    binding_matches_resolution = (
+        isinstance(current_binding, dict)
+        and current_binding.get("request_fingerprint")
+        == _request_fingerprint(request)
+        and current_binding.get("interaction_fingerprint")
+        == interaction_fp
+    )
     consumed_matches = (
+        binding_matches_resolution
+        and
         interaction_id
         and consumed.get(INTERACTION_KEY) == interaction_id
         and answer_fingerprints.get(INTERACTION_KEY) == interaction_fp
     )
     pending_matches = (
+        binding_matches_resolution
+        and
         interaction_id
         and pending
         and pending.get("key") == INTERACTION_KEY
@@ -1299,6 +1450,8 @@ def acknowledge_bgm_resolution(
     )
     if consumed_matches or pending_matches:
         interaction_port.clear(request.context, INTERACTION_KEY)
+        request.context.state.pop("bgm_interaction_binding", None)
+        request.context.save_state()
     return not acknowledged
 
 
@@ -1310,6 +1463,7 @@ def resolve_bgm_for_run(
     committed = _load_committed_resolution(request)
     if committed is not None:
         _claim_resolution_authority(request, committed)
+        _scrub_agent_response_state(request, committed)
         _cleanup_downloads(
             request,
             committed.track.path
@@ -1327,6 +1481,7 @@ def resolve_bgm_for_run(
         request.local_tracks,
         request.query,
         request.policy,
+        required_duration_ms=request.required_duration_ms,
     )
     if local.track is not None:
         return _selected_resolution(
@@ -1368,6 +1523,8 @@ def resolve_bgm_for_run(
         request.query,
         request.max_agent_candidates,
         request.max_agent_response_bytes,
+        required_duration_ms=request.required_duration_ms,
+        rejection_scores=(*local.scores, *provider_selection.scores),
     )
     expected_fingerprint = interaction_fingerprint("bgm_candidates", payload)
     pending = request.context.state.get("pending_interaction")
@@ -1386,6 +1543,13 @@ def resolve_bgm_for_run(
         warnings.append("BGM Agent handoff is unavailable")
         return _narration_only(request, warnings)
 
+    binding = {
+        "request_fingerprint": _request_fingerprint(request),
+        "interaction_fingerprint": expected_fingerprint,
+    }
+    if request.context.state.get("bgm_interaction_binding") != binding:
+        request.context.state["bgm_interaction_binding"] = binding
+        request.context.save_state()
     response = interaction_port.ask(
         request.context,
         INTERACTION_KEY,

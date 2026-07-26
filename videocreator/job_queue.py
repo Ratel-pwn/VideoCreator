@@ -22,6 +22,7 @@ class Job:
     status: str
     worker_id: str | None
     lease_until: str | None
+    lease_generation: int
     attempts: int
     cancel_requested: bool
     error: str | None
@@ -67,6 +68,7 @@ class JobQueue:
                     status TEXT NOT NULL,
                     worker_id TEXT,
                     lease_until TEXT,
+                    lease_generation INTEGER NOT NULL DEFAULT 0,
                     attempts INTEGER NOT NULL DEFAULT 0,
                     cancel_requested INTEGER NOT NULL DEFAULT 0,
                     error TEXT,
@@ -76,6 +78,15 @@ class JobQueue:
                 )
                 """
             )
+            columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(jobs)")
+            }
+            if "lease_generation" not in columns:
+                connection.execute(
+                    "ALTER TABLE jobs ADD COLUMN lease_generation "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
             connection.execute("CREATE INDEX IF NOT EXISTS jobs_status_created ON jobs(status, created_at)")
             connection.execute(
                 """
@@ -103,6 +114,15 @@ class JobQueue:
         value = dict(row)
         value["cancel_requested"] = bool(value["cancel_requested"])
         return Job(**value)
+
+    @staticmethod
+    def _lease_is_live(value: object, now: datetime) -> bool:
+        if not isinstance(value, str):
+            return False
+        try:
+            return datetime.fromisoformat(value) > now
+        except (TypeError, ValueError):
+            return False
 
     def get(self, project: str, run_id: str) -> Job | None:
         with self._connect() as connection:
@@ -224,6 +244,7 @@ class JobQueue:
             connection.execute(
                 """
                 UPDATE jobs SET status = 'leased', worker_id = ?, lease_until = ?,
+                    lease_generation = lease_generation + 1,
                     attempts = attempts + 1, updated_at = ? WHERE id = ?
                 """,
                 (worker_id, lease_until, stamp, row["id"]),
@@ -232,31 +253,15 @@ class JobQueue:
             connection.commit()
         return self._job(claimed)
 
-    def renew(self, job_id: str, worker_id: str, lease_seconds: int) -> bool:
-        lease_until = (self.now() + timedelta(seconds=lease_seconds)).isoformat()
-        with self._connect() as connection:
-            cursor = connection.execute(
-                """
-                UPDATE jobs SET lease_until = ?, updated_at = ?
-                WHERE id = ? AND status = 'leased' AND worker_id = ?
-                    AND cancel_requested = 0
-                """,
-                (lease_until, self.now().isoformat(), job_id, worker_id),
-            )
-        return cursor.rowcount == 1
-
-    def release_waiting(self, job_id: str, worker_id: str) -> None:
-        self._finish(job_id, worker_id, "waiting", None)
-
-    def complete(self, job_id: str, worker_id: str, status: str = "completed") -> None:
-        if status not in {"completed", "cancelled"}:
-            raise ValueError(f"Unsupported terminal status: {status}")
-        self._finish(job_id, worker_id, status, None)
-
-    def fail(self, job_id: str, worker_id: str, error: str) -> None:
-        self._finish(job_id, worker_id, "failed", error)
-
-    def _finish(self, job_id: str, worker_id: str, status: str, error: str | None) -> None:
+    def renew(
+        self,
+        job_id: str,
+        worker_id: str,
+        lease_seconds: int,
+        lease_generation: int | None = None,
+    ) -> bool:
+        now = self.now()
+        lease_until = (now + timedelta(seconds=lease_seconds)).isoformat()
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
@@ -267,6 +272,103 @@ class JobQueue:
                 not row
                 or row["status"] != "leased"
                 or row["worker_id"] != worker_id
+                or row["cancel_requested"]
+                or not self._lease_is_live(row["lease_until"], now)
+                or (
+                    lease_generation is not None
+                    and row["lease_generation"] != lease_generation
+                )
+            ):
+                connection.rollback()
+                return False
+            cursor = connection.execute(
+                """
+                UPDATE jobs SET lease_until = ?, updated_at = ?
+                WHERE id = ? AND status = 'leased' AND worker_id = ?
+                    AND lease_generation = ?
+                """,
+                (
+                    lease_until,
+                    now.isoformat(),
+                    job_id,
+                    worker_id,
+                    row["lease_generation"],
+                ),
+            )
+            connection.commit()
+        return cursor.rowcount == 1
+
+    def release_waiting(
+        self,
+        job_id: str,
+        worker_id: str,
+        lease_generation: int | None = None,
+    ) -> None:
+        self._finish(
+            job_id,
+            worker_id,
+            "waiting",
+            None,
+            lease_generation=lease_generation,
+        )
+
+    def complete(
+        self,
+        job_id: str,
+        worker_id: str,
+        status: str = "completed",
+        lease_generation: int | None = None,
+    ) -> None:
+        if status not in {"completed", "cancelled"}:
+            raise ValueError(f"Unsupported terminal status: {status}")
+        self._finish(
+            job_id,
+            worker_id,
+            status,
+            None,
+            lease_generation=lease_generation,
+        )
+
+    def fail(
+        self,
+        job_id: str,
+        worker_id: str,
+        error: str,
+        lease_generation: int | None = None,
+    ) -> None:
+        self._finish(
+            job_id,
+            worker_id,
+            "failed",
+            error,
+            lease_generation=lease_generation,
+        )
+
+    def _finish(
+        self,
+        job_id: str,
+        worker_id: str,
+        status: str,
+        error: str | None,
+        *,
+        lease_generation: int | None = None,
+    ) -> None:
+        now = self.now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            if (
+                not row
+                or row["status"] != "leased"
+                or row["worker_id"] != worker_id
+                or not self._lease_is_live(row["lease_until"], now)
+                or (
+                    lease_generation is not None
+                    and row["lease_generation"] != lease_generation
+                )
             ):
                 connection.rollback()
                 raise RuntimeError(
@@ -296,7 +398,7 @@ class JobQueue:
                 (
                     final_status,
                     error if final_status == status else None,
-                    self.now().isoformat(),
+                    now.isoformat(),
                     job_id,
                     worker_id,
                 ),
@@ -308,9 +410,51 @@ class JobQueue:
                         consumed_at = ?
                     WHERE job_id = ? AND status = 'pending'
                     """,
-                    (self.now().isoformat(), job_id),
+                    (now.isoformat(), job_id),
                 )
             connection.commit()
+
+    def release_lease(
+        self,
+        job_id: str,
+        worker_id: str,
+        lease_generation: int,
+    ) -> None:
+        stamp = self.now().isoformat()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE jobs SET status = 'queued', worker_id = NULL,
+                    lease_until = NULL, updated_at = ?
+                WHERE id = ? AND status = 'leased' AND worker_id = ?
+                    AND lease_generation = ?
+                """,
+                (stamp, job_id, worker_id, lease_generation),
+            )
+        if cursor.rowcount != 1:
+            raise RuntimeError(
+                f"Job lease is not owned by {worker_id}: {job_id}"
+            )
+
+    def lease_is_owned(
+        self,
+        job_id: str,
+        worker_id: str,
+        lease_generation: int,
+    ) -> bool:
+        now = self.now()
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT lease_until FROM jobs
+                WHERE id = ? AND status = 'leased' AND worker_id = ?
+                    AND lease_generation = ? AND cancel_requested = 0
+                """,
+                (job_id, worker_id, lease_generation),
+            ).fetchone()
+        return bool(
+            row and self._lease_is_live(row["lease_until"], now)
+        )
 
     def request_cancel(self, project: str, run_id: str) -> Job:
         with self._connect() as connection:

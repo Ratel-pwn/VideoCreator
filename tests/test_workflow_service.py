@@ -35,6 +35,188 @@ def test_service_initializes_project_and_starts_async_workflow(tmp_path: Path):
     assert service.get_workflow_status("demo", "run-1")["current_stage"] == "prepare"
 
 
+@pytest.mark.parametrize(
+    "run_id",
+    [
+        "../escape",
+        r"..\escape",
+        "nested/run",
+        r"nested\run",
+        r"C:\escape",
+        "C:relative",
+        r"\\server\share\run",
+        ".",
+        "..",
+    ],
+)
+def test_service_rejects_run_ids_that_are_not_one_safe_component(
+    tmp_path: Path,
+    run_id: str,
+):
+    service = build_service(tmp_path)
+    service.initialize_project("demo", "chaos-museum")
+
+    with pytest.raises(ServiceError) as rejected:
+        service.start_workflow("demo", "A topic", run_id=run_id)
+
+    assert rejected.value.code == "invalid_argument"
+    assert list((tmp_path / "projects/demo/runs").iterdir()) == []
+
+
+def test_service_refuses_to_reopen_or_overwrite_an_existing_run(tmp_path: Path):
+    service = build_service(tmp_path)
+    service.initialize_project("demo", "chaos-museum")
+    service.start_workflow("demo", "Original topic", run_id="run-1")
+    manifest_path = tmp_path / "projects/demo/runs/run-1/manifest.json"
+    original = manifest_path.read_bytes()
+
+    with pytest.raises(ServiceError) as duplicate:
+        service.start_workflow("demo", "Replacement topic", run_id="run-1")
+
+    assert duplicate.value.code == "state_conflict"
+    assert manifest_path.read_bytes() == original
+
+
+def test_service_recovers_run_created_before_queue_enqueue(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    service = build_service(tmp_path)
+    service.initialize_project("demo", "chaos-museum")
+
+    monkeypatch.setattr(
+        service.queue,
+        "enqueue",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("simulated queue outage")
+        ),
+    )
+    with pytest.raises(ServiceError, match="queue"):
+        service.start_workflow("demo", "A topic", run_id="run-1")
+
+    state_path = tmp_path / "projects/demo/runs/run-1/state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["queue_outbox"]["status"] == "pending"
+
+    recovered = build_service(tmp_path)
+
+    job = recovered.queue.get("demo", "run-1")
+    assert job is not None
+    assert job.status == "queued"
+    recovered_state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert recovered_state["queue_outbox"]["status"] == "dispatched"
+    assert recovered_state["queue_outbox"]["job_id"] == job.id
+
+
+def test_published_run_has_outbox_before_context_construction_finishes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import main
+
+    service = build_service(tmp_path)
+    service.initialize_project("demo", "chaos-museum")
+    monkeypatch.setattr(
+        main,
+        "WorkflowContext",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("context construction crash")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="context construction crash"):
+        service.start_workflow(
+            "demo",
+            "A topic",
+            context="immutable context",
+            run_id="run-1",
+        )
+
+    run = tmp_path / "projects/demo/runs/run-1"
+    state = json.loads((run / "state.json").read_text(encoding="utf-8"))
+    manifest = json.loads((run / "manifest.json").read_text(encoding="utf-8"))
+    assert state["execution_owner"] == "mcp"
+    assert state["queue_outbox"]["status"] == "pending"
+    assert (run / "inputs/agent-context.md").read_text(
+        encoding="utf-8"
+    ).strip() == "immutable context"
+    assert manifest["lineage"]["agent_context"]["sha256"]
+
+    recovered = build_service(tmp_path)
+    assert recovered.queue.get("demo", "run-1").status == "queued"
+
+
+def test_service_recovers_resume_requested_before_queue_transition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    service = build_service(tmp_path)
+    service.initialize_project("demo", "chaos-museum")
+    service.start_workflow("demo", "A topic", run_id="run-1")
+    claimed = service.queue.claim("worker", 60)
+    service.queue.fail(
+        claimed.id,
+        "worker",
+        "failed before resume",
+        lease_generation=claimed.lease_generation,
+    )
+    run = tmp_path / "projects/demo/runs/run-1"
+    state_path = run / "state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["status"] = "failed"
+    state["last_error"] = "failed before resume"
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    monkeypatch.setattr(
+        service.queue,
+        "resume_failed",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("simulated queue outage")
+        ),
+    )
+    with pytest.raises(ServiceError, match="resume"):
+        service.resume_workflow("demo", "run-1")
+
+    pending = json.loads(state_path.read_text(encoding="utf-8"))
+    assert pending["status"] == "ready"
+    assert pending["queue_outbox"]["action"] == "resume"
+    assert pending["queue_outbox"]["status"] == "pending"
+
+    recovered = build_service(tmp_path)
+
+    job = recovered.queue.get("demo", "run-1")
+    assert job.status == "queued"
+    durable = json.loads(state_path.read_text(encoding="utf-8"))
+    assert durable["queue_outbox"]["status"] == "dispatched"
+    assert durable["queue_outbox"]["job_id"] == job.id
+
+
+def test_service_freezes_context_without_exposing_it_in_status_state_or_manifest(
+    tmp_path: Path,
+):
+    service = build_service(tmp_path)
+    service.initialize_project("demo", "chaos-museum")
+    secret_context = "Audience: researchers\nINTERNAL-CONTEXT-SENTINEL"
+
+    service.start_workflow(
+        "demo",
+        "A topic",
+        context=secret_context,
+        run_id="run-1",
+    )
+
+    run = tmp_path / "projects/demo/runs/run-1"
+    snapshot = run / "inputs/agent-context.md"
+    state_text = (run / "state.json").read_text(encoding="utf-8")
+    manifest = json.loads((run / "manifest.json").read_text(encoding="utf-8"))
+    status = service.get_workflow_status("demo", "run-1")
+    assert snapshot.read_text(encoding="utf-8").strip() == secret_context
+    assert manifest["lineage"]["agent_context"]["sha256"]
+    assert "INTERNAL-CONTEXT-SENTINEL" not in state_text
+    assert "INTERNAL-CONTEXT-SENTINEL" not in json.dumps(manifest)
+    assert "INTERNAL-CONTEXT-SENTINEL" not in json.dumps(status)
+
+
 def test_service_submits_only_current_interaction_and_requeues(tmp_path: Path):
     service = build_service(tmp_path)
     service.initialize_project("demo", "chaos-museum")

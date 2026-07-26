@@ -1013,4 +1013,5 @@ def candidate_to_track(
         preferred_start_ms=0,
         loopable=candidate.loopable,
         metadata_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+        duration_ms=metadata.duration_ms,
     )

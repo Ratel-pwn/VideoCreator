@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
 from .bgm_library import BgmLibrarySelection
-from .durable_io import atomic_write_json
+from .durable_io import atomic_write_json, atomic_write_text, fsync_directory
+from .run_identity import resolve_run_dir, validate_run_id
 from .templates import LibrarySelection, TemplateDefinition, snapshot_template
 
 
@@ -59,6 +63,7 @@ def _snapshot_library_item(item: LibrarySelection | BgmLibrarySelection) -> dict
                 {
                     "path": str(track.path),
                     "sha256": track.sha256,
+                    "duration_ms": track.duration_ms,
                     "metadata": {
                         "path": str(track.metadata_path),
                         "sha256": track.metadata_sha256,
@@ -89,22 +94,76 @@ def create_run(
     run_id: str,
     template: TemplateDefinition,
     libraries: Mapping[str, LibrarySelection | BgmLibrarySelection],
+    *,
+    initial_state: Mapping[str, Any] | None = None,
+    initial_manifest: Mapping[str, Any] | None = None,
+    input_text_snapshots: Mapping[str, str] | None = None,
 ) -> RunPaths:
-    root = project_root / "runs" / run_id
+    root = resolve_run_dir(project_root, run_id)
     if root.exists():
-        raise FileExistsError(f"run already exists: {root}")
+        raise FileExistsError(f"Run already exists: {root}")
+    runs_root = root.parent
+    runs_root.mkdir(parents=True, exist_ok=True)
+    staging = runs_root / f".creating-{run_id}-{uuid.uuid4().hex}"
+    staging.mkdir(exist_ok=False)
     names = ("inputs", "session", "writing", "audio", "subtitles", "visual", "render", "review")
-    for name in names:
-        (root / name).mkdir(parents=True, exist_ok=True)
-    paths = RunPaths(root, *(root / name for name in names))
-    project = json.loads((project_root / "project.json").read_text(encoding="utf-8"))
-    _write_json(paths.inputs / "template.snapshot.json", snapshot_template(template))
-    _write_json(paths.inputs / "project.snapshot.json", project)
-    _write_json(paths.inputs / "source-selection.json", {"files": []})
-    _write_json(paths.inputs / "library.snapshot.json", {
-        kind: _snapshot_library_item(item) for kind, item in sorted(libraries.items())
-    })
-    _write_json(paths.state, {"schema_version": 2, "run_id": run_id, "stages": {}})
-    _write_json(paths.manifest, {"schema_version": 2, "run_id": run_id, "project": project["name"], "template": {"id": template.id, "version": template.version}, "artifacts": {}})
-    return paths
+    try:
+        for name in names:
+            (staging / name).mkdir()
+        paths = RunPaths(
+            staging,
+            *(staging / name for name in names),
+        )
+        project = json.loads(
+            (project_root / "project.json").read_text(encoding="utf-8")
+        )
+        _write_json(
+            paths.inputs / "template.snapshot.json",
+            snapshot_template(template),
+        )
+        _write_json(paths.inputs / "project.snapshot.json", project)
+        _write_json(paths.inputs / "source-selection.json", {"files": []})
+        _write_json(
+            paths.inputs / "library.snapshot.json",
+            {
+                kind: _snapshot_library_item(item)
+                for kind, item in sorted(libraries.items())
+            },
+        )
+        for name, content in (input_text_snapshots or {}).items():
+            atomic_write_text(paths.inputs / validate_run_id(name), content)
+        _write_json(
+            paths.state,
+            {
+                "schema_version": 2,
+                "run_id": run_id,
+                "stages": {},
+                **dict(initial_state or {}),
+            },
+        )
+        _write_json(
+            paths.manifest,
+            {
+                "schema_version": 2,
+                "run_id": run_id,
+                "project": project["name"],
+                "template": {
+                    "id": template.id,
+                    "version": template.version,
+                },
+                "artifacts": {},
+                **dict(initial_manifest or {}),
+            },
+        )
+        try:
+            os.rename(staging, root)
+        except OSError as exc:
+            if root.exists():
+                raise FileExistsError(f"Run already exists: {root}") from exc
+            raise
+        fsync_directory(runs_root)
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging)
+    return RunPaths(root, *(root / name for name in names))
 

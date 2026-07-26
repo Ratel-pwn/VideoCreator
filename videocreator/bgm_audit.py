@@ -4,9 +4,10 @@ import json
 import math
 import subprocess
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .bgm_mix import BgmMixResult, BgmMixSettings, sha256_file
+from .durable_io import atomic_write_json
 from .media import probe_media
 
 
@@ -64,25 +65,24 @@ def _artifact(path: Path, sha256: str, duration_ms: int) -> dict[str, Any]:
     }
 
 
-def _write_report(report: dict[str, Any], path: Path) -> dict[str, Any]:
+def _write_report(
+    report: dict[str, Any],
+    path: Path,
+    *,
+    before_commit: Callable[[], None] = lambda: None,
+) -> dict[str, Any]:
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(
-            report,
-            ensure_ascii=False,
-            indent=2,
-            allow_nan=False,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
+    json.dumps(report, ensure_ascii=False, allow_nan=False)
+    before_commit()
+    atomic_write_json(path, report)
     return report
 
 
 def write_bgm_mix_report(
     result: BgmMixResult,
     path: Path,
+    *,
+    before_commit: Callable[[], None] = lambda: None,
 ) -> dict[str, Any]:
     findings = _measurement_findings(
         narration_duration_ms=result.narration_duration_ms,
@@ -165,13 +165,15 @@ def write_bgm_mix_report(
         "warnings": warnings,
         "findings": findings,
     }
-    return _write_report(report, path)
+    return _write_report(report, path, before_commit=before_commit)
 
 
 def write_narration_only_report(
     narration: Path,
     path: Path,
     warnings: list[str] | tuple[str, ...],
+    *,
+    before_commit: Callable[[], None] = lambda: None,
 ) -> dict[str, Any]:
     narration = Path(narration)
     if not narration.is_file():
@@ -196,7 +198,7 @@ def write_narration_only_report(
         "warnings": list(warnings),
         "findings": [],
     }
-    return _write_report(report, path)
+    return _write_report(report, path, before_commit=before_commit)
 
 
 def _load_report(report: dict[str, Any] | Path) -> dict[str, Any]:

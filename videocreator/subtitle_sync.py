@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 from .media import probe_media
+from .subtitle_alignment import normalize_visible_chars
 
 
 SRT_TIME_RE = re.compile(
@@ -163,6 +165,7 @@ def audit_subtitle_sync(
     *,
     thresholds: SyncThresholds,
     segment_manifest: Path | None = None,
+    approved_text: Path | None = None,
 ) -> dict[str, Any]:
     findings: list[dict[str, Any]] = []
     audio_hash = sha256_file(audio)
@@ -197,6 +200,59 @@ def audit_subtitle_sync(
         ))
 
     captions = parse_srt(srt)
+    approved_path = (
+        Path(approved_text)
+        if approved_text is not None
+        else Path(str(report.get("approved_text_path", "")))
+        if report.get("approved_text_path")
+        else None
+    )
+    expected_approved_hash = report.get("approved_text_sha256")
+    if approved_path is not None:
+        if not approved_path.is_file():
+            findings.append(_finding(
+                "approved_text_missing",
+                "Approved narration text is missing",
+                target="approved_text",
+            ))
+        else:
+            actual_approved_hash = sha256_file(approved_path)
+            if expected_approved_hash != actual_approved_hash:
+                findings.append(_finding(
+                    "approved_text_hash_mismatch",
+                    "Alignment report was not generated from the current approved text",
+                    evidence={
+                        "expected": expected_approved_hash,
+                        "actual": actual_approved_hash,
+                    },
+                    target="approved_text",
+                ))
+            approved_normalized = "".join(
+                normalize_visible_chars(
+                    approved_path.read_text(encoding="utf-8-sig")
+                )
+            )
+            subtitle_normalized = "".join(
+                normalize_visible_chars(
+                    " ".join(caption["text"] for caption in captions)
+                )
+            )
+            if approved_normalized != subtitle_normalized:
+                findings.append(_finding(
+                    "approved_text_mismatch",
+                    "Final SRT text does not contain the complete approved narration",
+                    evidence={
+                        "approved_character_count": len(approved_normalized),
+                        "subtitle_character_count": len(subtitle_normalized),
+                    },
+                    target="srt",
+                ))
+    elif expected_approved_hash is not None:
+        findings.append(_finding(
+            "approved_text_missing",
+            "Alignment report does not identify its approved narration text",
+            target="approved_text",
+        ))
     previous_end = 0
     for caption in captions:
         if caption["end_ms"] <= caption["start_ms"]:
@@ -233,6 +289,28 @@ def audit_subtitle_sync(
     exact_coverage = float(report.get("exact_match_coverage", 0.0))
     character_error_rate = float(report.get("character_error_rate", 1.0))
     timing_coverage = float(report.get("timing_coverage", 0.0))
+    unresolved_span = report.get("max_unresolved_span_ms")
+    if (
+        isinstance(unresolved_span, bool)
+        or not isinstance(unresolved_span, (int, float))
+        or not math.isfinite(float(unresolved_span))
+        or float(unresolved_span) < 0
+    ):
+        if approved_path is not None:
+            findings.append(_finding(
+                "alignment_evidence_missing",
+                "Alignment report does not declare maximum unresolved timing span",
+            ))
+        unresolved_span = 0
+    if float(unresolved_span) > thresholds.max_unresolved_span_ms:
+        findings.append(_finding(
+            "unresolved_span_too_long",
+            "Approved text has an unresolved timing span beyond the allowed maximum",
+            evidence={
+                "actual_ms": int(unresolved_span),
+                "maximum_ms": thresholds.max_unresolved_span_ms,
+            },
+        ))
     unmatched_spans = report.get("unmatched_approved_spans") or []
     mismatch_source_index = (
         int(unmatched_spans[0]["start_index"]) if unmatched_spans else None
@@ -318,6 +396,7 @@ def audit_subtitle_sync(
             "exact_match_coverage": exact_coverage,
             "character_error_rate": character_error_rate,
             "timing_coverage": timing_coverage,
+            "max_unresolved_span_ms": int(unresolved_span),
         },
         "findings": findings,
     }

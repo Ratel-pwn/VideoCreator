@@ -36,6 +36,67 @@ def test_expired_lease_can_be_recovered(tmp_path: Path):
     assert recovered.attempts == 2
 
 
+def test_reclaimed_lease_fences_stale_generation_even_for_same_worker_id(
+    tmp_path: Path,
+):
+    now = datetime(2026, 7, 22, tzinfo=timezone.utc)
+    queue = JobQueue(tmp_path / "queue.sqlite3", now=lambda: now)
+    queue.enqueue("project", "run-1")
+    stale = queue.claim("same-worker", lease_seconds=10)
+
+    queue.now = lambda: now + timedelta(seconds=11)
+    current = queue.claim("same-worker", lease_seconds=60)
+
+    assert current.lease_generation == stale.lease_generation + 1
+    assert not queue.renew(
+        stale.id,
+        "same-worker",
+        lease_seconds=60,
+        lease_generation=stale.lease_generation,
+    )
+    with pytest.raises(RuntimeError, match="lease"):
+        queue.complete(
+            stale.id,
+            "same-worker",
+            lease_generation=stale.lease_generation,
+        )
+    queue.complete(
+        current.id,
+        "same-worker",
+        lease_generation=current.lease_generation,
+    )
+    assert queue.get("project", "run-1").status == "completed"
+
+
+def test_expired_lease_is_fenced_before_replacement_claims_it(
+    tmp_path: Path,
+):
+    now = datetime(2026, 7, 22, tzinfo=timezone.utc)
+    queue = JobQueue(tmp_path / "queue.sqlite3", now=lambda: now)
+    queue.enqueue("project", "run-1")
+    stale = queue.claim("worker", lease_seconds=10)
+
+    queue.now = lambda: now + timedelta(seconds=11)
+
+    assert not queue.lease_is_owned(
+        stale.id,
+        "worker",
+        stale.lease_generation,
+    )
+    assert not queue.renew(
+        stale.id,
+        "worker",
+        lease_seconds=60,
+        lease_generation=stale.lease_generation,
+    )
+    with pytest.raises(RuntimeError, match="lease"):
+        queue.complete(
+            stale.id,
+            "worker",
+            lease_generation=stale.lease_generation,
+        )
+
+
 def test_waiting_job_is_requeued_and_persists_across_instances(tmp_path: Path):
     path = tmp_path / "queue.sqlite3"
     queue = JobQueue(path)

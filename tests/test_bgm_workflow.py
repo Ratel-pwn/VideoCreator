@@ -71,6 +71,7 @@ def track(root: Path, *, track_id: str = "track", rights_status: str = "cleared"
         avoid_for=(),
         preferred_start_ms=0,
         loopable=True,
+        duration_ms=60_000,
         metadata_sha256=digest,
     )
 
@@ -85,6 +86,7 @@ def request(tmp_path: Path, **overrides):
         "policy": BgmPolicy(preferred_moods=("reflective",)),
         "provider_config": {"providers": []},
         "download_dir": tmp_path / "visual" / "bgm",
+        "required_duration_ms": 30_000,
     }
     values.update(overrides)
     return BgmResolutionRequest(**values)
@@ -220,6 +222,33 @@ def test_agent_handoff_uses_workflow_candidate_and_response_limits(tmp_path):
     payload = raised.value.interaction["payload"]
     assert payload["response_schema"]["properties"]["candidates"]["maxItems"] == 2
     assert payload["limits"]["max_response_bytes"] == 512
+
+
+def test_agent_handoff_includes_required_duration_and_prior_rejections(
+    tmp_path,
+):
+    from videocreator.bgm_workflow import resolve_bgm_for_run
+
+    local = replace(
+        track(tmp_path / "local", track_id="too-short"),
+        loopable=False,
+        duration_ms=1_000,
+    )
+    req = request(
+        tmp_path,
+        local_tracks=(local,),
+        required_duration_ms=30_000,
+    )
+
+    with pytest.raises(InteractionRequired) as raised:
+        resolve_bgm_for_run(req, DurableInteractionPort())
+
+    technical = raised.value.interaction["payload"]["technical"]
+    assert technical["required_duration_ms"] == 30_000
+    assert {
+        "track_id": "too-short",
+        "reasons": ["too_short_non_loopable"],
+    } in technical["rejections"]
 
 
 def test_console_resume_preserves_matching_durable_agent_handoff(tmp_path):
@@ -408,6 +437,99 @@ def test_provider_candidates_are_tried_before_agent_handoff(tmp_path, monkeypatc
     assert result.mode == "bgm"
     assert result.source == "provider"
     assert "pending_interaction" not in req.context.state
+
+
+def test_provider_skips_short_non_loopable_candidate_and_uses_next(
+    tmp_path,
+    monkeypatch,
+):
+    from videocreator import bgm_workflow
+
+    candidates = [
+        replace(online_candidate("short"), loopable=False),
+        replace(online_candidate("long"), loopable=False),
+    ]
+    monkeypatch.setattr(
+        bgm_workflow,
+        "search_configured_providers",
+        lambda *_args, **_kwargs: candidates,
+    )
+
+    def download(candidate, output_dir, **_kwargs):
+        path = output_dir / f"{candidate.id}.mp3"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(candidate.id.encode())
+        return path
+
+    def to_track(candidate, path):
+        return replace(
+            candidate_track(candidate, path),
+            loopable=False,
+            duration_ms=1_000 if candidate.id == "short" else 60_000,
+        )
+
+    monkeypatch.setattr(bgm_workflow, "download_candidate", download)
+    monkeypatch.setattr(bgm_workflow, "candidate_to_track", to_track)
+
+    result = bgm_workflow.resolve_bgm_for_run(
+        request(tmp_path, required_duration_ms=30_000),
+        DurableInteractionPort(),
+    )
+
+    assert result.source == "provider"
+    assert result.track.id == "long"
+    rejected = next(
+        score for score in result.scores if score.track_id == "short"
+    )
+    assert rejected.rejection_reasons == ("too_short_non_loopable",)
+
+
+def test_agent_skips_short_non_loopable_candidate_and_uses_next(
+    tmp_path,
+    monkeypatch,
+):
+    from videocreator import bgm_workflow
+
+    req = request(tmp_path, required_duration_ms=30_000)
+    port = DurableInteractionPort()
+    with pytest.raises(InteractionRequired) as raised:
+        bgm_workflow.resolve_bgm_for_run(req, port)
+    payload = json.loads(agent_response())
+    short = dict(payload["candidates"][0])
+    short.update({"id": "short", "loopable": False})
+    long = dict(short)
+    long["id"] = "long"
+    payload["candidates"] = [short, long]
+    port.submit(
+        req.context,
+        raised.value.interaction["id"],
+        json.dumps(payload),
+    )
+
+    def download(candidate, output_dir, **_kwargs):
+        path = output_dir / f"{candidate.id}.mp3"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(candidate.id.encode())
+        return path
+
+    def to_track(candidate, path):
+        return replace(
+            candidate_track(candidate, path),
+            loopable=False,
+            duration_ms=1_000 if candidate.id == "short" else 60_000,
+        )
+
+    monkeypatch.setattr(bgm_workflow, "download_candidate", download)
+    monkeypatch.setattr(bgm_workflow, "candidate_to_track", to_track)
+
+    result = bgm_workflow.resolve_bgm_for_run(req, port)
+
+    assert result.source == "agent"
+    assert result.track.id == "long"
+    rejected = next(
+        score for score in result.scores if score.track_id == "short"
+    )
+    assert rejected.rejection_reasons == ("too_short_non_loopable",)
 
 
 def test_committed_resolution_is_replayed_without_search_or_download(
@@ -822,6 +944,89 @@ def test_acknowledgement_removes_signed_agent_url_from_runtime_state_and_ledgers
     )
     durable_text += (tmp_path / "state.json").read_text(encoding="utf-8")
     assert "DO-NOT-PERSIST" not in durable_text
+
+
+def test_agent_signed_urls_are_scrubbed_immediately_after_durable_resolution(
+    tmp_path,
+    monkeypatch,
+):
+    from videocreator import bgm_workflow
+
+    req = request(tmp_path)
+    port = DurableInteractionPort()
+    with pytest.raises(InteractionRequired) as raised:
+        bgm_workflow.resolve_bgm_for_run(req, port)
+    response = agent_response().replace(
+        "https://example.test/source",
+        "https://example.test/source?token=SOURCE-SECRET",
+    ).replace(
+        "track.mp3",
+        "track.mp3?X-Amz-Signature=DOWNLOAD-SECRET",
+    )
+    port.submit(req.context, raised.value.interaction["id"], response)
+
+    def download(item, output_dir, **kwargs):
+        path = output_dir / f"{kwargs['output_name']}.mp3"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"audio")
+        return path
+
+    monkeypatch.setattr(bgm_workflow, "download_candidate", download)
+    monkeypatch.setattr(bgm_workflow, "candidate_to_track", candidate_track)
+
+    result = bgm_workflow.resolve_bgm_for_run(req, port)
+
+    assert result.track.source_url == "https://example.test/source"
+    persisted = json.dumps(req.context.state, ensure_ascii=False)
+    persisted += "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in req.download_dir.rglob("*.json")
+    )
+    assert "SOURCE-SECRET" not in persisted
+    assert "DOWNLOAD-SECRET" not in persisted
+
+
+def test_agent_response_is_scrubbed_before_post_commit_cleanup(
+    tmp_path,
+    monkeypatch,
+):
+    from videocreator import bgm_workflow
+
+    req = request(tmp_path)
+    port = DurableInteractionPort()
+    with pytest.raises(InteractionRequired) as raised:
+        bgm_workflow.resolve_bgm_for_run(req, port)
+    response = agent_response().replace(
+        "track.mp3",
+        "track.mp3?X-Amz-Signature=CLEANUP-CRASH-SECRET",
+    )
+    port.submit(req.context, raised.value.interaction["id"], response)
+
+    def download(item, output_dir, **kwargs):
+        path = output_dir / f"{kwargs['output_name']}.mp3"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"audio")
+        return path
+
+    monkeypatch.setattr(bgm_workflow, "download_candidate", download)
+    monkeypatch.setattr(bgm_workflow, "candidate_to_track", candidate_track)
+    monkeypatch.setattr(
+        bgm_workflow,
+        "_cleanup_downloads",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            OSError("cleanup crash")
+        ),
+    )
+
+    with pytest.raises(OSError, match="cleanup crash"):
+        bgm_workflow.resolve_bgm_for_run(req, port)
+
+    state_text = json.dumps(req.context.state, ensure_ascii=False)
+    ledger_text = bgm_workflow._resolution_ledger_path(req).read_text(
+        encoding="utf-8"
+    )
+    assert "CLEANUP-CRASH-SECRET" not in state_text
+    assert "CLEANUP-CRASH-SECRET" not in ledger_text
 
 
 def test_copied_resolution_ledger_without_matching_artifact_is_rejected(

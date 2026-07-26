@@ -77,6 +77,41 @@ class AlignmentResult:
         resolved = sum(item.start_ms is not None and item.end_ms is not None for item in self.approved)
         return resolved / len(self.approved)
 
+    @property
+    def max_unresolved_span_ms(self) -> int:
+        if not self.approved or self.timing_coverage == 1.0:
+            return 0
+        recognized_end = max(
+            (item.end_ms for item in self.recognized),
+            default=0,
+        )
+        maximum = 0
+        index = 0
+        while index < len(self.approved):
+            if self.approved[index].start_ms is not None:
+                index += 1
+                continue
+            start = index
+            while (
+                index < len(self.approved)
+                and self.approved[index].start_ms is None
+            ):
+                index += 1
+            left_end = (
+                self.approved[start - 1].end_ms
+                if start > 0
+                and self.approved[start - 1].end_ms is not None
+                else 0
+            )
+            right_start = (
+                self.approved[index].start_ms
+                if index < len(self.approved)
+                and self.approved[index].start_ms is not None
+                else recognized_end
+            )
+            maximum = max(maximum, max(0, int(right_start - left_end)))
+        return maximum
+
     def to_report(self) -> dict[str, Any]:
         return {
             "approved_character_count": len(self.approved),
@@ -84,6 +119,7 @@ class AlignmentResult:
             "exact_match_coverage": round(self.exact_match_coverage, 6),
             "character_error_rate": round(self.character_error_rate, 6),
             "timing_coverage": round(self.timing_coverage, 6),
+            "max_unresolved_span_ms": self.max_unresolved_span_ms,
             "unmatched_approved_spans": self.unmatched_approved_spans,
             "unmatched_recognized_spans": self.unmatched_recognized_spans,
         }
@@ -196,17 +232,26 @@ def build_aligned_blocks(
     cursor = 0
     for chunk in chunks:
         count = len(normalize_visible_chars(chunk))
+        if count == 0:
+            raise ValueError("subtitle chunk has no visible approved text")
         source_start = cursor
         source_end = min(len(result.approved), cursor + count)
         selected = result.approved[source_start:source_end]
         cursor = source_end
+        if len(selected) != count:
+            raise ValueError(
+                "subtitle segmentation does not cover approved text exactly"
+            )
         resolved = [
             item
             for item in selected
             if item.start_ms is not None and item.end_ms is not None
         ]
-        if not resolved:
-            continue
+        if len(resolved) != len(selected):
+            raise ValueError(
+                "unresolved approved subtitle chunk cannot be timed safely: "
+                f"{chunk}"
+            )
         exact = sum(item.exact for item in selected)
         confidence = sum(item.confidence for item in resolved) / len(resolved)
         blocks.append(AlignedBlock(
@@ -219,6 +264,10 @@ def build_aligned_blocks(
             source_start=source_start,
             source_end=source_end,
         ))
+    if cursor != len(result.approved):
+        raise ValueError(
+            "subtitle segmentation does not cover approved text exactly"
+        )
     return blocks
 
 

@@ -111,7 +111,13 @@ def _track_tags(track: BgmTrack) -> tuple[str, ...]:
     )
 
 
-def score_candidate(track: BgmTrack, query: BgmQuery, policy: BgmPolicy) -> CandidateScore:
+def score_candidate(
+    track: BgmTrack,
+    query: BgmQuery,
+    policy: BgmPolicy,
+    *,
+    required_duration_ms: int = 0,
+) -> CandidateScore:
     components = {
         "subject": WEIGHTS["subject"] if _matches(track.subjects, query.subjects) else 0.0,
         "mood": WEIGHTS["mood"] if _matches(track.moods, query.moods) else 0.0,
@@ -133,9 +139,19 @@ def score_candidate(track: BgmTrack, query: BgmQuery, policy: BgmPolicy) -> Cand
     if avoided_by_policy or avoided_by_track:
         components["avoid"] = WEIGHTS["avoid"]
 
-    rejection_reasons = ()
+    rejection_reasons: tuple[str, ...] = ()
     if policy.instrumental_only and not track.instrumental:
         rejection_reasons = ("instrumental_only",)
+    available_duration_ms = max(0, track.duration_ms - track.preferred_start_ms)
+    if (
+        required_duration_ms > 0
+        and not track.loopable
+        and available_duration_ms < required_duration_ms
+    ):
+        rejection_reasons = (
+            *rejection_reasons,
+            "too_short_non_loopable",
+        )
     return CandidateScore(
         track_id=track.id,
         total=sum(components.values()),
@@ -146,9 +162,24 @@ def score_candidate(track: BgmTrack, query: BgmQuery, policy: BgmPolicy) -> Cand
 
 
 def select_bgm_candidate(
-    tracks: Iterable[BgmTrack], query: BgmQuery, policy: BgmPolicy
+    tracks: Iterable[BgmTrack],
+    query: BgmQuery,
+    policy: BgmPolicy,
+    *,
+    required_duration_ms: int = 0,
 ) -> SelectionResult:
-    pairs = [(track, score_candidate(track, query, policy)) for track in tracks]
+    pairs = [
+        (
+            track,
+            score_candidate(
+                track,
+                query,
+                policy,
+                required_duration_ms=required_duration_ms,
+            ),
+        )
+        for track in tracks
+    ]
     pairs.sort(
         key=lambda item: (
             not item[1].eligible,

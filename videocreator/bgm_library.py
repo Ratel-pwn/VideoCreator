@@ -41,8 +41,15 @@ class BgmTrack:
     loopable: bool
     metadata_sha256: str = ""
     provider: str | None = None
+    duration_ms: int = 0
 
     def __post_init__(self) -> None:
+        if (
+            isinstance(self.duration_ms, bool)
+            or not isinstance(self.duration_ms, int)
+            or self.duration_ms < 0
+        ):
+            raise ValueError("duration_ms must be a non-negative integer")
         object.__setattr__(
             self,
             "provider",
@@ -171,6 +178,7 @@ def _load_track(audio_path: Path, level: str) -> BgmTrack:
         preferred_start_ms=preferred_start_raw,
         loopable=loopable,
         metadata_sha256=_sha256(metadata_path),
+        duration_ms=metadata.duration_ms,
     )
 
 
