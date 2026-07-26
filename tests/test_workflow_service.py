@@ -587,6 +587,34 @@ def test_result_rejects_same_directory_manifest_aliases(tmp_path: Path):
     assert "final_video" not in result["artifacts"]
 
 
+def test_result_allows_canonical_migrated_audio_and_subtitle_paths(
+    tmp_path: Path,
+):
+    service = build_service(tmp_path)
+    service.initialize_project("demo", "chaos-museum")
+    service.start_workflow("demo", "A topic", run_id="run-1")
+    run = tmp_path / "projects/demo/runs/run-1"
+    paths = {
+        "voice_audio": run / "audio/narration.generated.mp3",
+        "voice_subtitle": run / "subtitles/subtitles.aligned.srt",
+        "voice_audio_cleaned": run / "audio/narration.render.mp3",
+        "voice_subtitle_cleaned": run / "subtitles/subtitles.render.srt",
+    }
+    for path in paths.values():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"public-artifact")
+    manifest_path = run / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["artifacts"].update(
+        {key: str(path) for key, path in paths.items()}
+    )
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    result = service.get_workflow_result("demo", "run-1")
+
+    assert set(paths).issubset(result["artifacts"])
+
+
 @pytest.mark.parametrize(
     "name",
     [
