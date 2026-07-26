@@ -597,8 +597,8 @@ def test_result_allows_canonical_migrated_audio_and_subtitle_paths(
     paths = {
         "voice_audio": run / "audio/narration.generated.mp3",
         "voice_subtitle": run / "subtitles/subtitles.aligned.srt",
-        "voice_audio_cleaned": run / "audio/narration.render.mp3",
-        "voice_subtitle_cleaned": run / "subtitles/subtitles.render.srt",
+        "voice_audio_cleaned": run / "audio/narration.generated.mp3",
+        "voice_subtitle_cleaned": run / "subtitles/subtitles.aligned.srt",
     }
     for path in paths.values():
         path.parent.mkdir(parents=True, exist_ok=True)

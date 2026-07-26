@@ -56,11 +56,13 @@ PUBLIC_ARTIFACT_PATTERNS = {
     "voice_audio_cleaned": (
         r"audio/final-mix\.wav",
         r"audio/voice\.(?:mp3|wav|m4a|aac|flac|ogg)",
+        r"audio/narration\.generated\.(?:mp3|wav|m4a|aac|flac|ogg)",
         r"audio/narration\.imported\.(?:mp3|wav|m4a|aac|flac|ogg)",
         r"audio/narration\.render\.(?:mp3|wav|m4a|aac|flac|ogg)",
     ),
     "voice_subtitle_cleaned": (
         r"audio/voice\.srt",
+        r"subtitles/subtitles\.aligned\.srt",
         r"subtitles/subtitles\.imported\.srt",
         r"subtitles/subtitles\.render\.srt",
     ),
