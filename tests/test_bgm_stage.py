@@ -155,7 +155,10 @@ def test_selected_bgm_stage_registers_full_lineage(context, monkeypatch):
     source = context.run_dir / "audio" / "bgm.source.mp3"
     metadata = context.run_dir / "audio" / "bgm.source.bgm.json"
     source.write_bytes(b"selected")
-    metadata.write_text("{}", encoding="utf-8")
+    metadata.write_text(
+        json.dumps({"provider": None, "rights_status": "cleared"}),
+        encoding="utf-8",
+    )
     track = BgmTrack(
         id="selected",
         path=source,
@@ -232,6 +235,10 @@ def test_selected_bgm_stage_registers_full_lineage(context, monkeypatch):
                 main._effective_bgm_policy(context)
             ),
             "configuration_sha256": mix_configuration_hash(settings),
+            "provenance": {
+                "provider": track.provider,
+                "rights_status": track.rights_status,
+            },
         }
         path.write_text(json.dumps(value), encoding="utf-8")
         return value
@@ -601,6 +608,8 @@ def test_render_gate_requires_exact_current_narration_path(context, monkeypatch)
 
 
 def _metadata_gate_fixture(context):
+    provider = "fixture-provider"
+    rights_status = "unknown"
     narration = Path(context.manifest["artifacts"]["voice_audio"])
     source = context.run_dir / "audio" / "bgm.source.mp3"
     metadata = context.run_dir / "audio" / "bgm.source.bgm.json"
@@ -610,24 +619,37 @@ def _metadata_gate_fixture(context):
     selection_path = context.run_dir / "audio" / "bgm-selection.json"
     for path, value in (
         (source, b"source"),
-        (metadata, b"metadata"),
+        (
+            metadata,
+            json.dumps(
+                {
+                    "provider": provider,
+                    "rights_status": rights_status,
+                }
+            ).encode("utf-8"),
+        ),
         (prepared, b"prepared"),
         (final_mix, b"mix"),
     ):
         path.write_bytes(value)
     metadata_hash = main.sha256_file(metadata)
-    selection_path.write_text(
-        json.dumps(
-            {
-                "track": {
-                    "path": str(source),
-                    "metadata_path": str(metadata),
-                    "metadata_sha256": metadata_hash,
-                }
-            }
-        ),
-        encoding="utf-8",
-    )
+    workflow_config_sha256 = main._workflow_bgm_config_hash(context)
+    effective_policy_sha256 = main._effective_bgm_policy_hash(context)
+    selection = {
+        "resolution_id": "resolution-1",
+        "request_fingerprint": "request-1",
+        "workflow_config_sha256": workflow_config_sha256,
+        "effective_policy_sha256": effective_policy_sha256,
+        "track": {
+            "path": str(source),
+            "metadata_path": str(metadata),
+            "metadata_sha256": metadata_hash,
+            "provider": provider,
+            "rights_status": rights_status,
+        },
+    }
+    selection_path.write_text(json.dumps(selection), encoding="utf-8")
+    settings = main.bgm_mix_settings_for_context(context)
     report = {
         "mode": "bgm",
         "inputs": {
@@ -645,6 +667,20 @@ def _metadata_gate_fixture(context):
             "prepared_bgm": {"path": str(prepared)},
             "render_audio": {"path": str(final_mix)},
         },
+        "settings": vars(settings),
+        "configuration_sha256": mix_configuration_hash(settings),
+        "policy_sha256": bgm_policy_hash(main._effective_bgm_policy(context)),
+        "provenance": {
+            "provider": provider,
+            "rights_status": rights_status,
+        },
+        "workflow": {
+            "resolution_id": "resolution-1",
+            "request_fingerprint": "request-1",
+            "workflow_config_sha256": workflow_config_sha256,
+            "effective_policy_sha256": effective_policy_sha256,
+            "selection_sha256": main.sha256_file(selection_path),
+        },
     }
     report_path.write_text(json.dumps(report), encoding="utf-8")
     context.manifest["artifacts"].update(
@@ -657,6 +693,18 @@ def _metadata_gate_fixture(context):
             "bgm_mix_report": str(report_path),
         }
     )
+    context.manifest.setdefault("lineage", {})["bgm"] = {
+        "resolution_id": "resolution-1",
+        "request_fingerprint": "request-1",
+        "provider": provider,
+        "rights_status": rights_status,
+        "selection": str(selection_path),
+        "mix_report": str(report_path),
+        "narration": str(narration),
+        "render_audio": str(final_mix),
+        "mix_report_sha256": main.sha256_file(report_path),
+        "render_audio_sha256": main.sha256_file(final_mix),
+    }
     return report, report_path, final_mix, selection_path, metadata
 
 
@@ -699,6 +747,47 @@ def test_render_gate_binds_bgm_metadata_hash_across_all_records(context):
             report_path,
             final_mix,
         )
+
+
+@pytest.mark.parametrize(
+    ("field", "tampered_value"),
+    (
+        ("provider", "tampered-provider"),
+        ("rights_status", "cleared"),
+    ),
+)
+def test_render_gate_rejects_tampered_manifest_bgm_provenance(
+    context,
+    field,
+    tampered_value,
+):
+    report, report_path, final_mix, _selection_path, _metadata = (
+        _metadata_gate_fixture(context)
+    )
+    context.manifest["lineage"]["bgm"][field] = tampered_value
+
+    with pytest.raises(RuntimeError, match="bgm_manifest_provenance_mismatch"):
+        main._ensure_context_bgm_lineage(
+            context,
+            report,
+            report_path,
+            final_mix,
+        )
+
+
+def test_render_gate_accepts_legacy_manifest_without_bgm_provenance_keys(context):
+    report, report_path, final_mix, _selection_path, _metadata = (
+        _metadata_gate_fixture(context)
+    )
+    del context.manifest["lineage"]["bgm"]["provider"]
+    del context.manifest["lineage"]["bgm"]["rights_status"]
+
+    main._ensure_context_bgm_lineage(
+        context,
+        report,
+        report_path,
+        final_mix,
+    )
 
 
 def test_stale_final_mix_is_rejected_before_render(context):

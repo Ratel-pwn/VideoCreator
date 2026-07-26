@@ -1841,6 +1841,7 @@ def _ensure_context_bgm_lineage(
             or report_bgm.get("metadata_sha256") != metadata_hash
         ):
             raise RuntimeError("bgm_metadata_hash_mismatch")
+        frozen_metadata = load_json(expected_metadata)
     workflow = report.get("workflow")
     if not isinstance(workflow, dict):
         raise RuntimeError("missing_bgm_workflow_binding")
@@ -1915,6 +1916,29 @@ def _ensure_context_bgm_lineage(
     lineage = ctx.manifest.get("lineage", {}).get("bgm")
     if not isinstance(lineage, dict):
         raise RuntimeError("missing_bgm_manifest_lineage")
+    if report.get("mode") == "bgm":
+        report_provenance = report.get("provenance")
+        if not isinstance(report_provenance, dict):
+            raise RuntimeError("bgm_manifest_provenance_mismatch")
+
+        def provenance_value(record: dict[str, Any], field: str) -> Any:
+            if field in record:
+                return record[field]
+            return None if field == "provider" else "unknown"
+
+        for field in ("provider", "rights_status"):
+            if field not in lineage:
+                continue
+            expected = lineage[field]
+            if any(
+                provenance_value(record, field) != expected
+                for record in (
+                    selected_track,
+                    report_provenance,
+                    frozen_metadata,
+                )
+            ):
+                raise RuntimeError("bgm_manifest_provenance_mismatch")
     if (
         Path(str(lineage.get("selection"))).resolve() != selection_path
         or Path(str(lineage.get("mix_report"))).resolve() != expected_report

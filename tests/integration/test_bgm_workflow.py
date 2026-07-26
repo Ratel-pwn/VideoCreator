@@ -310,6 +310,19 @@ def test_provider_fallback_downloads_and_preserves_attribution(
     )
     assert ledger["track"]["provider"] == candidate.provider
     assert ledger["track"]["rights_status"] == candidate.rights_status
+    download_ledger = json.loads(
+        next(
+            request.download_dir.glob("bgm-downloads-*.json")
+        ).read_text(encoding="utf-8")
+    )
+    validated = [
+        entry
+        for entry in download_ledger["candidates"].values()
+        if entry["status"] == "validated"
+    ]
+    assert len(validated) == 1
+    assert validated[0]["track"]["provider"] == candidate.provider
+    assert validated[0]["track"]["rights_status"] == candidate.rights_status
 
 
 @pytest.mark.integration
@@ -364,6 +377,19 @@ def test_agent_fallback_waits_then_resumes_from_durable_state(
     )
     assert ledger["track"]["provider"] == candidate.provider
     assert ledger["track"]["rights_status"] == candidate.rights_status
+    download_ledger = json.loads(
+        next(
+            resumed_request.download_dir.glob("bgm-downloads-*.json")
+        ).read_text(encoding="utf-8")
+    )
+    validated = [
+        entry
+        for entry in download_ledger["candidates"].values()
+        if entry["status"] == "validated"
+    ]
+    assert len(validated) == 1
+    assert validated[0]["track"]["provider"] == candidate.provider
+    assert validated[0]["track"]["rights_status"] == candidate.rights_status
     assert "pending_interaction" not in resumed_context.state
     assert acknowledge_bgm_resolution(
         resumed_request,
