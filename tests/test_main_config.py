@@ -216,6 +216,7 @@ def test_resume_revalidates_pre_feature_confirmation_even_when_files_exist(
 
 def test_resume_preserves_current_render_confirmation_gate(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     repo_root = tmp_path / "repo"
     project_root = tmp_path / "projects" / "demo"
@@ -246,6 +247,16 @@ def test_resume_preserves_current_render_confirmation_gate(
     (run_dir / "manifest.json").write_text(
         json.dumps({"project_name": "demo", "artifacts": {}}),
         encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        main,
+        "_subtitle_quality_gate_is_current",
+        lambda _ctx: True,
+    )
+    monkeypatch.setattr(
+        main,
+        "_bgm_quality_gate_is_current",
+        lambda _ctx, **_kwargs: True,
     )
 
     context = resume_context(repo_root, config_path, run_dir)

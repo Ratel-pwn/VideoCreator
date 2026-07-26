@@ -36,7 +36,7 @@ def validate_interaction_response(
         return
     payload = interaction.get("payload")
     if not isinstance(payload, dict):
-        return
+        payload = {}
     limits = payload.get("limits")
     schema = payload.get("response_schema")
     max_bytes = (
@@ -58,9 +58,27 @@ def validate_interaction_response(
     if isinstance(max_bytes, int) and len(encoded) > max_bytes:
         raise ValueError(f"BGM response exceeds {max_bytes} bytes")
     try:
+        from .bgm_search import BgmSearchError, parse_agent_candidates
+
+        parse_agent_candidates(
+            response,
+            max_candidates=(
+                max_candidates
+                if isinstance(max_candidates, int)
+                else 20
+            ),
+            max_response_bytes=(
+                max_bytes
+                if isinstance(max_bytes, int)
+                else 200_000
+            ),
+        )
+    except BgmSearchError as exc:
+        raise ValueError(str(exc)) from exc
+    try:
         parsed = json.loads(response)
-    except json.JSONDecodeError:
-        return
+    except json.JSONDecodeError as exc:
+        raise ValueError("BGM response must be valid JSON") from exc
     candidates = parsed.get("candidates") if isinstance(parsed, dict) else None
     if not isinstance(candidates, list):
         return

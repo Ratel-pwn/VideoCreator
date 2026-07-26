@@ -3,13 +3,49 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
+import threading
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Callable
 
 
 class LeaseLostError(RuntimeError):
     pass
+
+
+class ProcessOutputLimitError(RuntimeError):
+    pass
+
+
+_ACTIVE_PROCESS_RUNNER: ContextVar[Callable[..., Any] | None] = (
+    ContextVar("videocreator_process_runner", default=None)
+)
+
+
+def _is_windows() -> bool:
+    return os.name == "nt"
+
+
+@contextmanager
+def process_runner_scope(runner: Callable[..., Any]):
+    token = _ACTIVE_PROCESS_RUNNER.set(runner)
+    try:
+        yield
+    finally:
+        _ACTIVE_PROCESS_RUNNER.reset(token)
+
+
+def run_managed_process(command: Any, **kwargs: Any) -> Any:
+    runner = _ACTIVE_PROCESS_RUNNER.get()
+    if runner is not None:
+        return runner(command, **kwargs)
+    return run_cancellable_process(
+        command,
+        cancelled=lambda: False,
+        **kwargs,
+    )
 
 
 class RunMutationLock:
@@ -67,8 +103,9 @@ class RunMutationLock:
 
 
 class _WindowsProcessJob:
-    def __init__(self, kernel32: Any, handle: Any):
+    def __init__(self, kernel32: Any, ntdll: Any, handle: Any):
         self.kernel32 = kernel32
+        self.ntdll = ntdll
         self.handle = handle
 
     @classmethod
@@ -113,6 +150,7 @@ class _WindowsProcessJob:
             ]
 
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
         kernel32.CreateJobObjectW.argtypes = [
             ctypes.c_void_p,
             wintypes.LPCWSTR,
@@ -137,6 +175,8 @@ class _WindowsProcessJob:
         kernel32.TerminateJobObject.restype = wintypes.BOOL
         kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
         kernel32.CloseHandle.restype = wintypes.BOOL
+        ntdll.NtResumeProcess.argtypes = [wintypes.HANDLE]
+        ntdll.NtResumeProcess.restype = ctypes.c_long
 
         handle = kernel32.CreateJobObjectW(None, None)
         if not handle:
@@ -168,7 +208,20 @@ class _WindowsProcessJob:
                 error,
                 "Could not fence subprocess in a job object",
             )
-        return cls(kernel32, handle)
+        return cls(kernel32, ntdll, handle)
+
+    def resume(self, process: subprocess.Popen[Any]) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        status = self.ntdll.NtResumeProcess(
+            wintypes.HANDLE(int(process._handle))
+        )
+        if status != 0:
+            raise OSError(
+                int(status),
+                "Could not resume fenced subprocess",
+            )
 
     def terminate(self) -> None:
         if self.handle:
@@ -187,7 +240,7 @@ def _terminate_process_tree(
     windows_job: _WindowsProcessJob | None = None,
     grace_seconds: float = 2,
 ) -> None:
-    if os.name == "nt":
+    if _is_windows():
         if windows_job is not None:
             windows_job.terminate()
         elif process.poll() is None:
@@ -212,6 +265,122 @@ def _terminate_process_tree(
             process.wait()
 
 
+def _bounded_communicate(
+    process: subprocess.Popen[Any],
+    command: Any,
+    *,
+    cancelled: Callable[[], bool],
+    windows_job: _WindowsProcessJob | None,
+    max_output_bytes: int,
+    timeout: float | int | None,
+    poll_seconds: float,
+    text_mode: bool,
+    encoding: str,
+) -> tuple[Any, Any]:
+    if max_output_bytes < 1:
+        raise ValueError("max_output_bytes must be positive")
+    if process.stdout is None or process.stderr is None:
+        raise ValueError(
+            "max_output_bytes requires captured stdout and stderr"
+        )
+    chunks: dict[str, list[Any]] = {"stdout": [], "stderr": []}
+    output_size = 0
+    output_lock = threading.Lock()
+    exceeded = threading.Event()
+    reader_errors: list[BaseException] = []
+
+    def drain(name: str, stream: Any) -> None:
+        nonlocal output_size
+        try:
+            while True:
+                chunk = stream.read(64 * 1024)
+                if not chunk:
+                    return
+                size = (
+                    len(chunk.encode(encoding, errors="replace"))
+                    if isinstance(chunk, str)
+                    else len(chunk)
+                )
+                with output_lock:
+                    if output_size + size > max_output_bytes:
+                        exceeded.set()
+                        return
+                    output_size += size
+                    chunks[name].append(chunk)
+        except BaseException as exc:
+            reader_errors.append(exc)
+
+    readers = [
+        threading.Thread(
+            target=drain,
+            args=("stdout", process.stdout),
+            daemon=True,
+        ),
+        threading.Thread(
+            target=drain,
+            args=("stderr", process.stderr),
+            daemon=True,
+        ),
+    ]
+    for reader in readers:
+        reader.start()
+
+    started = time.monotonic()
+    failure: BaseException | None = None
+    while True:
+        if cancelled():
+            failure = LeaseLostError(
+                "Job lease was lost during subprocess"
+            )
+            break
+        if exceeded.is_set():
+            failure = ProcessOutputLimitError(
+                f"Subprocess output exceeds {max_output_bytes} bytes"
+            )
+            break
+        if reader_errors:
+            failure = RuntimeError("Subprocess output reader failed")
+            break
+        elapsed = time.monotonic() - started
+        if timeout is not None and elapsed >= float(timeout):
+            failure = subprocess.TimeoutExpired(command, timeout)
+            break
+        remaining = (
+            max(0.001, float(timeout) - elapsed)
+            if timeout is not None
+            else poll_seconds
+        )
+        try:
+            process.wait(timeout=min(poll_seconds, remaining))
+            break
+        except subprocess.TimeoutExpired:
+            continue
+
+    if failure is not None:
+        _terminate_process_tree(process, windows_job=windows_job)
+    for reader in readers:
+        reader.join(timeout=2)
+    if any(reader.is_alive() for reader in readers):
+        if process.poll() is None:
+            _terminate_process_tree(process, windows_job=windows_job)
+        raise RuntimeError("Subprocess output pipes did not close")
+    if failure is None and exceeded.is_set():
+        failure = ProcessOutputLimitError(
+            f"Subprocess output exceeds {max_output_bytes} bytes"
+        )
+    if failure is not None:
+        raise failure
+    if reader_errors:
+        raise RuntimeError("Subprocess output reader failed") from (
+            reader_errors[0]
+        )
+    empty: Any = "" if text_mode else b""
+    return (
+        empty.join(chunks["stdout"]),
+        empty.join(chunks["stderr"]),
+    )
+
+
 def run_cancellable_process(
     command: Any,
     *,
@@ -225,56 +394,103 @@ def run_cancellable_process(
     capture_output = bool(kwargs.pop("capture_output", False))
     timeout = kwargs.pop("timeout", None)
     input_value = kwargs.pop("input", None)
+    max_output_bytes = kwargs.pop("max_output_bytes", None)
+    if max_output_bytes is not None and input_value is not None:
+        raise ValueError(
+            "input is not supported with bounded subprocess output"
+        )
     if capture_output:
         if kwargs.get("stdout") is not None or kwargs.get("stderr") is not None:
             raise ValueError("stdout/stderr cannot be used with capture_output")
         kwargs["stdout"] = subprocess.PIPE
         kwargs["stderr"] = subprocess.PIPE
-    if os.name == "nt":
+    if _is_windows():
         kwargs["creationflags"] = (
             int(kwargs.get("creationflags", 0))
-            | subprocess.CREATE_NEW_PROCESS_GROUP
+            | int(
+                getattr(
+                    subprocess,
+                    "CREATE_NEW_PROCESS_GROUP",
+                    0x00000200,
+                )
+            )
+            | int(
+                getattr(
+                    subprocess,
+                    "CREATE_SUSPENDED",
+                    0x00000004,
+                )
+            )
         )
     else:
         kwargs["start_new_session"] = True
     process = subprocess.Popen(command, **kwargs)
     windows_job: _WindowsProcessJob | None = None
-    if os.name == "nt":
+    if _is_windows():
         try:
             windows_job = _WindowsProcessJob.attach(process)
-        except OSError:
-            process.kill()
+            windows_job.resume(process)
+        except BaseException:
+            if windows_job is not None:
+                windows_job.terminate()
+                windows_job.close()
+            else:
+                process.kill()
             process.wait()
             raise
     started = time.monotonic()
     try:
-        while True:
-            if cancelled():
-                _terminate_process_tree(
-                    process,
-                    windows_job=windows_job,
-                )
-                raise LeaseLostError("Job lease was lost during subprocess")
-            remaining = None
-            if timeout is not None:
-                remaining = float(timeout) - (time.monotonic() - started)
-                if remaining <= 0:
+        if max_output_bytes is not None:
+            stdout, stderr = _bounded_communicate(
+                process,
+                command,
+                cancelled=cancelled,
+                windows_job=windows_job,
+                max_output_bytes=int(max_output_bytes),
+                timeout=timeout,
+                poll_seconds=poll_seconds,
+                text_mode=bool(
+                    kwargs.get("text")
+                    or kwargs.get("universal_newlines")
+                    or kwargs.get("encoding")
+                ),
+                encoding=str(kwargs.get("encoding") or "utf-8"),
+            )
+        else:
+            while True:
+                if cancelled():
                     _terminate_process_tree(
                         process,
                         windows_job=windows_job,
                     )
-                    raise subprocess.TimeoutExpired(command, timeout)
-            try:
-                stdout, stderr = process.communicate(
-                    input=input_value,
-                    timeout=min(poll_seconds, remaining)
-                    if remaining is not None
-                    else poll_seconds,
-                )
-                break
-            except subprocess.TimeoutExpired:
-                input_value = None
-                continue
+                    raise LeaseLostError(
+                        "Job lease was lost during subprocess"
+                    )
+                remaining = None
+                if timeout is not None:
+                    remaining = float(timeout) - (
+                        time.monotonic() - started
+                    )
+                    if remaining <= 0:
+                        _terminate_process_tree(
+                            process,
+                            windows_job=windows_job,
+                        )
+                        raise subprocess.TimeoutExpired(
+                            command,
+                            timeout,
+                        )
+                try:
+                    stdout, stderr = process.communicate(
+                        input=input_value,
+                        timeout=min(poll_seconds, remaining)
+                        if remaining is not None
+                        else poll_seconds,
+                    )
+                    break
+                except subprocess.TimeoutExpired:
+                    input_value = None
+                    continue
     except BaseException:
         if process.poll() is None:
             _terminate_process_tree(

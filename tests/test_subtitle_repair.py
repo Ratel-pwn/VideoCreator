@@ -25,6 +25,11 @@ def audit_with(code: str, target: str = "segment-0001") -> dict:
         ("asr_low_confidence", "recognize_window"),
         ("subtitle_boundary_drift", "realign_range"),
         ("subtitle_overlap", "realign_range"),
+        ("approved_text_missing", "rebuild_alignment"),
+        ("approved_text_hash_mismatch", "rebuild_alignment"),
+        ("approved_text_mismatch", "rebuild_alignment"),
+        ("alignment_evidence_missing", "rebuild_alignment"),
+        ("unresolved_span_too_long", "realign_range"),
     ],
 )
 def test_choose_repair_maps_diagnosis(code, action):

@@ -258,14 +258,16 @@ def test_default_media_probe_bounds_probe_size_analysis_time_and_runtime(
 
     def runner(command, **kwargs):
         calls.append((command, kwargs))
-        return type("Completed", (), {"stdout": stdout})()
+        return type(
+            "Completed",
+            (),
+            {"stdout": stdout, "stderr": b"", "returncode": 0},
+        )()
 
-    def popen(command, **kwargs):
-        calls.append((command, kwargs))
-        return FakeProcess(stdout)
-
-    monkeypatch.setattr("videocreator.bgm_search.subprocess.run", runner)
-    monkeypatch.setattr("videocreator.bgm_search.subprocess.Popen", popen)
+    monkeypatch.setattr(
+        "videocreator.bgm_search.run_managed_process",
+        runner,
+    )
 
     track = candidate_to_track(candidate(), path)
 
@@ -277,6 +279,8 @@ def test_default_media_probe_bounds_probe_size_analysis_time_and_runtime(
     assert command[command.index("-probesize") + 1] == "5000000"
     assert command[command.index("-analyzeduration") + 1] == "5000000"
     assert kwargs["stdin"] is subprocess.DEVNULL
+    assert kwargs["max_output_bytes"] == 1024 * 1024
+    assert kwargs["timeout"] == 15
     assert track.path == path
 
 
@@ -286,32 +290,18 @@ def test_media_probe_terminates_while_output_exceeds_limit(
 ):
     path = tmp_path / "candidate.mp3"
     path.write_bytes(b"ID3audio")
-    processes = []
+    from videocreator.execution_fence import ProcessOutputLimitError
 
     def runner(*_args, **_kwargs):
-        return type(
-            "Completed",
-            (),
-            {"stdout": b"x" * (1024 * 1024 + 1)},
-        )()
+        raise ProcessOutputLimitError(stream_name)
 
-    def popen(*_args, **_kwargs):
-        oversized = b"x" * (1024 * 1024 + 1)
-        process = FakeProcess(
-            oversized if stream_name == "stdout" else b"",
-            oversized if stream_name == "stderr" else b"",
-        )
-        processes.append(process)
-        return process
-
-    monkeypatch.setattr("videocreator.bgm_search.subprocess.run", runner)
-    monkeypatch.setattr("videocreator.bgm_search.subprocess.Popen", popen)
+    monkeypatch.setattr(
+        "videocreator.bgm_search.run_managed_process",
+        runner,
+    )
 
     with pytest.raises(BgmSearchError, match="output exceeds"):
         candidate_to_track(candidate(), path)
-
-    assert processes
-    assert processes[0].killed
 
 
 def test_pinned_https_opener_brackets_ipv6_host_and_preserves_sni(monkeypatch):

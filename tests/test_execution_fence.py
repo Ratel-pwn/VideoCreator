@@ -2,11 +2,12 @@ import sys
 import threading
 import time
 from pathlib import Path
-
 import pytest
 
+from videocreator import execution_fence
 from videocreator.execution_fence import (
     LeaseLostError,
+    ProcessOutputLimitError,
     RunMutationLock,
     run_cancellable_process,
 )
@@ -89,3 +90,135 @@ def test_cancellable_process_terminates_descendant_processes(tmp_path: Path):
 
     time.sleep(1.1)
     assert not marker.exists()
+
+
+def test_cancellable_process_enforces_bounded_capture_output():
+    with pytest.raises(ProcessOutputLimitError):
+        run_cancellable_process(
+            [
+                sys.executable,
+                "-c",
+                "import sys,time;sys.stdout.write('x'*200000);"
+                "sys.stdout.flush();time.sleep(2)",
+            ],
+            cancelled=lambda: False,
+            capture_output=True,
+            max_output_bytes=1024,
+            poll_seconds=0.01,
+        )
+
+
+def test_bounded_capture_rejects_output_limit_discovered_after_exit(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class DelayedOutput:
+        def __init__(self, value: bytes):
+            self.value = value
+
+        def read(self, _size):
+            time.sleep(0.02)
+            value, self.value = self.value, b""
+            return value
+
+    class Process:
+        returncode = 0
+        stdout = DelayedOutput(b"x" * 2048)
+        stderr = DelayedOutput(b"")
+
+        def wait(self, timeout=None):
+            del timeout
+            return self.returncode
+
+        def poll(self):
+            return self.returncode
+
+    monkeypatch.setattr(execution_fence, "_is_windows", lambda: False)
+    monkeypatch.setattr(
+        execution_fence.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: Process(),
+    )
+
+    with pytest.raises(ProcessOutputLimitError):
+        run_cancellable_process(
+            ["fake"],
+            cancelled=lambda: False,
+            capture_output=True,
+            max_output_bytes=1024,
+            poll_seconds=0.1,
+        )
+
+
+def test_windows_process_is_suspended_fenced_then_resumed(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    events: list[str] = []
+
+    class Process:
+        returncode = 0
+        _handle = 123
+
+        def communicate(self, input=None, timeout=None):
+            del input, timeout
+            events.append("communicate")
+            return b"", b""
+
+        def poll(self):
+            return self.returncode
+
+        def kill(self):
+            events.append("kill")
+
+        def wait(self, timeout=None):
+            del timeout
+            return self.returncode
+
+    class Job:
+        @classmethod
+        def attach(cls, _process):
+            events.append("attach")
+            return cls()
+
+        def resume(self, _process):
+            events.append("resume")
+
+        def close(self):
+            events.append("close")
+
+        def terminate(self):
+            events.append("terminate")
+
+    captured = {}
+
+    def popen(_command, **kwargs):
+        events.append("popen")
+        captured.update(kwargs)
+        return Process()
+
+    monkeypatch.setattr(execution_fence, "_is_windows", lambda: True)
+    monkeypatch.setattr(execution_fence.subprocess, "Popen", popen)
+    monkeypatch.setattr(execution_fence, "_WindowsProcessJob", Job)
+    monkeypatch.setattr(
+        execution_fence.subprocess,
+        "CREATE_NEW_PROCESS_GROUP",
+        0x200,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        execution_fence.subprocess,
+        "CREATE_SUSPENDED",
+        0x004,
+        raising=False,
+    )
+
+    result = run_cancellable_process(
+        ["fake"],
+        cancelled=lambda: False,
+        capture_output=True,
+    )
+
+    assert result.returncode == 0
+    assert captured["creationflags"] & 0x200
+    assert captured["creationflags"] & 0x004
+    assert events[:4] == ["popen", "attach", "resume", "communicate"]
+    assert events[-1] == "close"

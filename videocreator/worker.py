@@ -7,6 +7,7 @@ from collections.abc import Callable
 from .execution_fence import (
     LeaseLostError,
     RunMutationLock,
+    process_runner_scope,
     run_cancellable_process,
 )
 from .interactions import DurableInteractionPort, WorkflowOutcome
@@ -33,7 +34,10 @@ class WorkflowWorker:
         stopped: threading.Event,
         lease_lost: threading.Event,
     ) -> None:
-        interval = max(1.0, self.service.runtime.lease_seconds / 3)
+        interval = max(
+            0.05,
+            self.service.runtime.lease_seconds / 3,
+        )
         while not stopped.wait(interval):
             try:
                 renewed = self.queue.renew(
@@ -54,34 +58,10 @@ class WorkflowWorker:
         job = self.queue.claim(self.worker_id, self.service.runtime.lease_seconds)
         if job is None:
             return False
-        if self.queue.is_cancel_requested(job.id):
-            self.queue.complete(
-                job.id,
-                self.worker_id,
-                status="cancelled",
-                lease_generation=job.lease_generation,
-            )
-            return True
-
-        import main as workflow
-
-        run = self.service._run(job.project, job.run_id)
-        run_lock = RunMutationLock(run / ".worker.lock")
-        if not run_lock.acquire():
-            self.queue.release_lease(
-                job.id,
-                self.worker_id,
-                job.lease_generation,
-            )
-            return True
-        stopped = threading.Event()
+        run_lock: RunMutationLock | None = None
+        stopped: threading.Event | None = None
         lease_lost = threading.Event()
-        heartbeat = threading.Thread(
-            target=self._heartbeat,
-            args=(job, stopped, lease_lost),
-            daemon=True,
-        )
-        heartbeat.start()
+        heartbeat: threading.Thread | None = None
 
         def assert_lease() -> None:
             if lease_lost.is_set() or not self.queue.lease_is_owned(
@@ -105,36 +85,70 @@ class WorkflowWorker:
             )
 
         try:
-            ctx = workflow.resume_context(
-                self.service.home,
-                self.service.config_path,
-                run,
-                mutation_guard=assert_lease,
-                process_runner=process_runner,
+            if self.queue.is_cancel_requested(job.id):
+                self.queue.complete(
+                    job.id,
+                    self.worker_id,
+                    status="cancelled",
+                    lease_generation=job.lease_generation,
+                )
+                return True
+
+            import main as workflow
+
+            run = self.service._run(job.project, job.run_id)
+            run_lock = RunMutationLock(run / ".worker.lock")
+            if not run_lock.acquire():
+                self.queue.release_lease(
+                    job.id,
+                    self.worker_id,
+                    job.lease_generation,
+                )
+                return True
+            stopped = threading.Event()
+            heartbeat = threading.Thread(
+                target=self._heartbeat,
+                args=(job, stopped, lease_lost),
+                daemon=True,
             )
-            port = DurableInteractionPort()
-            ctx.interactions = port
-            ctx.should_cancel = lambda: (
-                lease_lost.is_set()
-                or self.queue.is_cancel_requested(job.id)
-            )
-            for item in self.queue.pending_inputs(job.id):
-                try:
-                    port.submit(
-                        ctx,
+            heartbeat.start()
+            with process_runner_scope(process_runner):
+                ctx = workflow.resume_context(
+                    self.service.home,
+                    self.service.config_path,
+                    run,
+                    mutation_guard=assert_lease,
+                    process_runner=process_runner,
+                )
+                port = DurableInteractionPort()
+                ctx.interactions = port
+                ctx.should_cancel = lambda: (
+                    lease_lost.is_set()
+                    or self.queue.is_cancel_requested(job.id)
+                )
+                for item in self.queue.pending_inputs(job.id):
+                    try:
+                        port.submit(
+                            ctx,
+                            item.interaction_id,
+                            item.response,
+                            fingerprint=item.fingerprint,
+                        )
+                    except ValueError:
+                        # The interaction changed after submission; retain no
+                        # replayable answer and request the current payload.
+                        pass
+                    # The tombstone is safe only after state cleanup is durable.
+                    ctx.save_state()
+                    self.queue.acknowledge_input(
+                        job.id,
                         item.interaction_id,
-                        item.response,
-                        fingerprint=item.fingerprint,
                     )
-                except ValueError:
-                    # The interaction changed after submission; retain no replayable
-                    # answer and let the workflow request the current payload.
-                    pass
-                # The outbox tombstone is safe only after the corresponding
-                # state transition (including stale-answer cleanup) is durable.
-                ctx.save_state()
-                self.queue.acknowledge_input(job.id, item.interaction_id)
-            outcome = self.execute(ctx) if self.execute else workflow.execute_until_boundary(ctx)
+                outcome = (
+                    self.execute(ctx)
+                    if self.execute
+                    else workflow.execute_until_boundary(ctx)
+                )
             assert_lease()
             if outcome.status == "waiting_for_input":
                 self.queue.release_waiting(
@@ -199,9 +213,12 @@ class WorkflowWorker:
                 }:
                     raise
         finally:
-            stopped.set()
-            heartbeat.join(timeout=1)
-            run_lock.release()
+            if stopped is not None:
+                stopped.set()
+            if heartbeat is not None:
+                heartbeat.join(timeout=1)
+            if run_lock is not None:
+                run_lock.release()
         return True
 
     def run(self, stop_event: threading.Event) -> None:

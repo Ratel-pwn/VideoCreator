@@ -6,7 +6,7 @@ import shutil
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from .bgm_library import BgmLibrarySelection
 from .durable_io import atomic_write_json, atomic_write_text, fsync_directory
@@ -98,6 +98,7 @@ def create_run(
     initial_state: Mapping[str, Any] | None = None,
     initial_manifest: Mapping[str, Any] | None = None,
     input_text_snapshots: Mapping[str, str] | None = None,
+    populate_staging: Callable[[RunPaths], None] | None = None,
 ) -> RunPaths:
     root = resolve_run_dir(project_root, run_id)
     if root.exists():
@@ -132,6 +133,8 @@ def create_run(
         )
         for name, content in (input_text_snapshots or {}).items():
             atomic_write_text(paths.inputs / validate_run_id(name), content)
+        if populate_staging is not None:
+            populate_staging(paths)
         _write_json(
             paths.state,
             {

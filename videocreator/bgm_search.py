@@ -11,7 +11,6 @@ import re
 import socket
 import ssl
 import subprocess
-import threading
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,6 +19,10 @@ from urllib.parse import quote, urlencode, urljoin, urlsplit, urlunsplit
 
 from .bgm_library import BgmTrack, SUPPORTED_AUDIO_SUFFIXES
 from .durable_io import fsync_directory
+from .execution_fence import (
+    ProcessOutputLimitError,
+    run_managed_process,
+)
 from .bgm_selection import BgmQuery
 from .media import MediaMetadata, parse_ffprobe_json
 
@@ -816,7 +819,25 @@ def parse_agent_candidates(
     for candidate in candidates:
         if not isinstance(candidate, dict):
             raise BgmSearchError("agent candidate must be an object")
-        parsed.append(_candidate_from_mapping(candidate))
+        parsed_candidate = _candidate_from_mapping(candidate)
+        for label, raw_url in (
+            ("source page", parsed_candidate.source_page_url),
+            ("download", parsed_candidate.download_url),
+        ):
+            parsed_url = urlsplit(raw_url)
+            if parsed_url.username is not None or parsed_url.password is not None:
+                raise BgmSearchError(
+                    f"agent {label} URL must not contain userinfo"
+                )
+            if parsed_url.query:
+                raise BgmSearchError(
+                    f"agent {label} URL must not contain a query"
+                )
+            if parsed_url.fragment:
+                raise BgmSearchError(
+                    f"agent {label} URL must not contain a fragment"
+                )
+        parsed.append(parsed_candidate)
     return parsed
 
 
@@ -829,104 +850,41 @@ def _run_bounded_process(
     *,
     max_output_bytes: int = _MAX_PROBE_OUTPUT_BYTES,
     timeout_seconds: int = _PROBE_TIMEOUT_SECONDS,
-    popen: Callable[..., Any] | None = None,
 ) -> tuple[bytes, bytes]:
-    process_factory = popen or subprocess.Popen
     try:
-        process = process_factory(
+        completed = run_managed_process(
             command,
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
+            max_output_bytes=max_output_bytes,
+            timeout=timeout_seconds,
+            check=True,
         )
-    except OSError as exc:
-        raise BgmSearchError("candidate media probe failed") from exc
-
-    if process.stdout is None or process.stderr is None:
-        process.kill()
-        raise BgmSearchError("candidate media probe pipes are unavailable")
-
-    output: dict[str, list[bytes]] = {"stdout": [], "stderr": []}
-    output_size = 0
-    output_lock = threading.Lock()
-    exceeded = threading.Event()
-    reader_errors: list[Exception] = []
-
-    def terminate() -> None:
-        try:
-            process.kill()
-        except OSError:
-            pass
-
-    def drain(name: str, stream: Any) -> None:
-        nonlocal output_size
-        try:
-            while not exceeded.is_set():
-                chunk = stream.read(_PROBE_OUTPUT_CHUNK_BYTES)
-                if not chunk:
-                    return
-                if not isinstance(chunk, bytes):
-                    raise BgmSearchError(
-                        "candidate media probe output must be bytes"
-                    )
-                with output_lock:
-                    if output_size + len(chunk) > max_output_bytes:
-                        exceeded.set()
-                        terminate()
-                        return
-                    output_size += len(chunk)
-                    output[name].append(chunk)
-        except Exception as exc:
-            reader_errors.append(exc)
-            exceeded.set()
-            terminate()
-
-    readers = [
-        threading.Thread(
-            target=drain,
-            args=("stdout", process.stdout),
-            daemon=True,
-        ),
-        threading.Thread(
-            target=drain,
-            args=("stderr", process.stderr),
-            daemon=True,
-        ),
-    ]
-    for reader in readers:
-        reader.start()
-
-    timed_out = False
-    try:
-        process.wait(timeout=timeout_seconds)
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        terminate()
-        process.wait()
-    finally:
-        for reader in readers:
-            reader.join(timeout=1)
-        if any(reader.is_alive() for reader in readers):
-            terminate()
-            raise BgmSearchError("candidate media probe pipes did not close")
-
-    if timed_out:
-        raise BgmSearchError("candidate media probe timed out")
-    if exceeded.is_set():
-        raise BgmSearchError("candidate media probe output exceeds maximum size")
-    if reader_errors:
-        error = reader_errors[0]
-        if isinstance(error, BgmSearchError):
-            raise error
-        raise BgmSearchError("candidate media probe output failed") from error
-    stdout = b"".join(output["stdout"])
-    stderr = b"".join(output["stderr"])
-    if process.returncode != 0:
-        detail = stderr.decode("utf-8", errors="replace").strip()
+    except ProcessOutputLimitError as exc:
+        raise BgmSearchError(
+            "candidate media probe output exceeds maximum size"
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise BgmSearchError("candidate media probe timed out") from exc
+    except subprocess.CalledProcessError as exc:
+        raw_stderr = exc.stderr or b""
+        detail = (
+            raw_stderr.decode("utf-8", errors="replace").strip()
+            if isinstance(raw_stderr, bytes)
+            else str(raw_stderr).strip()
+        )
         message = "candidate media probe failed"
         if detail:
             message += f": {detail[:500]}"
-        raise BgmSearchError(message)
+        raise BgmSearchError(message) from exc
+    except OSError as exc:
+        raise BgmSearchError("candidate media probe failed") from exc
+    stdout = completed.stdout
+    stderr = completed.stderr
+    if not isinstance(stdout, bytes) or not isinstance(stderr, bytes):
+        raise BgmSearchError(
+            "candidate media probe output must be bytes"
+        )
     return stdout, stderr
 
 

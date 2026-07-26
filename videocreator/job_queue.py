@@ -422,19 +422,48 @@ class JobQueue:
     ) -> None:
         stamp = self.now().isoformat()
         with self._connect() as connection:
-            cursor = connection.execute(
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
                 """
-                UPDATE jobs SET status = 'queued', worker_id = NULL,
+                SELECT * FROM jobs
+                WHERE id = ? AND status = 'leased' AND worker_id = ?
+                    AND lease_generation = ?
+                """,
+                (job_id, worker_id, lease_generation),
+            ).fetchone()
+            if row is None:
+                connection.rollback()
+                raise RuntimeError(
+                    f"Job lease is not owned by {worker_id}: {job_id}"
+                )
+            final_status = (
+                "cancelled" if row["cancel_requested"] else "queued"
+            )
+            connection.execute(
+                """
+                UPDATE jobs SET status = ?, worker_id = NULL,
                     lease_until = NULL, updated_at = ?
                 WHERE id = ? AND status = 'leased' AND worker_id = ?
                     AND lease_generation = ?
                 """,
-                (stamp, job_id, worker_id, lease_generation),
+                (
+                    final_status,
+                    stamp,
+                    job_id,
+                    worker_id,
+                    lease_generation,
+                ),
             )
-        if cursor.rowcount != 1:
-            raise RuntimeError(
-                f"Job lease is not owned by {worker_id}: {job_id}"
-            )
+            if final_status == "cancelled":
+                connection.execute(
+                    """
+                    UPDATE job_inputs SET status = 'cancelled',
+                        response = NULL, consumed_at = ?
+                    WHERE job_id = ? AND status = 'pending'
+                    """,
+                    (stamp, job_id),
+                )
+            connection.commit()
 
     def lease_is_owned(
         self,

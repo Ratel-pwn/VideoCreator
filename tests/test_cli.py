@@ -170,6 +170,26 @@ def test_select_run_supports_explicit_id_and_rejects_corrupt_state(tmp_path):
         select_run(project, "run-1")
 
 
+@pytest.mark.parametrize(
+    "run_id",
+    [
+        "../outside",
+        r"..\outside",
+        r"C:\outside",
+        r"\\server\share\run",
+    ],
+)
+def test_select_run_rejects_absolute_traversal_and_unc_ids(
+    tmp_path: Path,
+    run_id: str,
+):
+    project = tmp_path / "project"
+    project.mkdir()
+
+    with pytest.raises(CliError, match="safe|inside|run_id"):
+        select_run(project, run_id)
+
+
 def test_resume_project_dispatches_latest_unfinished_run(tmp_path, monkeypatch):
     config = config_for_projects(tmp_path)
     project = tmp_path / "projects" / "project"

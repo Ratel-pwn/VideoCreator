@@ -35,6 +35,37 @@ def test_service_initializes_project_and_starts_async_workflow(tmp_path: Path):
     assert service.get_workflow_status("demo", "run-1")["current_stage"] == "prepare"
 
 
+def test_start_workflow_merges_dispatch_into_latest_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    service = build_service(tmp_path)
+    service.initialize_project("demo", "chaos-museum")
+    original_enqueue = service.queue.enqueue
+    run = tmp_path / "projects/demo/runs/run-1"
+    state_path = run / "state.json"
+
+    def enqueue_after_state_advance(project, run_id):
+        latest = json.loads(state_path.read_text(encoding="utf-8"))
+        latest["current_stage"] = "draft"
+        latest["status"] = "running"
+        state_path.write_text(json.dumps(latest), encoding="utf-8")
+        return original_enqueue(project, run_id)
+
+    monkeypatch.setattr(
+        service.queue,
+        "enqueue",
+        enqueue_after_state_advance,
+    )
+
+    service.start_workflow("demo", "A topic", run_id="run-1")
+
+    durable = json.loads(state_path.read_text(encoding="utf-8"))
+    assert durable["current_stage"] == "draft"
+    assert durable["status"] == "running"
+    assert durable["queue_outbox"]["status"] == "dispatched"
+
+
 @pytest.mark.parametrize(
     "run_id",
     [
@@ -191,6 +222,117 @@ def test_service_recovers_resume_requested_before_queue_transition(
     assert durable["queue_outbox"]["job_id"] == job.id
 
 
+def test_resume_workflow_merges_dispatch_into_latest_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    service = build_service(tmp_path)
+    service.initialize_project("demo", "chaos-museum")
+    service.start_workflow("demo", "A topic", run_id="run-1")
+    claimed = service.queue.claim("worker", 60)
+    service.queue.fail(
+        claimed.id,
+        "worker",
+        "failed before resume",
+        lease_generation=claimed.lease_generation,
+    )
+    run = tmp_path / "projects/demo/runs/run-1"
+    state_path = run / "state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["status"] = "failed"
+    state["last_error"] = "failed before resume"
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    original_resume = service.queue.resume_failed
+
+    def resume_after_state_advance(project, run_id):
+        latest = json.loads(state_path.read_text(encoding="utf-8"))
+        latest["current_stage"] = "draft"
+        latest["status"] = "running"
+        state_path.write_text(json.dumps(latest), encoding="utf-8")
+        return original_resume(project, run_id)
+
+    monkeypatch.setattr(
+        service.queue,
+        "resume_failed",
+        resume_after_state_advance,
+    )
+
+    service.resume_workflow("demo", "run-1")
+
+    durable = json.loads(state_path.read_text(encoding="utf-8"))
+    assert durable["current_stage"] == "draft"
+    assert durable["status"] == "running"
+    assert durable["queue_outbox"]["status"] == "dispatched"
+
+
+def test_outbox_reconciliation_merges_only_outbox_into_latest_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    service = build_service(tmp_path)
+    service.initialize_project("demo", "chaos-museum")
+    service.start_workflow("demo", "A topic", run_id="run-1")
+    run = tmp_path / "projects/demo/runs/run-1"
+    state_path = run / "state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["queue_outbox"] = {
+        "schema_version": 1,
+        "generation": 7,
+        "action": "advance",
+        "status": "pending",
+    }
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    with sqlite3.connect(service.queue.database_path) as connection:
+        connection.execute(
+            "DELETE FROM jobs WHERE project = ? AND run_id = ?",
+            ("demo", "run-1"),
+        )
+    original_enqueue = service.queue.enqueue
+
+    def enqueue_with_concurrent_state_advance(project, run_id):
+        latest = json.loads(state_path.read_text(encoding="utf-8"))
+        latest["current_stage"] = "draft"
+        latest["status"] = "running"
+        state_path.write_text(json.dumps(latest), encoding="utf-8")
+        return original_enqueue(project, run_id)
+
+    monkeypatch.setattr(
+        service.queue,
+        "enqueue",
+        enqueue_with_concurrent_state_advance,
+    )
+
+    assert service.reconcile_workflow_outbox() == 1
+
+    durable = json.loads(state_path.read_text(encoding="utf-8"))
+    job = service.queue.get("demo", "run-1")
+    assert durable["current_stage"] == "draft"
+    assert durable["status"] == "running"
+    assert durable["queue_outbox"]["generation"] == 7
+    assert durable["queue_outbox"]["status"] == "dispatched"
+    assert durable["queue_outbox"]["job_id"] == job.id
+    assert durable["queue_outbox"]["job_lease_generation"] == (
+        job.lease_generation
+    )
+
+
+def test_outbox_reconciliation_skips_run_owned_by_worker(
+    tmp_path: Path,
+):
+    from videocreator.execution_fence import RunMutationLock
+
+    service = build_service(tmp_path)
+    service.initialize_project("demo", "chaos-museum")
+    service.start_workflow("demo", "A topic", run_id="run-1")
+    run = tmp_path / "projects/demo/runs/run-1"
+    lock = RunMutationLock(run / ".worker.lock")
+    assert lock.acquire()
+    try:
+        assert service.reconcile_workflow_outbox() == 0
+    finally:
+        lock.release()
+
+
 def test_service_freezes_context_without_exposing_it_in_status_state_or_manifest(
     tmp_path: Path,
 ):
@@ -212,6 +354,8 @@ def test_service_freezes_context_without_exposing_it_in_status_state_or_manifest
     status = service.get_workflow_status("demo", "run-1")
     assert snapshot.read_text(encoding="utf-8").strip() == secret_context
     assert manifest["lineage"]["agent_context"]["sha256"]
+    assert manifest["private_artifacts"]["agent_context"] == str(snapshot)
+    assert "agent_context" not in manifest["artifacts"]
     assert "INTERNAL-CONTEXT-SENTINEL" not in state_text
     assert "INTERNAL-CONTEXT-SENTINEL" not in json.dumps(manifest)
     assert "INTERNAL-CONTEXT-SENTINEL" not in json.dumps(status)
@@ -376,6 +520,70 @@ def test_result_returns_text_but_never_media_binary(tmp_path: Path):
     assert result["artifacts"]["draft_approved"]["content"] == "approved"
     assert "content" not in result["artifacts"]["final_video"]
     assert result["artifacts"]["final_video"]["size"] == len(b"not-returned")
+
+
+def test_result_uses_strict_public_allowlist_and_current_run_containment(
+    tmp_path: Path,
+):
+    service = build_service(tmp_path)
+    service.initialize_project("demo", "chaos-museum")
+    service.start_workflow(
+        "demo",
+        "A topic",
+        context="PRIVATE-CONTEXT",
+        run_id="run-1",
+    )
+    run = tmp_path / "projects/demo/runs/run-1"
+    local_config = tmp_path / "workflow.local.json"
+    local_config.write_text("LOCAL-CONFIG-SECRET", encoding="utf-8")
+    manifest_path = run / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["artifacts"].update(
+        {
+            "agent_context": str(run / "inputs/agent-context.md"),
+            "session_json": str(run / "inputs/agent-context.md"),
+            "draft_approved": str(run / "inputs/agent-context.md"),
+            "final_video": str(local_config),
+        }
+    )
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    result = service.get_workflow_result("demo", "run-1")
+
+    assert result["artifacts"] == {}
+    assert "agent_context" not in result["artifacts"]
+    assert "session_json" not in service.get_workflow_status(
+        "demo",
+        "run-1",
+    )["artifacts"]
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "agent_context",
+        "session_json",
+        "../inputs/agent-context.md",
+        r"..\inputs\agent-context.md",
+        "workflow.local.json",
+    ],
+)
+def test_result_rejects_private_or_traversal_text_requests(
+    tmp_path: Path,
+    name: str,
+):
+    service = build_service(tmp_path)
+    service.initialize_project("demo", "chaos-museum")
+    service.start_workflow("demo", "A topic", run_id="run-1")
+
+    with pytest.raises(ServiceError) as rejected:
+        service.get_workflow_result(
+            "demo",
+            "run-1",
+            include_text=[name],
+        )
+
+    assert rejected.value.code == "invalid_argument"
 
 
 def test_queue_failure_is_projected_as_workflow_failure(tmp_path: Path):

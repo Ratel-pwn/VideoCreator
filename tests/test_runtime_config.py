@@ -50,3 +50,11 @@ def test_bearer_auth_requires_environment_secret(tmp_path: Path, monkeypatch):
             {"mcp": {"auth": {"mode": "bearer", "bearer_token_env": "MISSING_TOKEN"}}},
             tmp_path,
         )
+
+
+def test_runtime_config_rejects_one_second_lease(tmp_path: Path):
+    with pytest.raises(ValueError, match="lease_seconds.*at least"):
+        McpRuntimeConfig.from_workflow(
+            {"mcp": {"lease_seconds": 1}},
+            tmp_path,
+        )

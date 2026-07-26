@@ -466,6 +466,7 @@ def make_run_context(
         initial_state["execution_owner"] = execution_owner
         initial_state["queue_outbox"] = {
             "schema_version": 1,
+            "generation": 1,
             "action": "advance",
             "status": "pending",
             "created_at": created_at,
@@ -486,7 +487,7 @@ def make_run_context(
         normalized_context = initial_context.strip() + "\n"
         context_path = run_dir / "inputs" / "agent-context.md"
         input_text_snapshots["agent-context.md"] = normalized_context
-        initial_manifest["artifacts"] = {
+        initial_manifest["private_artifacts"] = {
             "agent_context": str(context_path),
         }
         initial_manifest["lineage"] = {
@@ -527,6 +528,7 @@ def make_run_context(
         state["execution_owner"] = execution_owner
         state["queue_outbox"] = {
             "schema_version": 1,
+            "generation": 1,
             "action": "advance",
             "status": "pending",
             "created_at": now_iso(),
@@ -579,7 +581,11 @@ def make_run_context(
 
 def load_frozen_agent_context(ctx: WorkflowContext) -> str:
     lineage = ctx.manifest.get("lineage", {}).get("agent_context")
-    artifact = ctx.manifest.get("artifacts", {}).get("agent_context")
+    artifact = ctx.manifest.get("private_artifacts", {}).get(
+        "agent_context"
+    )
+    if artifact is None:
+        artifact = ctx.manifest.get("artifacts", {}).get("agent_context")
     if lineage is None and artifact is None:
         return ""
     if not isinstance(lineage, dict):
@@ -2638,10 +2644,106 @@ def _path_artifact_exists(artifacts: dict[str, Any], key: str) -> bool:
     return bool(value and Path(str(value)).is_file())
 
 
-def _migrate_resume_quality_gates(
-    state: dict[str, Any],
-    artifacts: dict[str, Any],
+def _subtitle_quality_gate_is_current(ctx: WorkflowContext) -> bool:
+    artifacts = ctx.manifest.get("artifacts", {})
+    required = (
+        "voice_audio",
+        "voice_subtitle",
+        "narration_text",
+        "subtitle_alignment_report",
+        "subtitle_sync_audit",
+    )
+    if not all(_path_artifact_exists(artifacts, key) for key in required):
+        return False
+    expected_audit_path = (
+        ctx.run_dir / "review" / "subtitle-sync-audit.json"
+    ).resolve()
+    if Path(str(artifacts["subtitle_sync_audit"])).resolve() != (
+        expected_audit_path
+    ):
+        return False
+    try:
+        existing = load_json(expected_audit_path)
+        if (
+            existing.get("schema_version") != 1
+            or existing.get("status") != "passed"
+            or existing.get("findings")
+        ):
+            return False
+        segment_manifest = (
+            Path(str(artifacts["tts_segment_manifest"]))
+            if _path_artifact_exists(artifacts, "tts_segment_manifest")
+            else None
+        )
+        recalculated = audit_subtitle_sync(
+            Path(str(artifacts["voice_audio"])),
+            Path(str(artifacts["voice_subtitle"])),
+            Path(str(artifacts["subtitle_alignment_report"])),
+            thresholds=SyncThresholds.from_dict(
+                ctx.config.get("subtitle_sync", {})
+            ),
+            segment_manifest=segment_manifest,
+            approved_text=Path(str(artifacts["narration_text"])),
+        )
+    except (
+        KeyError,
+        OSError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+        subprocess.CalledProcessError,
+    ):
+        return False
+    if recalculated.get("status") != "passed":
+        return False
+    existing_inputs = existing.get("inputs")
+    expected_inputs = recalculated.get("inputs")
+    if not isinstance(existing_inputs, dict) or not isinstance(
+        expected_inputs,
+        dict,
+    ):
+        return False
+    return all(
+        existing_inputs.get(key) == value
+        for key, value in expected_inputs.items()
+    )
+
+
+def _bgm_quality_gate_is_current(
+    ctx: WorkflowContext,
+    *,
+    require_final_video: bool = False,
 ) -> bool:
+    artifacts = ctx.manifest.get("artifacts", {})
+    if require_final_video:
+        final_video = artifacts.get("final_video")
+        if not final_video:
+            return False
+        final_video_path = Path(str(final_video)).resolve()
+        try:
+            final_video_path.relative_to(ctx.run_dir.resolve())
+        except ValueError:
+            return False
+        if not final_video_path.is_file():
+            return False
+    try:
+        resolve_context_render_audio(ctx)
+    except (
+        KeyError,
+        OSError,
+        TypeError,
+        ValueError,
+        RuntimeError,
+        json.JSONDecodeError,
+        subprocess.CalledProcessError,
+    ):
+        return False
+    return True
+
+
+def _migrate_resume_quality_gates(ctx: WorkflowContext) -> bool:
+    state = ctx.state
+    artifacts = ctx.manifest.get("artifacts", {})
     if state.get("status") in {"completed", "cancelled"}:
         return False
     current = state.get("current_stage")
@@ -2657,27 +2759,27 @@ def _migrate_resume_quality_gates(
     if current not in gated_stages:
         return False
 
-    if (
-        current == STAGE_VIDEO_RENDER_CONFIRM
-        and state.get("quality_gate_version") == 2
-    ):
-        return False
-
-    subtitle_ready = all(
-        _path_artifact_exists(artifacts, key)
-        for key in (
-            "voice_audio",
-            "voice_subtitle",
-            "narration_text",
-            "subtitle_alignment_report",
+    subtitle_ready = _subtitle_quality_gate_is_current(ctx)
+    bgm_ready = (
+        _bgm_quality_gate_is_current(
+            ctx,
+            require_final_video=(
+                current == STAGE_VIDEO_RENDER_CONFIRM
+            ),
         )
+        if current
+        in {
+            STAGE_VIDEO_RENDER,
+            STAGE_VIDEO_RENDER_CONFIRM,
+        }
+        else _path_artifact_exists(artifacts, "bgm_mix_report")
     )
-    bgm_ready = _path_artifact_exists(artifacts, "bgm_mix_report")
     target = current
     resume_after_sync: str | None = None
     if current == STAGE_VIDEO_RENDER_CONFIRM:
-        target = STAGE_SUBTITLE_SYNC
-        resume_after_sync = STAGE_BGM
+        if not subtitle_ready or not bgm_ready:
+            target = STAGE_SUBTITLE_SYNC
+            resume_after_sync = STAGE_BGM
     elif not subtitle_ready:
         target = STAGE_SUBTITLE_SYNC
         resume_after_sync = (
@@ -2744,26 +2846,20 @@ def resume_context(
         raise RuntimeError(
             f"Run ID does not match the authoritative run directory: {run_dir}"
         )
-    artifacts = manifest.get("artifacts", {})
     manifest_changed = _materialize_resume_inputs(
         run_dir,
         manifest,
         before_commit=mutation_guard,
     )
-    artifacts = manifest.get("artifacts", {})
-    state_changed = _migrate_resume_quality_gates(state, artifacts)
     if manifest_changed:
         mutation_guard()
         save_json(run_dir / "manifest.json", manifest)
-    if state_changed:
-        mutation_guard()
-        save_json(run_dir / "state.json", state)
     project_name = state.get("project_name") or manifest.get("project_name") or (run_dir.parent.parent.name if run_dir.parent.name == "runs" else "legacy")
     project_config = load_json(project_root / "project.json")
     template = None
     if project_config.get("template_id"):
         template = load_template(resolve_path(repo_root, config.get("templates", {}).get("root", "templates")), project_config["template_id"])
-    return WorkflowContext(
+    ctx = WorkflowContext(
         repo_root=repo_root,
         config_path=config_path,
         config=config,
@@ -2781,6 +2877,10 @@ def resume_context(
         mutation_guard=mutation_guard,
         process_runner=process_runner,
     )
+    if _migrate_resume_quality_gates(ctx):
+        mutation_guard()
+        save_json(run_dir / "state.json", state)
+    return ctx
 
 
 def finish_workflow(ctx: WorkflowContext) -> bool:

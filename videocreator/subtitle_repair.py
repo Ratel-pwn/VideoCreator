@@ -7,6 +7,11 @@ from typing import Any, Callable
 
 REPAIR_BY_DIAGNOSIS = {
     "artifact_hash_mismatch": ["rebuild_alignment", "reassemble_audio"],
+    "approved_text_missing": ["rebuild_alignment"],
+    "approved_text_hash_mismatch": ["rebuild_alignment"],
+    "approved_text_mismatch": ["rebuild_alignment"],
+    "alignment_evidence_missing": ["rebuild_alignment"],
+    "unresolved_span_too_long": ["realign_range", "rebuild_alignment"],
     "audio_decode_failure": ["reassemble_audio", "regenerate_segment"],
     "segment_missing": ["regenerate_segment"],
     "segment_duplicate": ["reassemble_audio"],

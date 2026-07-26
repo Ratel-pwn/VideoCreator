@@ -215,12 +215,13 @@ def test_worker_recovers_answer_persisted_only_in_outbox(tmp_path: Path):
     service.queue.release_waiting(claimed.id, "setup")
 
     # This is the crash boundary: SQLite has the response and wakeup, state.json does not.
+    answer = json.dumps({"candidates": []})
     assert service.queue.submit_input(
         "demo",
         "run-1",
         "bgm-1",
         fingerprint,
-        "answer",
+        answer,
     )
     assert "response" not in json.loads(state_path.read_text(encoding="utf-8"))[
         "pending_interaction"
@@ -240,13 +241,13 @@ def test_worker_recovers_answer_persisted_only_in_outbox(tmp_path: Path):
 
     worker = WorkflowWorker(service, worker_id="worker-2", execute=execute)
     assert worker.run_once()
-    assert observed["answer"] == "answer"
+    assert observed["answer"] == answer
     assert service.queue.pending_inputs(claimed.id) == ()
     late = service.submit_workflow_input(
         "demo",
         "run-1",
         "bgm-1",
-        "answer",
+        answer,
     )
     assert late["accepted"] is False
     assert late["status"] == "completed"
@@ -267,7 +268,7 @@ def test_worker_does_not_strand_answer_arriving_while_leased(tmp_path: Path):
                 "run-1",
                 "bgm-1",
                 fingerprint,
-                "answer",
+                json.dumps({"candidates": []}),
             ),
             WorkflowOutcome("waiting_for_input"),
         )[1],
@@ -330,8 +331,9 @@ def test_worker_does_not_acknowledge_input_when_state_save_fails(
         "fingerprint": fingerprint,
     }
     state_path.write_text(json.dumps(state), encoding="utf-8")
+    answer = json.dumps({"candidates": []})
     assert service.queue.submit_input(
-        "demo", "run-1", "bgm-1", fingerprint, "secret answer"
+        "demo", "run-1", "bgm-1", fingerprint, answer
     )
 
     import main
@@ -347,7 +349,7 @@ def test_worker_does_not_acknowledge_input_when_state_save_fails(
 
     job = service.queue.get("demo", "run-1")
     assert job.status == "queued"
-    assert service.queue.pending_inputs(job.id)[0].response == "secret answer"
+    assert service.queue.pending_inputs(job.id)[0].response == answer
 
 
 def test_worker_imports_legacy_state_only_answer_and_wakes_waiting_job(
@@ -360,6 +362,7 @@ def test_worker_imports_legacy_state_only_answer_and_wakes_waiting_job(
     payload = {"query": {"subjects": ["economics"]}}
     fingerprint = interaction_fingerprint("bgm_candidates", payload)
     state["status"] = "waiting_for_input"
+    answer = json.dumps({"candidates": []})
     state["pending_interaction"] = {
         "id": "legacy-bgm-1",
         "key": "bgm-online-candidates",
@@ -368,7 +371,7 @@ def test_worker_imports_legacy_state_only_answer_and_wakes_waiting_job(
         "choices": [],
         "payload": payload,
         "fingerprint": fingerprint,
-        "response": "legacy answer",
+        "response": answer,
     }
     state_path.write_text(json.dumps(state), encoding="utf-8")
     claimed = service.queue.claim("setup", 60)
@@ -388,5 +391,37 @@ def test_worker_imports_legacy_state_only_answer_and_wakes_waiting_job(
     worker = WorkflowWorker(service, worker_id="worker-legacy", execute=execute)
     assert worker.run_once()
 
-    assert observed["answer"] == "legacy answer"
+    assert observed["answer"] == answer
+    assert service.queue.get("demo", "run-1").status == "completed"
+
+
+def test_worker_quarantines_corrupt_job_and_continues_to_next(
+    tmp_path: Path,
+):
+    service = prepare(tmp_path)
+    service.queue.enqueue("missing-project", "orphan-run")
+    with sqlite3.connect(service.queue.database_path) as connection:
+        connection.execute(
+            """
+            UPDATE jobs SET created_at = '2000-01-01T00:00:00+00:00'
+            WHERE project = 'missing-project'
+            """
+        )
+    executed: list[str] = []
+    worker = WorkflowWorker(
+        service,
+        worker_id="worker-corrupt-job",
+        execute=lambda ctx: (
+            executed.append(ctx.run_id),
+            WorkflowOutcome("completed"),
+        )[1],
+    )
+
+    assert worker.run_once()
+    orphan = service.queue.get("missing-project", "orphan-run")
+    assert orphan.status == "failed"
+    assert orphan.error
+
+    assert worker.run_once()
+    assert executed == ["run-1"]
     assert service.queue.get("demo", "run-1").status == "completed"

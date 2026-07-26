@@ -6,6 +6,9 @@ from pathlib import Path
 from typing import Mapping
 
 
+MIN_LEASE_SECONDS = 3
+
+
 @dataclass(frozen=True)
 class AuthConfig:
     mode: str
@@ -58,6 +61,11 @@ class McpRuntimeConfig:
             raise ValueError("MCP port must be between 1 and 65535")
         if min(worker_count, lease_seconds, shutdown_grace_seconds) <= 0:
             raise ValueError("MCP worker and timing settings must be positive")
+        if lease_seconds < MIN_LEASE_SECONDS:
+            raise ValueError(
+                "MCP lease_seconds must be at least "
+                f"{MIN_LEASE_SECONDS}"
+            )
 
         return cls(
             host=str(raw.get("host", "127.0.0.1")),

@@ -20,7 +20,12 @@ def main() -> int:
     args = parser.parse_args()
 
     artifacts = discover_legacy_artifacts(args.project_root)
-    run_dir = import_legacy_project(args.project_root, args.run_id, artifacts)
+    run_dir = import_legacy_project(
+        args.project_root,
+        args.run_id,
+        artifacts,
+        repo_root=REPO_ROOT,
+    )
     print(run_dir)
     return 0
 

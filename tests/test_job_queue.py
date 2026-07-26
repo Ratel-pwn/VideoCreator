@@ -261,6 +261,27 @@ def test_release_after_cancel_finishes_lease_as_cancelled(tmp_path: Path):
     ) is False
 
 
+def test_release_lease_after_lock_contention_finalizes_cancellation(
+    tmp_path: Path,
+):
+    queue = JobQueue(tmp_path / "queue.sqlite3")
+    queue.enqueue("project", "run-1")
+    claimed = queue.claim("worker", lease_seconds=60)
+    queue.request_cancel("project", "run-1")
+
+    queue.release_lease(
+        claimed.id,
+        "worker",
+        claimed.lease_generation,
+    )
+
+    current = queue.get("project", "run-1")
+    assert current.status == "cancelled"
+    assert current.worker_id is None
+    assert current.cancel_requested is True
+    assert queue.claim("replacement", lease_seconds=60) is None
+
+
 def test_job_input_schema_is_added_to_existing_database(tmp_path: Path):
     database = tmp_path / "queue.sqlite3"
     with sqlite3.connect(database) as connection:

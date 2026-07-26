@@ -371,25 +371,25 @@ def test_agent_response_resumes_through_download_validation_and_scoring(
     ) is False
 
 
-def test_invalid_agent_response_falls_back_then_acknowledges_answer(tmp_path):
-    from videocreator.bgm_workflow import (
-        acknowledge_bgm_resolution,
-        resolve_bgm_for_run,
-    )
+def test_invalid_agent_response_is_rejected_before_persistence(tmp_path):
+    from videocreator.bgm_workflow import resolve_bgm_for_run
 
     req = request(tmp_path)
     port = DurableInteractionPort()
     with pytest.raises(InteractionRequired) as raised:
         resolve_bgm_for_run(req, port)
-    port.submit(req.context, raised.value.interaction["id"], "not-json")
+    state_before = (tmp_path / "state.json").read_bytes()
+    audit_before = (tmp_path / "session/interactions.jsonl").read_bytes()
 
-    result = resolve_bgm_for_run(req, port)
+    with pytest.raises(ValueError, match="valid JSON"):
+        port.submit(
+            req.context,
+            raised.value.interaction["id"],
+            "not-json",
+        )
 
-    assert result.mode == "narration_only"
-    assert any("agent response" in warning.lower() for warning in result.warnings)
-    assert "interaction_answers" in req.context.state
-    assert acknowledge_bgm_resolution(req, port, result.resolution_id)
-    assert "interaction_answers" not in req.context.state
+    assert (tmp_path / "state.json").read_bytes() == state_before
+    assert (tmp_path / "session/interactions.jsonl").read_bytes() == audit_before
 
 
 def test_provider_candidates_are_tried_before_agent_handoff(tmp_path, monkeypatch):
@@ -742,7 +742,7 @@ def test_old_resolution_ack_does_not_clear_new_query_interaction(
     port.submit(
         old_request.context,
         raised.value.interaction["id"],
-        "not-json",
+        json.dumps({"candidates": []}),
         fingerprint=raised.value.interaction["fingerprint"],
     )
     old_result = bgm_workflow.resolve_bgm_for_run(old_request, port)
@@ -906,9 +906,8 @@ def test_provisional_download_is_recovered_after_crash_before_probe(
     assert result.track.path.name.startswith("candidate-")
 
 
-def test_acknowledgement_removes_signed_agent_url_from_runtime_state_and_ledgers(
+def test_signed_agent_download_url_is_rejected_before_runtime_persistence(
     tmp_path,
-    monkeypatch,
 ):
     from videocreator import bgm_workflow
 
@@ -920,35 +919,18 @@ def test_acknowledgement_removes_signed_agent_url_from_runtime_state_and_ledgers
         "track.mp3",
         "track.mp3?X-Amz-Signature=DO-NOT-PERSIST",
     )
-    port.submit(req.context, raised.value.interaction["id"], response)
+    with pytest.raises(ValueError, match="query"):
+        port.submit(req.context, raised.value.interaction["id"], response)
 
-    def download(item, output_dir, **kwargs):
-        path = output_dir / f"{kwargs['output_name']}.mp3"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(b"audio")
-        return path
-
-    monkeypatch.setattr(bgm_workflow, "download_candidate", download)
-    monkeypatch.setattr(bgm_workflow, "candidate_to_track", candidate_track)
-    result = bgm_workflow.resolve_bgm_for_run(req, port)
-    assert bgm_workflow.acknowledge_bgm_resolution(
-        req, port, result.resolution_id
-    )
-
-    durable_text = "\n".join(
-        path.read_text(encoding="utf-8")
-        for path in req.download_dir.glob("*.json")
-    )
-    durable_text += (tmp_path / "session/interactions.jsonl").read_text(
+    durable_text = (tmp_path / "session/interactions.jsonl").read_text(
         encoding="utf-8"
     )
     durable_text += (tmp_path / "state.json").read_text(encoding="utf-8")
     assert "DO-NOT-PERSIST" not in durable_text
 
 
-def test_agent_signed_urls_are_scrubbed_immediately_after_durable_resolution(
+def test_agent_signed_source_and_download_urls_are_rejected_before_write(
     tmp_path,
-    monkeypatch,
 ):
     from videocreator import bgm_workflow
 
@@ -963,30 +945,18 @@ def test_agent_signed_urls_are_scrubbed_immediately_after_durable_resolution(
         "track.mp3",
         "track.mp3?X-Amz-Signature=DOWNLOAD-SECRET",
     )
-    port.submit(req.context, raised.value.interaction["id"], response)
+    with pytest.raises(ValueError, match="query"):
+        port.submit(req.context, raised.value.interaction["id"], response)
 
-    def download(item, output_dir, **kwargs):
-        path = output_dir / f"{kwargs['output_name']}.mp3"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(b"audio")
-        return path
-
-    monkeypatch.setattr(bgm_workflow, "download_candidate", download)
-    monkeypatch.setattr(bgm_workflow, "candidate_to_track", candidate_track)
-
-    result = bgm_workflow.resolve_bgm_for_run(req, port)
-
-    assert result.track.source_url == "https://example.test/source"
     persisted = json.dumps(req.context.state, ensure_ascii=False)
-    persisted += "\n".join(
-        path.read_text(encoding="utf-8")
-        for path in req.download_dir.rglob("*.json")
+    persisted += (tmp_path / "session/interactions.jsonl").read_text(
+        encoding="utf-8"
     )
     assert "SOURCE-SECRET" not in persisted
     assert "DOWNLOAD-SECRET" not in persisted
 
 
-def test_agent_response_is_scrubbed_before_post_commit_cleanup(
+def test_unsafe_agent_response_never_reaches_post_commit_cleanup(
     tmp_path,
     monkeypatch,
 ):
@@ -1000,33 +970,24 @@ def test_agent_response_is_scrubbed_before_post_commit_cleanup(
         "track.mp3",
         "track.mp3?X-Amz-Signature=CLEANUP-CRASH-SECRET",
     )
-    port.submit(req.context, raised.value.interaction["id"], response)
+    cleanup_called = False
 
-    def download(item, output_dir, **kwargs):
-        path = output_dir / f"{kwargs['output_name']}.mp3"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(b"audio")
-        return path
+    def cleanup(*_args, **_kwargs):
+        nonlocal cleanup_called
+        cleanup_called = True
 
-    monkeypatch.setattr(bgm_workflow, "download_candidate", download)
-    monkeypatch.setattr(bgm_workflow, "candidate_to_track", candidate_track)
     monkeypatch.setattr(
         bgm_workflow,
         "_cleanup_downloads",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            OSError("cleanup crash")
-        ),
+        cleanup,
     )
 
-    with pytest.raises(OSError, match="cleanup crash"):
-        bgm_workflow.resolve_bgm_for_run(req, port)
+    with pytest.raises(ValueError, match="query"):
+        port.submit(req.context, raised.value.interaction["id"], response)
 
     state_text = json.dumps(req.context.state, ensure_ascii=False)
-    ledger_text = bgm_workflow._resolution_ledger_path(req).read_text(
-        encoding="utf-8"
-    )
+    assert cleanup_called is False
     assert "CLEANUP-CRASH-SECRET" not in state_text
-    assert "CLEANUP-CRASH-SECRET" not in ledger_text
 
 
 def test_copied_resolution_ledger_without_matching_artifact_is_rejected(

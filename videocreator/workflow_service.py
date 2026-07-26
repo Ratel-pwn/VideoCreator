@@ -6,6 +6,7 @@ from typing import Any, Iterable
 
 from .interactions import interaction_fingerprint, validate_interaction_response
 from .durable_io import atomic_write_json
+from .execution_fence import RunMutationLock
 from .job_queue import JobCancelledError, JobQueue
 from .project_layout import initialize_project
 from .run_identity import resolve_run_dir, validate_run_id
@@ -14,6 +15,40 @@ from .templates import discover_templates
 
 
 TEXT_ARTIFACT_SUFFIXES = {".json", ".jsonl", ".md", ".srt", ".txt"}
+PUBLIC_RESULT_ARTIFACTS = frozenset(
+    {
+        "draft_approved",
+        "voice_audio",
+        "voice_subtitle",
+        "subtitle_sync_audit",
+        "visual_plan",
+        "visual_plan_audit",
+        "asset_manifest",
+        "bgm_selection",
+        "bgm_mix_report",
+        "final_mix",
+        "voice_audio_cleaned",
+        "voice_subtitle_cleaned",
+        "final_video",
+        "render_report",
+    }
+)
+PUBLIC_ARTIFACT_DIRECTORIES = {
+    "draft_approved": "writing",
+    "voice_audio": "audio",
+    "voice_subtitle": "subtitles",
+    "subtitle_sync_audit": "review",
+    "visual_plan": "visual",
+    "visual_plan_audit": "visual",
+    "asset_manifest": "visual",
+    "bgm_selection": "audio",
+    "bgm_mix_report": "audio",
+    "final_mix": "audio",
+    "voice_audio_cleaned": "audio",
+    "voice_subtitle_cleaned": "subtitles",
+    "final_video": "render",
+    "render_report": "render",
+}
 
 
 class ServiceError(RuntimeError):
@@ -80,63 +115,108 @@ class WorkflowService:
                 state_path = run_dir / "state.json"
                 if not run_dir.is_dir() or not state_path.is_file():
                     continue
+                run_lock = RunMutationLock(run_dir / ".worker.lock")
+                if not run_lock.acquire():
+                    continue
                 try:
-                    state = json.loads(
-                        state_path.read_text(encoding="utf-8-sig")
-                    )
-                except (OSError, json.JSONDecodeError):
-                    continue
-                if (
-                    state.get("execution_owner") != "mcp"
-                    or state.get("status")
-                    in {"completed", "cancelled", "failed"}
-                ):
-                    continue
-                run_id = str(state.get("run_id", ""))
-                try:
-                    expected_run = resolve_run_dir(project_dir, run_id)
-                except ValueError:
-                    continue
-                if expected_run != run_dir.resolve():
-                    continue
-                outbox = state.setdefault("queue_outbox", {})
-                action = outbox.get("action", "advance")
-                job = self.queue.get(project_dir.name, run_id)
-                if job is None:
-                    job = self.queue.enqueue(project_dir.name, run_id)
-                    recovered += 1
-                elif (
-                    action == "resume"
-                    and outbox.get("status") == "pending"
-                    and job.status == "failed"
-                ):
                     try:
-                        job = self.queue.resume_failed(
+                        state = json.loads(
+                            state_path.read_text(encoding="utf-8-sig")
+                        )
+                    except (OSError, json.JSONDecodeError):
+                        continue
+                    if (
+                        state.get("execution_owner") != "mcp"
+                        or state.get("status")
+                        in {"completed", "cancelled", "failed"}
+                    ):
+                        continue
+                    run_id = str(state.get("run_id", ""))
+                    try:
+                        expected_run = resolve_run_dir(
+                            project_dir,
+                            run_id,
+                        )
+                    except ValueError:
+                        continue
+                    if expected_run != run_dir.resolve():
+                        continue
+                    outbox = state.get("queue_outbox")
+                    if not isinstance(outbox, dict):
+                        continue
+                    action = str(outbox.get("action", "advance"))
+                    try:
+                        generation = int(outbox.get("generation", 1))
+                    except (TypeError, ValueError):
+                        continue
+                    job = self.queue.get(project_dir.name, run_id)
+                    if job is None:
+                        job = self.queue.enqueue(
                             project_dir.name,
                             run_id,
                         )
                         recovered += 1
-                    except ValueError:
-                        job = self.queue.get(project_dir.name, run_id)
-                        if job is None or job.status not in {
-                            "queued",
-                            "leased",
-                            "waiting",
-                        }:
-                            raise
-                if (
-                    outbox.get("status") != "dispatched"
-                    or outbox.get("job_id") != job.id
-                ):
-                    outbox.update(
+                    elif (
+                        action == "resume"
+                        and outbox.get("status") == "pending"
+                        and job.status == "failed"
+                    ):
+                        try:
+                            job = self.queue.resume_failed(
+                                project_dir.name,
+                                run_id,
+                            )
+                            recovered += 1
+                        except ValueError:
+                            job = self.queue.get(
+                                project_dir.name,
+                                run_id,
+                            )
+                            if job is None or job.status not in {
+                                "queued",
+                                "leased",
+                                "waiting",
+                            }:
+                                raise
+                    latest = json.loads(
+                        state_path.read_text(encoding="utf-8-sig")
+                    )
+                    latest_outbox = latest.get("queue_outbox")
+                    if not isinstance(latest_outbox, dict):
+                        continue
+                    try:
+                        latest_generation = int(
+                            latest_outbox.get("generation", 1)
+                        )
+                    except (TypeError, ValueError):
+                        continue
+                    if (
+                        latest_generation != generation
+                        or str(latest_outbox.get("action", "advance"))
+                        != action
+                    ):
+                        continue
+                    current_job = self.queue.get(
+                        project_dir.name,
+                        run_id,
+                    )
+                    if current_job is None or current_job.id != job.id:
+                        continue
+                    latest_outbox.update(
                         {
                             "schema_version": 1,
-                            "action": job.action,
+                            "generation": generation,
+                            "action": current_job.action,
                             "status": "dispatched",
-                            "job_id": job.id,
+                            "job_id": current_job.id,
+                            "job_lease_generation": (
+                                current_job.lease_generation
+                            ),
                         }
                     )
-                    atomic_write_json(state_path, state)
+                    atomic_write_json(state_path, latest)
+                finally:
+                    run_lock.release()
         return recovered
 
     @staticmethod
@@ -145,6 +225,24 @@ class WorkflowService:
             return json.loads(path.read_text(encoding="utf-8-sig"))
         except (OSError, json.JSONDecodeError) as exc:
             raise ServiceError("service_unavailable", f"Invalid runtime file: {path.name}") from exc
+
+    @staticmethod
+    def _public_artifact_path(
+        run: Path,
+        key: str,
+        raw_path: Any,
+    ) -> Path | None:
+        expected_directory = PUBLIC_ARTIFACT_DIRECTORIES.get(key)
+        if expected_directory is None:
+            return None
+        try:
+            path = Path(raw_path).resolve()
+            relative = path.relative_to(run.resolve())
+        except (OSError, TypeError, ValueError):
+            return None
+        if not relative.parts or relative.parts[0] != expected_directory:
+            return None
+        return path
 
     def list_templates(self) -> list[dict[str, Any]]:
         return [
@@ -227,22 +325,75 @@ class WorkflowService:
             )
         except FileExistsError as exc:
             raise ServiceError("state_conflict", str(exc)) from exc
-        try:
-            job = self.queue.enqueue(project, ctx.run_id)
-        except Exception as exc:
+        state_path = ctx.run_dir / "state.json"
+        run_lock = RunMutationLock(ctx.run_dir / ".worker.lock")
+        if not run_lock.acquire():
             raise ServiceError(
                 "service_unavailable",
-                f"Workflow run was created but queue dispatch failed: {exc}",
-            ) from exc
-        ctx.state["queue_outbox"].update(
-            {"status": "dispatched", "job_id": job.id}
-        )
-        ctx.save_state()
+                "Workflow run is already being dispatched",
+            )
+        try:
+            before = self._read_json(state_path)
+            outbox = before.get("queue_outbox")
+            if not isinstance(outbox, dict):
+                raise ServiceError(
+                    "service_unavailable",
+                    "Workflow queue outbox is missing",
+                )
+            try:
+                generation = int(outbox["generation"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ServiceError(
+                    "service_unavailable",
+                    "Workflow queue outbox generation is invalid",
+                ) from exc
+            action = str(outbox.get("action", "advance"))
+            try:
+                job = self.queue.enqueue(project, ctx.run_id)
+            except Exception as exc:
+                raise ServiceError(
+                    "service_unavailable",
+                    "Workflow run was created but queue dispatch failed: "
+                    f"{exc}",
+                ) from exc
+            latest = self._read_json(state_path)
+            latest_outbox = latest.get("queue_outbox")
+            if not isinstance(latest_outbox, dict):
+                raise ServiceError(
+                    "state_conflict",
+                    "Workflow queue outbox changed during dispatch",
+                )
+            try:
+                latest_generation = int(latest_outbox["generation"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ServiceError(
+                    "state_conflict",
+                    "Workflow queue outbox changed during dispatch",
+                ) from exc
+            if (
+                latest_generation != generation
+                or str(latest_outbox.get("action", "advance")) != action
+            ):
+                raise ServiceError(
+                    "state_conflict",
+                    "Workflow queue outbox changed during dispatch",
+                )
+            latest_outbox.update(
+                {
+                    "status": "dispatched",
+                    "job_id": job.id,
+                    "job_lease_generation": job.lease_generation,
+                }
+            )
+            atomic_write_json(state_path, latest)
+            current_stage = latest.get("current_stage")
+        finally:
+            run_lock.release()
         return {
             "project": project,
             "run_id": ctx.run_id,
             "status": job.status,
-            "current_stage": ctx.state.get("current_stage"),
+            "current_stage": current_stage,
             "created_at": job.created_at,
         }
 
@@ -284,7 +435,18 @@ class WorkflowService:
             "interaction": interaction,
             "error": state.get("last_error") or (job.error if job else None),
             "updated_at": state.get("updated_at"),
-            "artifacts": sorted((manifest.get("artifacts") or {}).keys()),
+            "artifacts": sorted(
+                key
+                for key, raw_path in (
+                    manifest.get("artifacts") or {}
+                ).items()
+                if self._public_artifact_path(
+                    run,
+                    key,
+                    raw_path,
+                )
+                is not None
+            ),
         }
 
     def submit_workflow_input(
@@ -366,34 +528,90 @@ class WorkflowService:
         if status["status"] not in {"failed"}:
             raise ServiceError("state_conflict", f"Run cannot be resumed from {status['status']}")
         run = self._run(project, run_id)
-        state = self._read_json(run / "state.json")
-        state["status"] = "ready"
-        state.pop("last_error", None)
-        state["queue_outbox"] = {
-            "schema_version": 1,
-            "action": "resume",
-            "status": "pending",
-        }
-        atomic_write_json(run / "state.json", state)
+        state_path = run / "state.json"
+        run_lock = RunMutationLock(run / ".worker.lock")
+        if not run_lock.acquire():
+            raise ServiceError(
+                "state_conflict",
+                "Workflow run is currently being mutated",
+            )
         try:
-            job = self.queue.resume_failed(project, run_id)
-        except Exception as exc:
-            current = self.queue.get(project, run_id)
-            if current is None or current.status not in {
-                "queued",
-                "leased",
-                "waiting",
-            }:
+            state = self._read_json(state_path)
+            current_job = self.queue.get(project, run_id)
+            if current_job is None or current_job.status != "failed":
+                raise ServiceError(
+                    "state_conflict",
+                    "Run can no longer be resumed from failed",
+                )
+            state["status"] = "ready"
+            state.pop("last_error", None)
+            try:
+                prior_generation = int(
+                    (state.get("queue_outbox") or {}).get(
+                        "generation",
+                        0,
+                    )
+                )
+            except (TypeError, ValueError) as exc:
                 raise ServiceError(
                     "service_unavailable",
-                    "Workflow resume was recorded but queue resume failed: "
-                    f"{exc}",
+                    "Workflow queue outbox generation is invalid",
                 ) from exc
-            job = current
-        state["queue_outbox"].update(
-            {"status": "dispatched", "job_id": job.id}
-        )
-        atomic_write_json(run / "state.json", state)
+            generation = prior_generation + 1
+            state["queue_outbox"] = {
+                "schema_version": 1,
+                "generation": generation,
+                "action": "resume",
+                "status": "pending",
+            }
+            atomic_write_json(state_path, state)
+            try:
+                job = self.queue.resume_failed(project, run_id)
+            except Exception as exc:
+                current = self.queue.get(project, run_id)
+                if current is None or current.status not in {
+                    "queued",
+                    "leased",
+                    "waiting",
+                }:
+                    raise ServiceError(
+                        "service_unavailable",
+                        "Workflow resume was recorded but queue resume failed: "
+                        f"{exc}",
+                    ) from exc
+                job = current
+            latest = self._read_json(state_path)
+            latest_outbox = latest.get("queue_outbox")
+            if not isinstance(latest_outbox, dict):
+                raise ServiceError(
+                    "state_conflict",
+                    "Workflow queue outbox changed during dispatch",
+                )
+            try:
+                latest_generation = int(latest_outbox["generation"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ServiceError(
+                    "state_conflict",
+                    "Workflow queue outbox changed during dispatch",
+                ) from exc
+            if (
+                latest_generation != generation
+                or latest_outbox.get("action") != "resume"
+            ):
+                raise ServiceError(
+                    "state_conflict",
+                    "Workflow queue outbox changed during dispatch",
+                )
+            latest_outbox.update(
+                {
+                    "status": "dispatched",
+                    "job_id": job.id,
+                    "job_lease_generation": job.lease_generation,
+                }
+            )
+            atomic_write_json(state_path, latest)
+        finally:
+            run_lock.release()
         return {"project": project, "run_id": run_id, "status": job.status}
 
     def cancel_workflow(self, project: str, run_id: str) -> dict[str, Any]:
@@ -449,12 +667,17 @@ class WorkflowService:
         run = self._run(project, run_id)
         manifest = self._read_json(run / "manifest.json")
         requested = set(include_text)
+        disallowed = sorted(requested - PUBLIC_RESULT_ARTIFACTS)
+        if disallowed:
+            raise ServiceError(
+                "invalid_argument",
+                "Text artifacts are not public results: "
+                + ", ".join(disallowed),
+            )
         artifacts: dict[str, Any] = {}
         for key, raw_path in (manifest.get("artifacts") or {}).items():
-            path = Path(raw_path).resolve()
-            try:
-                path.relative_to(self.projects_root)
-            except ValueError:
+            path = self._public_artifact_path(run, key, raw_path)
+            if path is None:
                 continue
             item: dict[str, Any] = {
                 "path": str(path),

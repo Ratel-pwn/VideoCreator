@@ -1,11 +1,13 @@
 from pathlib import Path
 from unittest.mock import Mock
+import json
 
 from videocreator.media import (
     clean_audio_and_srt,
     detect_trailing_silence,
     parse_ffprobe_json,
     parse_trailing_silence,
+    probe_media,
 )
 
 
@@ -28,6 +30,45 @@ def test_parse_ffprobe_json_returns_video_metadata():
     assert metadata.kind == "video"
     assert metadata.width == 1920
     assert metadata.duration_ms == 4250
+
+
+def test_probe_media_routes_ffprobe_through_managed_runner(
+    tmp_path: Path,
+    monkeypatch,
+):
+    path = tmp_path / "voice.mp3"
+    path.write_bytes(b"audio")
+    calls = []
+    completed = Mock(
+        stdout=json.dumps(
+            {
+                "streams": [
+                    {
+                        "codec_type": "audio",
+                        "codec_name": "mp3",
+                        "duration": "1.25",
+                    }
+                ],
+                "format": {"duration": "1.25"},
+            }
+        )
+    )
+
+    def run(command, **kwargs):
+        calls.append((command, kwargs))
+        return completed
+
+    monkeypatch.setattr(
+        "videocreator.media.run_managed_process",
+        run,
+    )
+
+    metadata = probe_media(path)
+
+    assert metadata.kind == "audio"
+    assert metadata.duration_ms == 1250
+    assert calls[0][0][0] == "ffprobe"
+    assert calls[0][1]["timeout"] > 0
 
 
 def test_parse_trailing_silence_returns_absolute_spoken_end():

@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from .execution_fence import run_managed_process
+
 
 @dataclass(frozen=True)
 class MediaMetadata:
@@ -38,8 +40,12 @@ def parse_ffprobe_json(payload: dict[str, Any]) -> MediaMetadata:
     )
 
 
-def probe_media(path: Path) -> MediaMetadata:
-    completed = subprocess.run(
+def probe_media(
+    path: Path,
+    *,
+    runner: Callable[..., Any] | None = None,
+) -> MediaMetadata:
+    completed = (runner or run_managed_process)(
         [
             "ffprobe",
             "-v",
@@ -54,6 +60,7 @@ def probe_media(path: Path) -> MediaMetadata:
         capture_output=True,
         text=True,
         encoding="utf-8",
+        timeout=30,
     )
     metadata = parse_ffprobe_json(json.loads(completed.stdout))
     if path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".gif"}:

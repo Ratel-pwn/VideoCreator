@@ -1,16 +1,20 @@
 from __future__ import annotations
 
+import json
 import re
 from datetime import datetime
 from pathlib import Path
 
+from .bgm_library import resolve_bgm_library
 from .durable_io import (
     atomic_copy_file,
     atomic_write_json,
     atomic_write_text,
     sha256_file,
 )
+from .project_layout import RunPaths, create_run
 from .run_identity import resolve_run_dir
+from .templates import load_template, resolve_library
 
 ARTIFACT_PATTERNS = {
     "draft_approved": ("drafts", "*.md"),
@@ -53,24 +57,46 @@ def import_legacy_project(
     project_root: Path,
     run_id: str,
     artifacts: dict[str, Path],
+    *,
+    repo_root: Path,
+    templates_root: Path | None = None,
 ) -> Path:
     root = project_root.resolve()
-    runs_root = root / "runs"
-    runs_root.mkdir(parents=True, exist_ok=True)
+    home = Path(repo_root).resolve()
+    project_path = root / "project.json"
+    if not project_path.is_file():
+        raise ValueError(
+            f"Legacy import requires a valid project.json: {project_path}"
+        )
+    try:
+        project = json.loads(project_path.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Invalid project.json: {project_path}") from exc
+    if not isinstance(project, dict):
+        raise ValueError(f"Invalid project.json: {project_path}")
+    project_name = project.get("name")
+    if not isinstance(project_name, str) or not project_name.strip():
+        raise ValueError("project.json must declare name")
+    template_id = project.get("template_id")
+    if not isinstance(template_id, str) or not template_id:
+        raise ValueError("project.json must declare template_id")
+    template = load_template(
+        Path(templates_root).resolve()
+        if templates_root is not None
+        else home / "templates",
+        template_id,
+    )
+    libraries = {
+        resource_type: resolve_library(
+            home,
+            root,
+            template,
+            resource_type,
+        )
+        for resource_type in ("style", "voice")
+    }
+    libraries["bgm"] = resolve_bgm_library(home, root, template)
     run_dir = resolve_run_dir(root, run_id)
-    run_dir.mkdir(exist_ok=False)
-    for name in (
-        "inputs",
-        "session",
-        "writing",
-        "audio",
-        "subtitles",
-        "visual",
-        "render",
-        "review",
-    ):
-        (run_dir / name).mkdir()
-
     destinations = {
         "draft_approved": run_dir / "writing" / "script.approved.md",
         "voice_audio": (
@@ -81,39 +107,41 @@ def import_legacy_project(
         "voice_subtitle": run_dir / "subtitles" / "subtitles.imported.srt",
         "visual_plan": run_dir / "visual" / "visual-plan.json",
     }
+    source_snapshots = {
+        key: (
+            run_dir
+            / "inputs"
+            / "legacy-sources"
+            / f"{key}{source.suffix.lower()}"
+        )
+        for key, source in artifacts.items()
+    }
     lineage: dict[str, dict[str, str]] = {}
     for key, destination in destinations.items():
         source = artifacts[key].resolve()
         source_hash = sha256_file(source)
-        atomic_copy_file(
-            source,
-            destination,
-            expected_sha256=source_hash,
-        )
         lineage[key] = {
             "source_path": str(source),
             "source_sha256": source_hash,
             "snapshot_path": str(destination),
-            "snapshot_sha256": sha256_file(destination),
+            "snapshot_sha256": source_hash,
+            "input_snapshot_path": str(source_snapshots[key]),
         }
 
     narration_path = run_dir / "audio" / "narration.txt"
     narration = _narration_text(
-        destinations["draft_approved"].read_text(encoding="utf-8-sig")
+        artifacts["draft_approved"].read_text(encoding="utf-8-sig")
     )
     if not narration:
         raise ValueError("approved draft does not contain narration text")
-    atomic_write_text(narration_path, narration + "\n")
 
     now = datetime.now().astimezone().isoformat(timespec="seconds")
-    _write_json(
-        run_dir / "state.json",
-        {
+    state = {
             "run_id": run_id,
-            "project_name": root.name,
+            "project_name": project_name,
             "mode": "legacy-import",
             "current_stage": "subtitle_sync",
-            "resume_after_subtitle_sync": "visual_assets",
+            "resume_after_subtitle_sync": "visual_plan",
             "status": "ready",
             "created_at": now,
             "updated_at": now,
@@ -124,13 +152,10 @@ def import_legacy_project(
                     "migrated_at": now,
                 }
             },
-        },
-    )
-    _write_json(
-        run_dir / "manifest.json",
-        {
+        }
+    manifest = {
             "run_id": run_id,
-            "project_name": root.name,
+            "project_name": project_name,
             "mode": "legacy-import",
             "topic": root.name,
             "created_at": now,
@@ -148,6 +173,58 @@ def import_legacy_project(
                 ),
             },
             "lineage": {"legacy_import": lineage},
-        },
+        }
+
+    def populate(paths: RunPaths) -> None:
+        source_records = []
+        for key, final_destination in destinations.items():
+            source = artifacts[key].resolve()
+            source_hash = lineage[key]["source_sha256"]
+            relative_destination = final_destination.relative_to(run_dir)
+            staging_destination = paths.root / relative_destination
+            atomic_copy_file(
+                source,
+                staging_destination,
+                expected_sha256=source_hash,
+            )
+            input_destination = (
+                paths.root
+                / source_snapshots[key].relative_to(run_dir)
+            )
+            input_destination.parent.mkdir(parents=True, exist_ok=True)
+            atomic_copy_file(
+                source,
+                input_destination,
+                expected_sha256=source_hash,
+            )
+            source_records.append(
+                {
+                    "artifact": key,
+                    "source_path": str(source),
+                    "source_sha256": source_hash,
+                    "snapshot_path": str(source_snapshots[key]),
+                    "snapshot_sha256": sha256_file(input_destination),
+                }
+            )
+        atomic_write_text(
+            paths.audio / "narration.txt",
+            narration + "\n",
+        )
+        _write_json(
+            paths.inputs / "source-selection.json",
+            {
+                "schema_version": 1,
+                "files": source_records,
+            },
+        )
+
+    paths = create_run(
+        root,
+        run_id,
+        template,
+        libraries,
+        initial_state=state,
+        initial_manifest=manifest,
+        populate_staging=populate,
     )
-    return run_dir
+    return paths.root

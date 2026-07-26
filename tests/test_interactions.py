@@ -110,10 +110,11 @@ def test_changed_kind_or_payload_cannot_replay_stale_answer(tmp_path: Path):
             payload=first_payload,
         )
     first = raised.value.interaction
+    answer = json.dumps({"candidates": []})
     port.submit(
         ctx,
         first["id"],
-        "answer",
+        answer,
         fingerprint=first["fingerprint"],
     )
     assert port.ask(
@@ -122,7 +123,7 @@ def test_changed_kind_or_payload_cannot_replay_stale_answer(tmp_path: Path):
         "Find BGM",
         "bgm_candidates",
         payload=first_payload,
-    ) == "answer"
+    ) == answer
 
     with pytest.raises(InteractionRequired) as changed:
         port.ask(
@@ -170,7 +171,18 @@ def test_answer_audit_contains_only_bounded_hash_not_raw_response(tmp_path: Path
     port = DurableInteractionPort()
     with pytest.raises(InteractionRequired) as raised:
         port.ask(ctx, "bgm", "Find BGM", "bgm_candidates", payload={"query": "x"})
-    secret = '{"download_url":"https://cdn.example/a.mp3?token=TOP-SECRET"}'
+    secret = json.dumps(
+        {
+            "candidates": [
+                {
+                    "title": "TOP-SECRET",
+                    "source_page_url": "https://example.test/source",
+                    "download_url": "https://cdn.example/a.mp3",
+                    "provider": "agent",
+                }
+            ]
+        }
+    )
 
     port.submit(ctx, raised.value.interaction["id"], secret)
 
@@ -181,6 +193,98 @@ def test_answer_audit_contains_only_bounded_hash_not_raw_response(tmp_path: Path
     assert "response" not in answered
     assert len(answered["response_sha256"]) == 64
     assert answered["response_bytes"] == len(secret.encode("utf-8"))
+
+
+@pytest.mark.parametrize(
+    "unsafe_url",
+    [
+        "https://cdn.example/a.mp3?token=TOP-SECRET",
+        "https://user:TOP-SECRET@cdn.example/a.mp3",
+        "https://cdn.example/a.mp3#TOP-SECRET",
+    ],
+)
+def test_agent_candidate_urls_are_rejected_before_any_durable_write(
+    tmp_path: Path,
+    unsafe_url: str,
+):
+    ctx = Context(tmp_path)
+    port = DurableInteractionPort()
+    payload = {
+        "limits": {
+            "max_response_bytes": 200_000,
+            "max_candidates": 20,
+        },
+        "response_schema": {
+            "properties": {
+                "candidates": {
+                    "maxItems": 20,
+                }
+            }
+        },
+    }
+    with pytest.raises(InteractionRequired) as raised:
+        port.ask(
+            ctx,
+            "bgm",
+            "Find BGM",
+            "bgm_candidates",
+            payload=payload,
+        )
+    response = json.dumps(
+        {
+            "candidates": [
+                {
+                    "title": "Unsafe",
+                    "source_page_url": "https://example.test/source",
+                    "download_url": unsafe_url,
+                    "provider": "agent",
+                }
+            ]
+        }
+    )
+    state_before = (tmp_path / "state.json").read_bytes()
+    audit_before = (tmp_path / "session/interactions.jsonl").read_bytes()
+
+    with pytest.raises(ValueError, match="query|userinfo|fragment"):
+        port.submit(ctx, raised.value.interaction["id"], response)
+
+    assert (tmp_path / "state.json").read_bytes() == state_before
+    assert (tmp_path / "session/interactions.jsonl").read_bytes() == audit_before
+    durable = state_before + audit_before
+    assert b"TOP-SECRET" not in durable
+
+
+def test_agent_url_validation_cannot_be_bypassed_by_missing_payload(
+    tmp_path: Path,
+):
+    ctx = Context(tmp_path)
+    port = DurableInteractionPort()
+    with pytest.raises(InteractionRequired) as raised:
+        port.ask(
+            ctx,
+            "bgm",
+            "Find BGM",
+            "bgm_candidates",
+        )
+    unsafe = json.dumps(
+        {
+            "candidates": [
+                {
+                    "title": "Unsafe",
+                    "source_page_url": "https://example.test/source",
+                    "download_url": (
+                        "https://cdn.example/a.mp3?token=TOP-SECRET"
+                    ),
+                    "provider": "agent",
+                }
+            ]
+        }
+    )
+
+    with pytest.raises(ValueError, match="query"):
+        port.submit(ctx, raised.value.interaction["id"], unsafe)
+
+    assert "TOP-SECRET" not in json.dumps(ctx.state)
 
 
 @pytest.mark.parametrize(

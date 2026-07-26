@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Callable, Mapping, Sequence, TextIO
 
 from .project_layout import initialize_project
+from .run_identity import resolve_run_dir
 from .templates import discover_templates
 
 
@@ -183,7 +184,10 @@ def list_runs(project_root: Path) -> list[RunSummary]:
 
 def select_run(project_root: Path, run_id: str | None = None, *, unfinished_only: bool = False) -> RunSummary:
     if run_id:
-        path = project_root / "runs" / run_id
+        try:
+            path = resolve_run_dir(project_root, run_id)
+        except ValueError as exc:
+            raise CliError(str(exc)) from exc
         if not path.is_dir():
             raise CliError(f"Run not found: {run_id}")
         value = _load_run(path)
