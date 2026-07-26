@@ -1,6 +1,7 @@
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -18,6 +19,29 @@ def test_queue_claims_fifo_and_prevents_duplicate_run_jobs(tmp_path: Path):
     assert claimed is not None
     assert claimed.run_id == "run-1"
     assert claimed.status == "leased"
+    assert queue.claim("worker-2", lease_seconds=60).run_id == "run-2"
+
+
+def test_queue_fifo_uses_insertion_order_when_timestamps_tie(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    now = datetime(2026, 7, 22, tzinfo=timezone.utc)
+    generated = iter(
+        [
+            SimpleNamespace(hex="f" * 32),
+            SimpleNamespace(hex="0" * 32),
+        ]
+    )
+    monkeypatch.setattr(
+        "videocreator.job_queue.uuid.uuid4",
+        lambda: next(generated),
+    )
+    queue = JobQueue(tmp_path / "queue.sqlite3", now=lambda: now)
+    queue.enqueue("project", "run-1")
+    queue.enqueue("project", "run-2")
+
+    assert queue.claim("worker-1", lease_seconds=60).run_id == "run-1"
     assert queue.claim("worker-2", lease_seconds=60).run_id == "run-2"
 
 

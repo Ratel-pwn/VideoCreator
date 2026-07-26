@@ -235,7 +235,7 @@ class JobQueue:
                 """
                 SELECT * FROM jobs
                 WHERE status = 'queued' AND cancel_requested = 0
-                ORDER BY created_at, id LIMIT 1
+                ORDER BY created_at, rowid LIMIT 1
                 """
             ).fetchone()
             if not row:
