@@ -410,4 +410,3 @@ The design is complete when implementation demonstrates all of the following:
 11. The server can bind to a configured local or remote interface without code changes.
 12. Optional bearer authentication works without persisting its secret.
 13. Automated tests do not call real external production services.
-

@@ -360,4 +360,3 @@ Expected: ten tools are returned and both server and worker exit cleanly.
 git add README.md config/README.md tests/integration/test_mcp_workflow.py
 git commit -m "docs: document MCP workflow service"
 ```
-
