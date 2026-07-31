@@ -5,6 +5,17 @@ from typing import Any
 
 
 FINAL_PUNCTUATION = re.compile(r"[。！？!?；;，,：:]$")
+SEMANTIC_BEAT_END = re.compile(r"[。！？!?；;]+")
+
+
+def count_semantic_beats(text: str) -> int:
+    text = text.strip()
+    if not text:
+        return 0
+    boundaries = len(SEMANTIC_BEAT_END.findall(text))
+    if boundaries == 0:
+        return 1
+    return boundaries + (0 if SEMANTIC_BEAT_END.search(text[-1:]) else 1)
 
 
 def audit_visual_plan(plan: dict[str, Any], pacing: dict[str, Any], subtitle_policy: dict[str, Any]) -> dict[str, Any]:
@@ -30,11 +41,21 @@ def audit_visual_plan(plan: dict[str, Any], pacing: dict[str, Any], subtitle_pol
         if duration > int(pacing["soft_max_duration_ms"]) and not segment.get("long_hold_reason"):
             errors.append({"code": "long_hold_reason_required", "segment_id": shot_id})
         text = str(segment.get("subtitle_text", "")).strip()
+        source_text = str(segment.get("text", text)).strip()
         if int(segment.get("subtitle_blocks", 1)) > int(pacing["max_subtitle_blocks"]):
             errors.append({"code": "subtitle_blocks", "segment_id": shot_id})
         chinese_chars = len(re.findall(r"[\u4e00-\u9fff]", text))
         if chinese_chars > int(pacing["max_chinese_chars"]):
             errors.append({"code": "subtitle_characters", "segment_id": shot_id, "count": chinese_chars})
+        semantic_beats = count_semantic_beats(source_text)
+        max_semantic_beats = int(pacing.get("max_semantic_beats_per_scene", 1))
+        if semantic_beats > max_semantic_beats:
+            errors.append({
+                "code": "semantic_beats",
+                "segment_id": shot_id,
+                "count": semantic_beats,
+                "maximum": max_semantic_beats,
+            })
         if subtitle_policy.get("single_line") and ("\n" in text or "\r" in text):
             errors.append({"code": "subtitle_line_break", "segment_id": shot_id})
         if subtitle_policy.get("omit_sentence_final_punctuation") and FINAL_PUNCTUATION.search(text):

@@ -136,4 +136,13 @@ describe('render components', () => {
     expect(markup).toContain('Title');
     expect(markup).toContain('assets/book.jpg');
   });
+
+  it('keeps entity labels above the display asset', () => {
+    const media = {assetType: 'image' as const, assetPath: 'assets/bg.jpg', fitMode: 'cover' as const, trimBeforeFrames: 0, mediaDurationInFrames: 0, shortVideoPolicy: 'reject' as const};
+    const markup = renderToStaticMarkup(<EntityCardScene scene={{id: 's', fromFrame: 0, durationInFrames: 25, presentationMode: 'entity_card', backgroundAsset: media, displayAsset: {...media, assetPath: 'assets/book.jpg', fitMode: 'contain'}, entity: {primaryLabel: 'Dutch East India Company', secondaryLabel: 'VOC'}}} />);
+
+    expect(markup).toContain('data-layer="entity-label"');
+    expect(markup).toMatch(/data-layer="entity-label"[^>]*z-index:2/);
+    expect(markup).toMatch(/data-layer="entity-display"[^>]*z-index:1/);
+  });
 });

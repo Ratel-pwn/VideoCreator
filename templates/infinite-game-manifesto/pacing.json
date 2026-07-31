@@ -4,5 +4,6 @@
   "hard_max_duration_ms": 10000,
   "max_subtitle_blocks": 1,
   "max_chinese_chars": 28,
-  "min_shots_per_minute": 12
+  "min_shots_per_minute": 12,
+  "max_semantic_beats_per_scene": 1
 }

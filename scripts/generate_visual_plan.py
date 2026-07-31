@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import urllib.error
@@ -10,9 +11,12 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from videocreator.visual_plan import audit_visual_plan
+
 MAX_SEGMENT_DURATION_MS = 9000
 MAX_SEGMENT_TEXT_CHARS = 34
 CLAUSE_SPLIT_RE = re.compile(r'([^。！？；，]+[。！？；，]?)')
+SEMANTIC_CLAUSE_SPLIT_RE = re.compile(r'([^。！？；]+[。！？；]?)')
 
 
 def parse_srt_timestamp(value: str) -> int:
@@ -65,13 +69,20 @@ def split_into_clauses(text: str) -> list[str]:
     return parts or [text.strip()]
 
 
+def split_into_semantic_clauses(text: str) -> list[str]:
+    parts = [item.strip() for item in SEMANTIC_CLAUSE_SPLIT_RE.findall(text) if item.strip()]
+    return parts or [text.strip()]
+
+
 def split_long_segments(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
     refined: list[dict[str, Any]] = []
     for segment in segments:
         duration_ms = segment['end_ms'] - segment['start_ms']
         text = segment['text'].strip()
-        clauses = split_into_clauses(text)
-        if len(clauses) <= 1 or (duration_ms <= MAX_SEGMENT_DURATION_MS and len(text) <= MAX_SEGMENT_TEXT_CHARS):
+        semantic_clauses = split_into_semantic_clauses(text)
+        is_long = duration_ms > MAX_SEGMENT_DURATION_MS or len(text) > MAX_SEGMENT_TEXT_CHARS
+        clauses = semantic_clauses if len(semantic_clauses) > 1 else split_into_clauses(text)
+        if len(clauses) <= 1 or (not is_long and len(semantic_clauses) <= 1):
             refined.append(segment)
             continue
         total_weight = sum(max(len(clause), 1) for clause in clauses)
@@ -172,7 +183,11 @@ def normalize_plan(subtitle_segments: list[dict[str, Any]], plan: dict[str, Any]
     for idx, (scene, subtitle_ids) in enumerate(zip(scenes, scene_ranges), 1):
         parts = [by_id[item] for item in subtitle_ids]
         start_ms = parts[0]['start_ms']
-        end_ms = parts[-1]['end_ms']
+        end_ms = (
+            by_id[scene_ranges[idx][0]]['start_ms']
+            if idx < len(scene_ranges)
+            else parts[-1]['end_ms']
+        )
         text = ''.join(part['text'] for part in parts).strip()
         search_queries = scene.get('search_queries') or {}
         generation_prompts = scene.get('generation_prompts') or {}
@@ -187,7 +202,7 @@ def normalize_plan(subtitle_segments: list[dict[str, Any]], plan: dict[str, Any]
             'segment_id': f'scene-{idx:03d}',
             'subtitle_segment_ids': subtitle_ids,
             'start': parts[0]['start'],
-            'end': parts[-1]['end'],
+            'end': format_srt_timestamp(end_ms),
             'start_ms': start_ms,
             'end_ms': end_ms,
             'duration_seconds': round((end_ms - start_ms) / 1000, 3),
@@ -226,6 +241,106 @@ def normalize_plan(subtitle_segments: list[dict[str, Any]], plan: dict[str, Any]
     }
 
 
+def build_planning_prompt(
+    subtitle_segments: list[dict[str, Any]],
+    *,
+    topic: str,
+    category: str,
+    draft_text: str,
+    pacing: dict[str, Any],
+    subtitle_policy: dict[str, Any],
+    audit_feedback: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    duration_ms = subtitle_segments[-1]['end_ms'] - subtitle_segments[0]['start_ms']
+    minimum_scene_count = math.ceil(duration_ms * float(pacing['min_shots_per_minute']) / 60000)
+    prompt = {
+        'topic': topic,
+        'category': category,
+        'draft_excerpt': draft_text[:6000],
+        'draft_paragraphs': [item.strip() for item in re.split(r'\n\s*\n', draft_text) if item.strip()],
+        'subtitle_segments': subtitle_segments,
+        'planning_contract': {
+            'minimum_scene_count': minimum_scene_count,
+            'target_duration_ms': pacing['target_duration_ms'],
+            'soft_max_duration_ms': pacing['soft_max_duration_ms'],
+            'hard_max_duration_ms': pacing['hard_max_duration_ms'],
+            'max_subtitle_blocks': pacing['max_subtitle_blocks'],
+            'max_chinese_chars': pacing['max_chinese_chars'],
+            'min_shots_per_minute': pacing['min_shots_per_minute'],
+            'max_semantic_beats_per_scene': pacing.get('max_semantic_beats_per_scene', 1),
+            'subtitle_policy': subtitle_policy,
+            'rules': [
+                'Treat each change of subject, location, action, time, example, or argument as a new semantic beat.',
+                'Never keep one scene across semantic beats that require different visual evidence.',
+                'Adjacent subtitle segments may be grouped only when they describe the same subject and action.',
+                'All numeric limits are mandatory; long_hold_reason does not waive the hard maximum.',
+            ],
+        },
+        'required_output': {
+            'topic': topic,
+            'category': category,
+            'segment_count': f'integer greater than or equal to {minimum_scene_count}',
+            'scene_granularity_rule': 'exactly one visual semantic beat per scene',
+            'segments': [{
+                'subtitle_segment_ids': ['sub-001'],
+                'brief': 'scene brief in Chinese',
+                'material_type': 'video|image|subtitle_only',
+                'presentation_mode': 'footage|still|entity_card|explainer|subtitle_only',
+                'slots': [{'role': 'primary|background|display', 'required_type': 'image|video'}],
+                'entity': {'primary_label': 'required for entity_card', 'secondary_label': 'optional'},
+                'explainer': {'kind': 'formula|process|list|function|score|code|quote', 'items': ['declarative content']},
+                'asset_strategy': 'search_first|generate_only|subtitle_only',
+                'visual_role': 'evidential|illustrative|abstract|atmospheric',
+                'search_queries': {'image': ['...'], 'video': ['...']},
+                'generation_prompts': {'image': '...', 'video': '...'},
+                'transition': 'cut|dissolve|hold',
+                'notes': 'short reason',
+            }],
+        },
+    }
+    if audit_feedback:
+        prompt['audit_feedback'] = audit_feedback
+        prompt['repair_instruction'] = 'Return a complete replacement plan that fixes every audit error.'
+    return prompt
+
+
+def plan_visual_scenes(
+    subtitle_segments: list[dict[str, Any]],
+    *,
+    topic: str,
+    category: str,
+    draft_text: str,
+    skill_text: str,
+    pacing: dict[str, Any],
+    subtitle_policy: dict[str, Any],
+    invoke: Any,
+    max_attempts: int = 3,
+) -> dict[str, Any]:
+    audit_feedback = None
+    for _attempt in range(max_attempts):
+        prompt = build_planning_prompt(
+            subtitle_segments,
+            topic=topic,
+            category=category,
+            draft_text=draft_text,
+            pacing=pacing,
+            subtitle_policy=subtitle_policy,
+            audit_feedback=audit_feedback,
+        )
+        messages = [
+            {'role': 'system', 'content': skill_text},
+            {'role': 'user', 'content': json.dumps(prompt, ensure_ascii=False, indent=2)},
+        ]
+        normalized = normalize_plan(subtitle_segments, extract_json(invoke(messages)), topic, category)
+        audit_feedback = audit_visual_plan(normalized, pacing, subtitle_policy)
+        if audit_feedback['ok']:
+            return normalized
+    raise RuntimeError(
+        f"Visual plan failed audit after {max_attempts} attempts: "
+        f"{json.dumps(audit_feedback['errors'], ensure_ascii=False)}"
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description='Generate a semantic visual plan from subtitle timing and article text')
     parser.add_argument('--workflow-config', required=True)
@@ -237,6 +352,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--skill-file', default='')
     parser.add_argument('--pacing-file', default='')
     parser.add_argument('--subtitle-policy-file', default='')
+    parser.add_argument('--max-attempts', type=int, default=3)
     return parser.parse_args()
 
 
@@ -255,44 +371,21 @@ def main() -> int:
     if not subtitle_segments:
         raise RuntimeError('No segments found in SRT file.')
     draft_text = Path(args.draft_file).read_text(encoding='utf-8') if args.draft_file else ''
-    draft_paragraphs = [item.strip() for item in re.split(r'\n\s*\n', draft_text) if item.strip()]
-    prompt = {
-        'topic': args.topic,
-        'category': args.category,
-        'draft_excerpt': draft_text[:6000],
-        'draft_paragraphs': draft_paragraphs,
-        'subtitle_segments': subtitle_segments,
-        'required_output': {
-            'topic': args.topic,
-            'category': args.category,
-            'segment_count': 'number of semantic scenes, not subtitle count',
-            'scene_granularity_rule': 'prefer one semantic beat per scene; if adjacent clauses need different visuals, split them',
-            'segments': [
-                {
-                    'subtitle_segment_ids': ['sub-001', 'sub-002'],
-                    'brief': 'scene brief in Chinese',
-                    'material_type': 'video|image|subtitle_only',
-                    'presentation_mode': 'footage|still|entity_card|explainer|subtitle_only',
-                    'slots': [{'role': 'primary|background|display', 'required_type': 'image|video'}],
-                    'entity': {'primary_label': 'required for entity_card', 'secondary_label': 'optional'},
-                    'explainer': {'kind': 'formula|process|list|function|score|code|quote', 'items': ['declarative content']},
-                    'asset_strategy': 'search_first|generate_only|subtitle_only',
-                    'visual_role': 'evidential|illustrative|abstract|atmospheric',
-                    'search_queries': {'image': ['...'], 'video': ['...']},
-                    'generation_prompts': {'image': '...', 'video': '...'},
-                    'transition': 'cut|dissolve|hold',
-                    'notes': 'short reason'
-                }
-            ]
-        }
-    }
-    messages = [
-        {'role': 'system', 'content': skill_text},
-        {'role': 'user', 'content': json.dumps(prompt, ensure_ascii=False, indent=2)}
-    ]
-    response = call_compatible_openai(llm['base_url'], api_key, llm['model'], messages)
-    plan = extract_json(response)
-    normalized = normalize_plan(subtitle_segments, plan, args.topic, args.category)
+    if not args.pacing_file or not args.subtitle_policy_file:
+        raise RuntimeError('Both --pacing-file and --subtitle-policy-file are required')
+    pacing = json.loads(Path(args.pacing_file).read_text(encoding='utf-8'))
+    subtitle_policy = json.loads(Path(args.subtitle_policy_file).read_text(encoding='utf-8'))
+    normalized = plan_visual_scenes(
+        subtitle_segments,
+        topic=args.topic,
+        category=args.category,
+        draft_text=draft_text,
+        skill_text=skill_text,
+        pacing=pacing,
+        subtitle_policy=subtitle_policy,
+        invoke=lambda messages: call_compatible_openai(llm['base_url'], api_key, llm['model'], messages),
+        max_attempts=args.max_attempts,
+    )
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(normalized, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
